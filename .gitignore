@@ -1,0 +1,42 @@
+# 明文密钥 / 本机路径
+box_config.json
+box_config.json.bak
+box_config.json.*
+*.bak
+
+# 运行产物（用户数据，不入 git）
+source/
+cropped_hi/
+output/
+token_log.csv
+launcher.log
+*.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# 构建中间产物
+build/
+dist/
+build_venv*/
+macOS/AppIcon.icns
+.portable_staging
+
+# Release 产物（二进制走 GitHub Releases，不进 git 仓库）
+deploy/Output/
+
+# 通用日志
+*.log
+build_log.txt
+iss_log.txt
+
+# 旧版 / 调试残留（scripts/，非核心代码）
+scripts/box_ocr_server.py
+scripts/call_ocr.py
+scripts/group_articles.py
+scripts/stop_flag.py
+scripts/test_verify.py
+scripts/static/
+scripts/民国报纸OCR/
+scripts/box_launcher.py.current_img_*

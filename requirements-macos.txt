@@ -1,0 +1,13 @@
+# 墨痕 macOS 构建依赖
+# 用法（开发/打包）：
+#   python3 -m venv build_venv_mac
+#   build_venv_mac/bin/python -m pip install -r requirements-macos.txt
+# 或直接在 macOS 上执行 bash macOS/build_mac.sh（会自动准备虚拟环境）。
+
+pyinstaller>=6.0
+pywebview>=5.0
+numpy
+Pillow
+opencc-python-reimplemented
+openai
+pypdf

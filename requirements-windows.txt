@@ -1,0 +1,13 @@
+# 墨痕 Windows 构建依赖
+# 用法（开发/打包）：
+#   python -m venv build_venv
+#   build_venv\Scripts\python.exe -m pip install -r requirements-windows.txt
+# 或直接使用 build_exe.bat（会自动准备虚拟环境）。
+
+pyinstaller>=6.0
+pywebview>=5.0
+numpy
+Pillow
+opencc-python-reimplemented
+openai
+pypdf

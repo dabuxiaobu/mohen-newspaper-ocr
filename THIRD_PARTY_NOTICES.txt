@@ -1,0 +1,50 @@
+墨痕（近代报刊转录助手）第三方组件许可声明
+================================================
+
+本项目在运行时与打包产物（墨痕.exe / 墨痕.app）中包含了以下第三方开源组件。
+这些组件各自保留其原始版权与许可证，本声明仅作汇总，不构成对原许可的修改。
+
+本项目的自有源代码以 GNU Affero General Public License Version 3 only（AGPL-3.0-only）发布（见仓库根目录 LICENSE 文件）。
+下列组件以其各自的许可证分发，其许可证全文可通过对应项目的官方仓库或
+PyPI 页面获取。
+
+----------------------------------------------------------------------
+1. Python
+   许可证：Python Software Foundation License (PSF)
+   说明：运行时解释器。
+
+2. PyInstaller
+   许可证：GPL-2.0-or-later，并附带 Bootloader Exception
+   说明：用于将程序打包为独立可执行文件。其 Bootloader Exception 允许
+         将 PyInstaller 引导加载程序与非 GPL 代码链接并分发，因此本项目的
+         CC BY-NC-SA 4.0 许可不被 PyInstaller 的 GPL 条款传染。
+
+3. pywebview
+   许可证：BSD-2-Clause
+
+4. numpy
+   许可证：BSD-3-Clause
+
+5. Pillow
+   许可证：HPND（历史为 PIL Software License，与 HPND 兼容）
+
+6. opencc-python-reimplemented
+   许可证：Apache-2.0
+   说明：OpenCC 的 Python 重新实现，用于繁体→简体转换。
+
+7. openai
+   许可证：MIT
+   说明：OpenAI Python SDK，本项目通过其调用任意 OpenAI 兼容视觉模型
+         （如阿里云百炼 qwen 系列、豆包等）。
+
+8. pypdf
+   许可证：BSD-3-Clause
+
+----------------------------------------------------------------------
+获取完整许可证文本的途径
+----------------------------------------------------------------------
+- PyPI：https://pypi.org/project/<包名>/  （每个项目页面含 License 字段与链接）
+- GitHub：各项目官方仓库的 LICENSE 文件
+- AGPL-3.0-only 全文：https://www.gnu.org/licenses/agpl-3.0.html
+
+如需本项目的完整第三方许可证文本归档，可联系作者获取。

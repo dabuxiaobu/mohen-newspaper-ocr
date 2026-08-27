@@ -1,0 +1,90 @@
+# =====================================================================
+# 墨痕 · macOS 自动构建（GitHub Actions）
+# ---------------------------------------------------------------------
+# 触发方式：
+#   1) 推送版本标签：git tag v1.0.0 && git push --tags
+#      → 自动在真实 Mac runner 上构建 arm64 + x86_64 两个架构，
+#        并创建 GitHub Release、上传 .dmg / .zip / .sha256.txt。
+#   2) 手动触发（Actions 页面 Run workflow）：仅构建测试，不发布 Release。
+#
+# 说明：
+#   - 用真实 Apple 硬件 runner，符合 Apple 许可，且免费（公开仓库无限分钟）。
+#   - Windows 无法交叉编译 macOS 二进制，必须在 Mac 上打包。
+#   - 可选代码签名：在仓库 Settings → Secrets 里配置 MACOS_SIGN_IDENTITY
+#     （证书需另经 keychain 导入，本 workflow 仅演示 identity 透传）。
+# =====================================================================
+
+name: Build macOS
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不含 v，例如 1.0.0；仅手动触发时生效）'
+        required: false
+        default: '1.0.0'
+
+jobs:
+  build:
+    name: Build macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15       # Apple Silicon（arm64）
+            arch: arm64
+          - runner: macos-13       # Intel（x86_64）
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Build .app / .dmg / .zip
+        env:
+          MH_ARCH: ${{ matrix.arch }}
+          MH_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+        run: bash macOS/build_mac.sh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.arch }}
+          if-no-files-found: error
+          path: |
+            deploy/Output/墨痕-v*-macos-${{ matrix.arch }}.dmg
+            deploy/Output/墨痕-v*-macos-${{ matrix.arch }}.zip
+            deploy/Output/墨痕-v*-macos-${{ matrix.arch }}.dmg.sha256.txt
+            deploy/Output/墨痕-v*-macos-${{ matrix.arch }}.zip.sha256.txt
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: false
+
+      - name: List collected files
+        run: find artifacts -type f
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/**/*
+          generate_release_notes: true
