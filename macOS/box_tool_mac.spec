@@ -15,8 +15,8 @@
 import os
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
-HERE = os.path.dirname(os.path.abspath(SPEC))          # skill 根
-MAC_DIR = os.path.join(HERE, "macOS")
+MAC_DIR = os.path.dirname(os.path.abspath(SPEC))        # macOS/（本 spec 所在目录）
+HERE = os.path.dirname(MAC_DIR)                           # skill 根（上溯一级；spec 在 macOS/ 下，不能再用 dirname(SPEC)）
 SCRIPTS = os.path.join(HERE, "scripts")
 ICON_ICNS = os.path.join(MAC_DIR, "AppIcon.icns")        # 由 build_mac.sh 从 newspaper.ico 生成
 
