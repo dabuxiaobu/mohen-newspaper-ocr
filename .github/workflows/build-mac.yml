@@ -3,8 +3,10 @@
 # ---------------------------------------------------------------------
 # 触发方式：
 #   1) 推送版本标签：git tag v1.0.0 && git push --tags
-#      → 自动在真实 Mac runner 上构建 arm64 + x86_64 两个架构，
+#      → 自动在真实 Mac runner（macos-15 / Apple Silicon）上构建 arm64 架构，
 #        并创建 GitHub Release、上传 .dmg / .zip / .sha256.txt。
+#      （注：x86_64 原走 macos-13 Intel runner，常年排队，故暂仅发 arm64；
+#         Intel Mac 用户可改用源码/portable 方式运行。）
 #   2) 手动触发（Actions 页面 Run workflow）：仅构建测试，不发布 Release。
 #
 # 说明：
@@ -36,8 +38,6 @@ jobs:
         include:
           - runner: macos-15       # Apple Silicon（arm64）
             arch: arm64
-          - runner: macos-13       # Intel（x86_64）
-            arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
