@@ -30,6 +30,7 @@ import subprocess
 import threading
 import time
 import socket
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from functools import partial
@@ -52,12 +53,38 @@ def _app_dir():
         return d
     return HERE
 APP_DIR = _app_dir()
-CONFIG_DIR = APP_DIR
+CONFIG_DIR = APP_DIR   # 配置（API Key 等）仍随 exe 目录，更新靠「覆盖解压」保留，行为不变
 
-# 运行时产物目录（source/ cropped_hi/ output/ 等）：与 CONFIG_DIR 同理，
-# 冻结态必须指向 exe 所在目录，否则会写进 _MEIPASS 临时目录，程序一关就丢，
-# 且抽图脚本去 exe 目录找 source/ 时因空目录而静默无产出（表现为「抽图没反应」）。
-RUNTIME_DIR = CONFIG_DIR
+# 用户产物目录：脱离 exe 所在目录，固定落到「文档/墨痕数据」，与版本无关。
+# 无论新版本解压到哪、几个版本并存，识别产物 output/ 都自动共享、不会随旧版本丢失。
+# 首次启动会把 exe 旁遗留的旧 output/source/cropped_hi/ 及日志迁移到此处并清空原目录。
+def _user_data_dir():
+    home = os.path.expanduser("~")
+    for cand in (os.path.join(home, "Documents", "墨痕数据"),
+                 os.path.join(home, "墨痕数据")):
+        try:
+            os.makedirs(cand, exist_ok=True)
+            return cand
+        except Exception:
+            continue
+    return os.path.join(home, "墨痕数据")
+DATA_DIR = _user_data_dir()
+RUNTIME_DIR = DATA_DIR
+
+# 首次启动迁移：把 exe 旁遗留的旧产物/日志搬到 DATA_DIR，避免旧版本文件夹残留数据。
+_LEGACY_ITEMS = ["output", "source", "cropped_hi", "token_log.csv", "ocr_runs.csv", "box_launcher.log"]
+def _migrate_legacy_data():
+    if any(os.path.exists(os.path.join(DATA_DIR, n)) for n in _LEGACY_ITEMS):
+        return  # DATA_DIR 已含数据，视为已迁移完成，跳过以防重复搬运/覆盖
+    for name in _LEGACY_ITEMS:
+        src = os.path.join(APP_DIR, name)
+        if not os.path.exists(src):
+            continue
+        try:
+            shutil.move(src, os.path.join(DATA_DIR, name))
+        except Exception as _e:
+            sys.stderr.write(f"[migrate] 迁移 {name} 失败：{_e}\n")
+_migrate_legacy_data()
 
 try:
     import webview  # type: ignore
@@ -67,14 +94,147 @@ except ImportError as _e:
             f"\n原始错误：{_e}")
     print(_msg)
     try:
-        sys.stdout = open(os.path.join(HERE, "box_launcher.log"), "a", encoding="utf-8")
+        sys.stdout = open(os.path.join(DATA_DIR, "box_launcher.log"), "a", encoding="utf-8")
         sys.stderr = sys.stdout
         print(_msg)
     except Exception:
         pass
     os._exit(1)
 
-VERSION = "box-v20260822.1-pywebview"
+VERSION = "1.1.0"
+
+# ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
+# 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
+# 互不影响。BOX_OCR_PROVIDER 记录当前用哪一个。旧版仅有的 BOX_OCR_* 字段会在
+# 首次启动时迁移进 QWEN_*（见 _migrate_cfg）。
+OCR_PROVIDERS = {
+    "qwen": {
+        "label": "千问（日常）",
+        "key_prefix": "QWEN",
+        "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "default_model": "qwen3.6-plus",
+        "base_placeholder": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "key_placeholder": "sk-...",
+        "model_placeholder": "",
+    },
+    "doubao": {
+        "label": "豆包（疑难）",
+        "key_prefix": "DOUBAO",
+        "default_base_url": "https://ark.cn-beijing.volces.com/api/v3",
+        "default_model": "",
+        "base_placeholder": "https://ark.cn-beijing.volces.com/api/v3",
+        "key_placeholder": "ark-",
+        "model_placeholder": "",
+    },
+    "other": {
+        "label": "其他（自定义）",
+        "key_prefix": "OTHER",
+        "default_base_url": "",
+        "default_model": "",
+        "base_placeholder": "",
+        "key_placeholder": "",
+        "model_placeholder": "",
+    },
+}
+
+# ---------- 自动更新（方案甲：下载 zip → TEMP 更新器覆盖 → 重启） ----------
+# 更新源：Gitee 优先（需先在 Gitee 对应仓库建 Releases 并发布 exe 包），
+# 失败则 fallback GitHub。留空则只用 GitHub。启用 Gitee 优先：改成 "owner/repo"。
+GITEE_REPO = "dabuxiaobu/mohen-newspaper-ocr"
+GITHUB_REPO = "dabuxiaobu/mohen-newspaper-ocr"
+# 自动更新挑选 Windows 包的关键字（release asset 名称含其一且以 .zip 结尾）
+WIN_PKG_KEYWORDS = ("windows", "win", "onedir", "exe")
+# 跨「下载→应用」的更新状态（单进程内存；下载后写入，重启时读取）
+_UPDATE_STATE = {}
+
+def _sha256_of_file(path):
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _parse_sha256(text, filename):
+    """从 checksum 文本里取与目标文件名匹配的 64 位 hex；无匹配则返回首个 hex。"""
+    best = ""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        toks = line.replace("*", " ").split()
+        hexes = [t for t in toks if len(t) == 64 and all(c in "0123456789abcdefABCDEF" for c in t)]
+        if not hexes:
+            continue
+        h = hexes[0]
+        if filename and filename.lower() in line.lower():
+            return h
+        best = h
+    return best
+
+def _query_latest_release(repo, provider):
+    """查询 Gitee/GitHub 最新 release，返回 dict 或 None。"""
+    import urllib.request, urllib.error, ssl, json as _json_mod
+    if provider == "gitee":
+        api = f"https://gitee.com/api/v5/repos/{repo}/releases/latest"
+    else:
+        api = f"https://api.github.com/repos/{repo}/releases/latest"
+    try:
+        req = urllib.request.Request(api, method="GET")
+        req.add_header("Accept", "application/json")
+        req.add_header("User-Agent", "mohen-updater")
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+            data = _json_mod.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+    tag = data.get("tag_name") or data.get("name") or ""
+    notes = data.get("body") or ""
+    page_url = data.get("html_url") or ""
+    if provider == "gitee":
+        page_url = f"https://gitee.com/{repo}/releases"
+    assets = []
+    for a in (data.get("assets") or []):
+        assets.append({"name": a.get("name", ""),
+                       "url": a.get("browser_download_url") or a.get("url") or ""})
+    return {"tag": tag, "notes": notes, "assets": assets, "page_url": page_url}
+
+def _build_update_result(current, rel, provider):
+    win_asset = None
+    fallback_zip = None
+    for a in rel["assets"]:
+        n = a["name"].lower()
+        if n.endswith(".zip"):
+            if fallback_zip is None:
+                fallback_zip = a
+            if any(k in n for k in WIN_PKG_KEYWORDS):
+                win_asset = a
+                break
+    target = win_asset or fallback_zip
+    sha_asset = None
+    for a in rel["assets"]:
+        if a["name"].lower() in ("sha256.txt", "sha256sums.txt", "checksums.txt", "checksums.sha256"):
+            sha_asset = a
+    need = bool(target) and bool(rel["tag"]) and rel["tag"] != current
+    return {
+        "ok": True, "current": current, "latest": rel["tag"],
+        "notes": rel["notes"], "page_url": rel["page_url"],
+        "download_url": target["url"] if target else "",
+        "asset_name": target["name"] if target else "",
+        "sha256_url": sha_asset["url"] if sha_asset else "",
+        "need": need,
+    }
+
+def _check_update():
+    current = VERSION
+    if GITEE_REPO:
+        r = _query_latest_release(GITEE_REPO, "gitee")
+        if r and r["tag"]:
+            return _build_update_result(current, r, "gitee")
+    r = _query_latest_release(GITHUB_REPO, "github")
+    if r and r["tag"]:
+        return _build_update_result(current, r, "github")
+    return {"ok": False, "error": "无法获取更新信息（Gitee/GitHub 均失败）"}
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 
@@ -82,9 +242,8 @@ IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 KB_DIR = "knowledge_base"     # 知识库模式（.md 题录）
 PLAIN_DIR = "plain_text"      # 纯文本模式（结构化_*.txt）
 
-# token 用量日志：由 OCR / 结构化阶段自动追加，供用量统计抽屉读取。
-# 与 postprocess.py 对齐：脚本态用脚本目录，打包态用 exe 所在目录（避免 __file__ 指向 _internal）。
-_TOKEN_BASE = APP_DIR
+# token 用量日志等：落到 DATA_DIR（文档/墨痕数据），与产物同目录、跨版本共享。
+_TOKEN_BASE = DATA_DIR
 TOKEN_LOG = os.path.join(_TOKEN_BASE, "token_log.csv")
 # 前端操作日志持久化文件（关闭 exe 后历史可恢复）
 LOG_FILE = os.path.join(_TOKEN_BASE, "box_launcher.log")
@@ -194,24 +353,25 @@ def _load_cfg():
     cfg = {}
     explicit = set()
     p = os.path.join(CONFIG_DIR, "box_config.json")
+    _CFG_KEYS = ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
+                 "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
+                 "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
+                 "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
+                 "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")
     if os.path.exists(p):
         try:
             data = json.load(open(p, encoding="utf-8"))
-            for k in ("BOX_OCR_API_KEY", "BOX_OCR_BASE_URL", "BOX_OCR_MODEL",
-                      "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
-                      "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN"):
+            for k in _CFG_KEYS:
                 if data.get(k):
                     cfg[k] = data[k]; explicit.add(k)
         except Exception:
             pass
-    for k in ("BOX_OCR_API_KEY", "BOX_OCR_BASE_URL", "BOX_OCR_MODEL",
-              "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
-              "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN"):
+    for k in _CFG_KEYS:
         if os.environ.get(k):
             cfg[k] = os.environ[k]; explicit.add(k)
     cfg = {k: v for k, v in cfg.items() if v not in (None, "")}
-    cfg.setdefault("BOX_OCR_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
-    cfg.setdefault("BOX_OCR_MODEL", "")
+    # 兼容旧版：仅有 BOX_OCR_* 时未设置服务商，按千问处理
+    cfg.setdefault("BOX_OCR_PROVIDER", "qwen")
     return cfg, explicit
 
 
@@ -219,9 +379,12 @@ def _ensure_blank_config():
     p = os.path.join(CONFIG_DIR, "box_config.json")
     if os.path.exists(p):
         return
-    blank = {k: "" for k in ("BOX_OCR_API_KEY", "BOX_OCR_BASE_URL", "BOX_OCR_MODEL",
+    blank = {k: "" for k in ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
+                             "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
+                             "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
                              "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                              "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")}
+    blank["BOX_OCR_PROVIDER"] = "qwen"
     try:
         with open(p, "w", encoding="utf-8") as f:
             json.dump(blank, f, ensure_ascii=False, indent=2)
@@ -230,7 +393,9 @@ def _ensure_blank_config():
 
 
 def _cfg_status(cfg, explicit):
-    keys = ("BOX_OCR_API_KEY", "BOX_OCR_BASE_URL", "BOX_OCR_MODEL",
+    keys = ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
+            "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
+            "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
             "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
             "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")
     return {k: (k in explicit) for k in keys}
@@ -242,6 +407,36 @@ def _mask(s):
     return s[:4] + "…" + s[-2:] if len(s) > 8 else "****"
 
 
+def _migrate_cfg():
+    """一次性迁移：旧版配置只含 BOX_OCR_*（千问），迁到 QWEN_* 并补 BOX_OCR_PROVIDER。
+    仅在文件确实存在且含旧字段时改写，避免无谓写盘。"""
+    p = os.path.join(CONFIG_DIR, "box_config.json")
+    if not os.path.exists(p):
+        return
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    if not isinstance(data, dict):
+        return
+    changed = False
+    if data.get("BOX_OCR_API_KEY") and not data.get("QWEN_API_KEY"):
+        data["QWEN_API_KEY"] = data.pop("BOX_OCR_API_KEY", "")
+        data["QWEN_BASE_URL"] = data.pop("BOX_OCR_BASE_URL", "")
+        data["QWEN_MODEL"] = data.pop("BOX_OCR_MODEL", "")
+        changed = True
+    if not data.get("BOX_OCR_PROVIDER"):
+        data["BOX_OCR_PROVIDER"] = "qwen"
+        changed = True
+    if changed:
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+
 def _safe_format(tpl, **kw):
     """安全格式化提示词：缺失的占位符（如自定义 OCR 提示词不含 {src}）保留 {key} 原样，不抛错。"""
     class _SafeDict(dict):
@@ -250,7 +445,7 @@ def _safe_format(tpl, **kw):
     return tpl.format_map(_SafeDict(**kw))
 
 
-def do_ocr(b64, src, prompt_override=None, overrides=None):
+def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None):
     import urllib.request
     import urllib.error
     import ssl
@@ -258,12 +453,21 @@ def do_ocr(b64, src, prompt_override=None, overrides=None):
     if "," in b64:
         b64 = b64.split(",", 1)[1]
     ov = overrides or {}
-    api_key = ov.get("api_key") or cfg.get("BOX_OCR_API_KEY", "")
+    # provider 身份优先跟随前端当前选中（overrides.provider），
+    # 仅在未传时回退 BOX_OCR_PROVIDER，确保切换即时生效、不静默回退千问
+    provider = ov.get("provider") or provider or cfg.get("BOX_OCR_PROVIDER", "qwen")
+    if provider not in OCR_PROVIDERS:
+        provider = "qwen"
+    ppre = OCR_PROVIDERS[provider]["key_prefix"]
+    pdef = OCR_PROVIDERS[provider]
+    api_key = ov.get("api_key") or cfg.get(ppre + "_API_KEY", "")
     if not api_key:
-        return ("【dry_run 占位】未配置 BOX_OCR_API_KEY，未调用真实模型。\n"
-                "标题：\n作者：\n正文：（配置密钥后将返回真实转录；当前为流程验证占位）")
-    base_url = ov.get("base_url") or cfg.get("BOX_OCR_BASE_URL", "")
-    model = ov.get("model") or cfg.get("BOX_OCR_MODEL", "")
+        return ("【未配置 %s 的 API Key】当前 OCR 服务商为「%s」，但其 API Key 未填写。\n"
+                "请在设置中选择该服务商、填入 %s 并保存，再执行识别。\n"
+                "标题：\n作者：\n正文：（未配置密钥，未调用真实模型）"
+                % (ppre, pdef["label"], ppre + "_API_KEY"))
+    base_url = ov.get("base_url") or cfg.get(ppre + "_BASE_URL", "") or pdef["default_base_url"]
+    model = ov.get("model") or cfg.get(ppre + "_MODEL", "") or pdef["default_model"]
     user_text = _safe_format(prompt_override or SINGLE_INSTRUCTION, src=src)
     payload = {
         "model": model,
@@ -516,18 +720,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, HTML, "text/html; charset=utf-8")
         if u.path == "/api/config":
             cfg, explicit = _load_cfg()
+            provider = cfg.get("BOX_OCR_PROVIDER", "qwen")
+            if provider not in OCR_PROVIDERS:
+                provider = "qwen"
+            ppre = OCR_PROVIDERS[provider]["key_prefix"]
+            active_key = cfg.get(ppre + "_API_KEY", "")
+            active_model = cfg.get(ppre + "_MODEL", "")
+            active_base = cfg.get(ppre + "_BASE_URL", "") or OCR_PROVIDERS[provider]["default_base_url"]
             return self._json({
                 "version": VERSION,
-                "dry_run": not bool(cfg.get("BOX_OCR_API_KEY")),
-                "model": _mask(cfg.get("BOX_OCR_MODEL", "")),
-                "base_url_host": urlparse(cfg.get("BOX_OCR_BASE_URL", "")).netloc,
+                "provider": provider,
+                "dry_run": not bool(active_key),
+                "model": _mask(active_model),
+                "base_url_host": urlparse(active_base).netloc,
                 "workdir": HERE,
                 "runtime_dir": RUNTIME_DIR,
                 "has_ds_key": bool(cfg.get("DEEPSEEK_API_KEY")),
                 "config": _cfg_status(cfg, explicit),
                 # 明文回填用（仅本地窗体内返回，不外传）：供前端启动填入输入框
                 "values": {k: cfg.get(k, "") for k in
-                           ("BOX_OCR_API_KEY", "BOX_OCR_BASE_URL", "BOX_OCR_MODEL",
+                           ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
+                            "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
+                            "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
                             "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                             "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")},
                 # 提示词出厂默认（抽屉「恢复默认」回填；自定义留空则回落到此）
@@ -586,6 +800,8 @@ class Handler(BaseHTTPRequestHandler):
             data["ok"] = True
             data["filters"] = {"model": model or "全部", "stage": stage or "全部"}
             return self._json(data)
+        if u.path == "/api/check_update":
+            return self._json(_check_update())
         return self._send(404, "not found")
 
     def do_POST(self):
@@ -665,6 +881,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._cleanup_cropped(data)
         if u.path == "/api/cleanup_cross_raw":
             return self._cleanup_cross_raw(data)
+        if u.path == "/api/open_url":
+            return self._open_url(data)
+        if u.path == "/api/update_download":
+            return self._update_download(data)
+        if u.path == "/api/update_apply":
+            return self._update_apply()
         return self._send(404, "not found")
 
     def _export(self, data):
@@ -954,6 +1176,116 @@ class Handler(BaseHTTPRequestHandler):
                 pass
         return self._json({"ok": True, "removed": removed, "dir_removed": dir_removed, "count": len(removed)})
 
+    def _open_url(self, data):
+        """用系统浏览器打开外部 URL（版本更新页等），不在当前 pywebview 窗体内跳转。"""
+        url = (data.get("url") or "").strip()
+        if not url:
+            return self._json({"ok": False, "error": "缺少 url"})
+        try:
+            webbrowser.open(url, new=2)
+            return self._json({"ok": True})
+        except Exception as e:
+            return self._json({"ok": False, "error": str(e)})
+
+    def _update_download(self, data):
+        """下载更新包 zip → 校验 SHA256 → 解压 → 排除 box_config.json → 生成 TEMP 更新器 bat。
+        返回 ok 后由前端调 /api/update_apply 触发「退出主程序 + bat 覆盖 exe 目录 + 重启」。"""
+        import os, zipfile, shutil, tempfile, urllib.request, urllib.error, ssl
+        url = (data.get("download_url") or "").strip()
+        sha_url = (data.get("sha256_url") or "").strip()
+        if not url:
+            return self._json({"ok": False, "error": "缺少 download_url"})
+        tmp = tempfile.gettempdir()
+        work = os.path.join(tmp, "mohen_update")
+        os.makedirs(work, exist_ok=True)
+        zip_path = os.path.join(work, "pkg.zip")
+        try:
+            # 1) 下载更新包
+            req = urllib.request.Request(url, method="GET")
+            req.add_header("User-Agent", "mohen-updater")
+            ctx = ssl.create_default_context()
+            with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
+                with open(zip_path, "wb") as f:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+            # 2) 校验 SHA256（若 release 附带 checksum 文件）
+            if sha_url:
+                try:
+                    sreq = urllib.request.Request(sha_url, method="GET")
+                    sreq.add_header("User-Agent", "mohen-updater")
+                    with urllib.request.urlopen(sreq, timeout=30, context=ctx) as sresp:
+                        sha_text = sresp.read().decode("utf-8", "ignore")
+                    expected = _parse_sha256(sha_text, os.path.basename(url))
+                    if expected:
+                        actual = _sha256_of_file(zip_path)
+                        if actual.lower() != expected.lower():
+                            return self._json({"ok": False, "error": "SHA256 校验失败，下载可能被篡改"})
+                except Exception as _se:
+                    sys.stderr.write(f"[update] sha 校验跳过：{_se}\n")
+            # 3) 解压
+            pkg_dir = os.path.join(work, "pkg")
+            if os.path.isdir(pkg_dir):
+                shutil.rmtree(pkg_dir)
+            os.makedirs(pkg_dir, exist_ok=True)
+            with zipfile.ZipFile(zip_path) as z:
+                z.extractall(pkg_dir)
+            # 4) 下钻一层：若只有一个子目录且含 exe，则以该子目录为源根
+            entries = [e for e in os.listdir(pkg_dir) if not e.startswith(".")]
+            src_root = pkg_dir
+            if len(entries) == 1 and os.path.isdir(os.path.join(pkg_dir, entries[0])):
+                src_root = os.path.join(pkg_dir, entries[0])
+            # 5) 排除用户配置：不覆盖 box_config.json（保留 API Key 等）
+            cfg_in_pkg = os.path.join(src_root, "box_config.json")
+            if os.path.exists(cfg_in_pkg):
+                os.remove(cfg_in_pkg)
+            # 6) 定位主 exe（优先 墨痕.exe）
+            exe_name = "墨痕.exe"
+            if not os.path.exists(os.path.join(src_root, exe_name)):
+                exes = [f for f in os.listdir(src_root) if f.lower().endswith(".exe")]
+                exe_name = exes[0] if exes else ""
+            if not exe_name:
+                return self._json({"ok": False, "error": "解压后未找到可执行文件"})
+            # 7) 生成更新器 bat：纯 ASCII 内容，路径以参数传入，规避中文路径红线
+            bat_path = os.path.join(work, "apply.bat")
+            bat_content = (
+                "@echo off\r\n"
+                "timeout /t 3 /nobreak > nul\r\n"
+                'xcopy /E /Y /I "%~2\\*" "%~1" > nul\r\n'
+                'start "" /D "%~1" "%~1\\%~3"\r\n'
+            )
+            with open(bat_path, "w", encoding="ascii") as f:
+                f.write(bat_content)
+            global _UPDATE_STATE
+            _UPDATE_STATE = {"bat": bat_path, "app_dir": APP_DIR,
+                             "src_root": src_root, "exe_name": exe_name}
+            return self._json({"ok": True, "exe_name": exe_name, "asset": os.path.basename(url)})
+        except Exception as e:
+            return self._json({"ok": False, "error": f"{type(e).__name__}: {e}"})
+
+    def _update_apply(self):
+        """启动 TEMP 更新器 bat（覆盖 exe 目录后重启），随后退出主程序。"""
+        global _UPDATE_STATE
+        st = _UPDATE_STATE
+        if not st or not os.path.exists(st.get("bat", "")):
+            return self._json({"ok": False, "error": "未找到已下载的更新包，请先点「立即更新」"})
+        try:
+            subprocess.Popen(
+                ["cmd", "/c", st["bat"], st["app_dir"], st["src_root"], st["exe_name"]],
+                shell=False,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+        except Exception as e:
+            return self._json({"ok": False, "error": f"{type(e).__name__}: {e}"})
+        import threading, time as _t
+        def _exit():
+            _t.sleep(0.6)
+            os._exit(0)
+        threading.Thread(target=_exit, daemon=True).start()
+        return self._json({"ok": True, "restarting": True})
+
     def _run_script(self, name, data):
         cfg, _ = _load_cfg()
         script = os.path.join(HERE, {"extract": "extract_original.py",
@@ -966,9 +1298,11 @@ class Handler(BaseHTTPRequestHandler):
         env.setdefault("DEEPSEEK_MODEL", "deepseek-v4-flash")
         # 子进程需能 import stop_flag（脚本目录 HERE），否则冻结态会 ModuleNotFoundError 崩溃
         env["PYTHONPATH"] = HERE + os.pathsep + env.get("PYTHONPATH", "")
+        # 数据目录统一传到子进程，避免 postprocess.py 在打包态把 token_log 写到 exe 目录
+        env["MOHEN_DATA_DIR"] = RUNTIME_DIR
         extra = []
         if name == "postprocess":
-            pmode = (data.get("mode") or "kb").strip() or "kb"
+            pmode = (data.get("mode") or "plain").strip() or "plain"
             top = KB_DIR if pmode != "plain" else PLAIN_DIR
             pages = data.get("pages") or []
             if not pages:
@@ -992,7 +1326,7 @@ class Handler(BaseHTTPRequestHandler):
                 extra = extra + ["--prompt-post-plain", ppp]
         elif name == "group":
             mode = (data.get("mode") or "auto").strip() or "auto"
-            extra = ["--mode", mode, "--src", "cropped_hi", "--dst", "民国报纸OCR"]
+            extra = ["--mode", mode, "--src", _img_dir("cropped_hi"), "--dst", _img_dir("民国报纸OCR")]
         try:
             r = subprocess.run([_py(), "--run-script", script, *extra], cwd=HERE,
                                capture_output=True, text=True, env=env, timeout=900)
@@ -1036,8 +1370,9 @@ class Handler(BaseHTTPRequestHandler):
                                "error": "source/ 中没有可抽图的 PDF / 图片（支持 png/jpg/pdf 等）。请先用「导入文件」放入文件。"})
         out = {"ok": False, "steps": [], "stdout": "", "stderr": ""}
         try:
-            # 1) 抽图：source/ -> cropped_hi/
-            r1 = subprocess.run([_py(), "--run-script", os.path.join(HERE, "extract_original.py")],
+            # 1) 抽图：source/ -> cropped_hi/（绝对路径传给脚本，对齐 DATA_DIR，避免脚本回退到 exe 目录）
+            r1 = subprocess.run([_py(), "--run-script", os.path.join(HERE, "extract_original.py"),
+                                 "--src", src_dir, "--dst", _img_dir("cropped_hi")],
                                 cwd=RUNTIME_DIR, capture_output=True, text=True, env=env, timeout=600)
             out["steps"].append({"step": "extract", "ok": r1.returncode == 0,
                                  "returncode": r1.returncode})
@@ -1074,7 +1409,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(out)
 
     def _save_cfg(self, data):
-        allowed = ("BOX_OCR_API_KEY", "BOX_OCR_BASE_URL", "BOX_OCR_MODEL",
+        allowed = ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
+                   "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
+                   "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
                    "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                    "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")
         p = os.path.join(CONFIG_DIR, "box_config.json")
@@ -1188,6 +1525,8 @@ HTML = r"""<!doctype html>
   .flow-num { display:inline-flex; align-items:center; justify-content:center; width:1.5em; height:1.5em;
               border-radius:50%; background:#e8eefd; color:var(--pri); font-weight:700; font-size:11px; }
   .sub { color:var(--mut); margin:10px 0 0; font-size:12px; line-height:1.6; }
+  .rdo { display:inline-flex; align-items:center; gap:4px; font-size:13px; white-space:nowrap; }
+  .rdo input { margin:0; width:auto; min-width:auto; flex-shrink:0; vertical-align:middle; }
   .btns .sub { margin:0; font-size:12px; }
 
   /* 日志 */
@@ -1281,8 +1620,12 @@ HTML = r"""<!doctype html>
   .drawer-close:hover { background:#eef1f5; color:var(--ink); }
   .drawer-body { flex:1; overflow:auto; padding:16px 18px; }
   .drawer-foot { padding:12px 18px; border-top:1px solid var(--bd); display:flex; gap:10px; align-items:center; }
-  .set-group { background:#fafbfc; border:1px solid var(--bd); border-radius:8px; padding:12px; margin-bottom:12px; }
-  .set-group h3 { margin:0 0 12px; font-size:13px; font-weight:600; }
+  .set-group { background:#fafbfc; border:1px solid var(--bd); border-radius:8px; padding:10px 12px; margin-bottom:10px; }
+  .set-group h3 { margin:0 0 10px; font-size:13px; font-weight:600; }
+  .set-group label { display:block; font-size:12px; color:var(--mut); margin:0 0 4px; }
+  .set-group input, .set-group select { padding:6px 10px; font-size:13px; line-height:1.4; }
+  .set-group .row { margin-bottom:8px; }
+  .set-group .row:last-child { margin-bottom:0; }
   .key-field { display:flex; flex-direction:column; }
   .key-field .input-wrap { position:relative; }
   .key-field input { padding-right:38px !important; }
@@ -1428,14 +1771,14 @@ HTML = r"""<!doctype html>
 
     <div class="card">
       <h2>③ OCR识别</h2>
-      <div class="btns">
-        <button id="recogAll">识别全部</button>
-        <button class="stop" id="clearBoxes">清空框选</button>
-      </div>
       <p class="sub">组 = 一篇文章：同组（同色）框合并识别/导出为一篇，留空则自动合并为一篇，组内按“标题 → 作者 → 正文”排序。</p>
       <div style="margin-top:12px; border-top:1px solid var(--bd); padding-top:12px;">
         <h3 style="font-size:13px;font-weight:600;margin:0 0 8px;color:var(--ink);">已框选区域（按阅读顺序，序号 = 导出次序）</h3>
         <div id="boxList"><div style="color:var(--mut); font-size:12px;">尚未框选</div></div>
+      </div>
+      <div class="btns" style="margin-top:12px;">
+        <button id="recogAll">识别全部</button>
+        <button class="stop" id="clearBoxes">清空框选</button>
       </div>
     </div>
 
@@ -1449,8 +1792,8 @@ HTML = r"""<!doctype html>
       <div class="btns" style="margin-top:10px; align-items:center; flex-wrap:nowrap; gap:8px;">
         <label style="margin:0; display:flex; align-items:center; white-space:nowrap;">结构化模式：</label>
         <select id="postMode" style="width:auto; min-width:90px;">
-          <option value="kb" selected>知识库.md</option>
-          <option value="plain">纯文本.txt</option>
+          <option value="kb">知识库.md</option>
+          <option value="plain" selected>纯文本.txt</option>
         </select>
         <button class="purple" id="runPost">结构化</button>
         <button class="sec" id="exportAll" title="把 output/knowledge_base 下的 .md 和 output/plain_text 下的结构化 .txt 统一复制到 output/oneclick/ 中（直接平铺，不分子文件夹、不按次分文件夹），原产物保持不变">一键导出</button>
@@ -1482,7 +1825,12 @@ HTML = r"""<!doctype html>
   </div>
   <div class="drawer-body">
     <div class="set-group">
-      <h3>OCR 视觉模型</h3>
+      <h3>OCR 视觉模型（任选一）</h3>
+      <div class="row" style="margin-bottom:8px; align-items:center; gap:10px; flex-wrap:nowrap;">
+        <label class="rdo"><input type="radio" name="cfgProvider" value="qwen"> 千问（日常）</label>
+        <label class="rdo"><input type="radio" name="cfgProvider" value="doubao"> 豆包（疑难）</label>
+        <label class="rdo"><input type="radio" name="cfgProvider" value="other"> 其他（自定义）</label>
+      </div>
       <div class="row">
         <div class="key-field"><label>OCR API Key</label>
           <div class="input-wrap">
@@ -1491,7 +1839,7 @@ HTML = r"""<!doctype html>
           </div></div>
         <div><label>模型名</label><input id="cfgModel" placeholder=""></div>
       </div>
-      <label>OCR Base URL（可选，默认千问AI平台）</label>
+      <label id="cfgBaseUrlLabel">OCR Base URL（可选，默认千问AI平台）</label>
       <input id="cfgBaseUrl" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
     </div>
     <div class="set-group">
@@ -1506,6 +1854,14 @@ HTML = r"""<!doctype html>
       </div>
       <label>DeepSeek Base URL（可选，默认官方）</label>
       <input id="cfgDsUrl" placeholder="https://api.deepseek.com">
+    </div>
+    <div class="set-group">
+      <h3>版本更新</h3>
+      <div class="row" style="align-items:center; gap:12px; flex-wrap:wrap;">
+        <span class="sub">当前版本：<span id="curVersion">--</span></span>
+        <button class="sec" id="checkUpdateBtn" type="button">检查更新</button>
+      </div>
+      <div id="updateStatus" class="sub" style="margin-top:6px;"></div>
     </div>
   </div>
   <div class="drawer-foot">
@@ -1560,8 +1916,8 @@ HTML = r"""<!doctype html>
     </div>
     <div class="set-group">
       <div class="mode-tabs">
-        <label><input type="radio" name="postModeEdit" value="kb" checked> 知识库模式</label>
-        <label><input type="radio" name="postModeEdit" value="plain"> 纯文本</label>
+        <label><input type="radio" name="postModeEdit" value="kb"> 知识库模式</label>
+        <label><input type="radio" name="postModeEdit" value="plain" checked> 纯文本</label>
       </div>
       <h3>结构化提示词<span class="reset" id="resetPost">恢复默认</span></h3>
       <p class="sub" id="postHint">知识库模式：用于「结构化」阶段题录抽取，产物为.md格式。</p>
@@ -1596,15 +1952,46 @@ function groupColor(g){ let h=0; for(let i=0;i<g.length;i++) h=(h*31+g.charCodeA
 const HANDLE=9, HIT_PAD=2;
 
 // ---------- 配置 / 状态 ----------
-fetch('/api/config').then(r=>r.json()).then(c=>{ backendCfg=c; window.__RUNTIME_DIR=c.runtime_dir||''; fillCfgInputs(c.values||{}); updateCfgLine(); }).catch(()=>{ $('cfgLine').textContent='配置读取失败'; });
+let CURRENT_VERSION = '';
+const RELEASE_PAGE_URL = 'https://github.com/dabuxiaobu/mohen-newspaper-ocr/releases';
+fetch('/api/config').then(r=>r.json()).then(c=>{ backendCfg=c; window.__RUNTIME_DIR=c.runtime_dir||''; CURRENT_VERSION = c.version || ''; if($('curVersion')) $('curVersion').textContent = CURRENT_VERSION || '--'; fillCfgInputs(c.values||{}); updateCfgLine(); }).catch(()=>{ $('cfgLine').textContent='配置读取失败'; });
 // 启动恢复历史日志（关闭 exe 不丢失）
 restoreLogs();
 // 启动时把已保存的密钥/模型回填进输入框，避免重开后看似"丢失"
-function fillCfgInputs(v){
-  const map = { BOX_OCR_API_KEY:'cfgApiKey', BOX_OCR_BASE_URL:'cfgBaseUrl', BOX_OCR_MODEL:'cfgModel',
-                DEEPSEEK_API_KEY:'cfgDsKey', DEEPSEEK_MODEL:'cfgDsModel', DEEPSEEK_BASE_URL:'cfgDsUrl' };
-  for(const k in map){ const el=$(map[k]); if(el && v[k]) el.value=v[k]; }
+// OCR 服务商切换：每个服务商各存一组凭据，切换时回填对应值
+let ocrProvider = 'qwen';
+const ocrStash = { qwen:{api_key:'',base_url:'',model:''}, doubao:{api_key:'',base_url:'',model:''}, other:{api_key:'',base_url:'',model:''} };
+function applyProviderFromValues(v){
+  v = v || {};
+  for(const p of ['qwen','doubao','other']){ const pre=p.toUpperCase();
+    ocrStash[p] = { api_key:v[pre+'_API_KEY']||'', base_url:v[pre+'_BASE_URL']||'', model:v[pre+'_MODEL']||'' }; }
+  ocrProvider = (['qwen','doubao','other'].includes(v.BOX_OCR_PROVIDER)) ? v.BOX_OCR_PROVIDER : 'qwen';
+  setProviderRadio(ocrProvider);
+  fillActiveProviderInputs();
 }
+function setProviderRadio(p){ const r=document.querySelector('input[name="cfgProvider"][value="'+p+'"]'); if(r) r.checked=true; }
+function fillActiveProviderInputs(){
+  const s = ocrStash[ocrProvider];
+  $('cfgApiKey').value = s.api_key; $('cfgBaseUrl').value = s.base_url; $('cfgModel').value = s.model;
+  const def = (ocrProvider==='qwen')
+    ? { key:'sk-...', base:'https://dashscope.aliyuncs.com/compatible-mode/v1', model:'' }
+    : (ocrProvider==='doubao')
+    ? { key:'ark-', base:'https://ark.cn-beijing.volces.com/api/v3', model:'' }
+    : { key:'', base:'', model:'' };
+  $('cfgApiKey').placeholder = def.key;
+  $('cfgBaseUrl').placeholder = def.base;
+  $('cfgModel').placeholder = def.model;
+  const lbl=$('cfgBaseUrlLabel'); if(lbl) lbl.textContent = (ocrProvider==='qwen')
+    ? 'OCR Base URL（可选，默认千问AI平台）'
+    : (ocrProvider==='doubao')
+    ? 'OCR Base URL（可选，默认火山方舟）'
+    : 'OCR Base URL';
+}
+function stashActive(){
+  const s = ocrStash[ocrProvider];
+  s.api_key=$('cfgApiKey').value.trim(); s.base_url=$('cfgBaseUrl').value.trim(); s.model=$('cfgModel').value.trim();
+}
+function fillCfgInputs(v){ applyProviderFromValues(v); }
 function updateCfgLine(){
   const hasKey = backendCfg && backendCfg.dry_run===false;
   const model = (backendCfg&&backendCfg.model)||'未配置';
@@ -1612,8 +1999,7 @@ function updateCfgLine(){
   if(!hasKey) $('cfgLine').innerHTML='OCR：<span class="warn">未配置 API_KEY</span> 模型 '+model+' <b>请点「设置」填写 OCR 密钥与模型名</b>';
   else $('cfgLine').innerHTML='OCR：真实调用 · 模型 <b>'+model+'</b> @ '+host;
 }
-function getOverrides(){ const o={}; const bu=$('cfgBaseUrl').value.trim(),ak=$('cfgApiKey').value.trim(),mo=$('cfgModel').value.trim();
-  if(bu)o.base_url=bu; if(ak)o.api_key=ak; if(mo)o.model=mo; return Object.keys(o).length?o:null; }
+function getOverrides(){ const s=ocrStash[ocrProvider]||{}; const o={provider:ocrProvider}; if(s.base_url)o.base_url=s.base_url; if(s.api_key)o.api_key=s.api_key; if(s.model)o.model=s.model; return o; }
 
 // ---------- 加载图片（canvas drawImage 直接绘制，载入即显示，无需点击） ----------
 function loadDataURL(url,name,idx){ const pname=(name||'').replace(/\.[^.]+$/,'');
@@ -1879,7 +2265,7 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
   log('[识别全部] 已识别 '+okCount+' / '+pageOrder.length+' 版'+(cross?'（跨页模式：按阅读顺序合并为一篇）':'（单页模式：每版独立）')+'。');
   log('[识别全部] 本次 OCR 消耗 → 输入 '+ocrPt.toLocaleString()+' + 输出 '+ocrCt.toLocaleString()+' = 总 '+ocrTt.toLocaleString()+' tokens；OCR 接口耗时 '+ocrDur.toFixed(2)+'s，总耗时 '+wall+'s。');
   // 记录一次「识别全部」运行；OCR 调用次数按本次识别的「组」数计（每个 group 1 次，含未标 group 自动合并的默认组）
-  if(okCount>0){ try{ const cfgModel=(backendCfg&&backendCfg.values&&backendCfg.values.BOX_OCR_MODEL)||''; const callGroups=aggregateCrossTargets(); fetch('/api/ocr_run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:cfgModel,pages:pageOrder.length,boxes:pageOrder.reduce((s,p)=>s+((allPageData[p]&&allPageData[p].boxes)?allPageData[p].boxes.length:0),0),calls:callGroups.length})}).catch(()=>{}); }catch(e){} }
+  if(okCount>0){ try{ const _prov=(backendCfg&&backendCfg.values&&backendCfg.values.BOX_OCR_PROVIDER)||'qwen'; const _pre=_prov.toUpperCase(); const cfgModel=(backendCfg&&backendCfg.values&&backendCfg.values[_pre+'_MODEL'])||''; const callGroups=aggregateCrossTargets(); fetch('/api/ocr_run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:cfgModel,pages:pageOrder.length,boxes:pageOrder.reduce((s,p)=>s+((allPageData[p]&&allPageData[p].boxes)?allPageData[p].boxes.length:0),0),calls:callGroups.length})}).catch(()=>{}); }catch(e){} }
   if(failedPages.length) log('[识别全部] 以下版识别失败：'+failedPages.join('、'));
   // 跨页模式：循环结束后统一导出合并结果；单页模式已在循环内逐版导出，此处不再重复导出
   if(cross){ exportTxt(false); exportJson(false); } }
@@ -2052,7 +2438,7 @@ function runExtractAndGroup(){
     else log('失败：'+(j.error||''));
   }).catch(e=>log('抽图并归档失败：'+e)); }
 async function runPost(){
-  const mode = $('postMode') ? $('postMode').value : 'kb';
+  const mode = $('postMode') ? $('postMode').value : 'plain';
   const isCross = mergeMode==='cross' && pageOrder.length>1;
   const top = (mode==='plain' ? 'plain_text' : 'knowledge_base');
   // 统一空状态守卫：未载入任何版时直接提示，不调用后端，避免生成「未命名」空文件夹
@@ -2329,6 +2715,45 @@ $('loadCropped').onclick=async ()=>{
 
 // ---------- 抽屉（设置 / 用量统计 / 提示词） ----------
 const mask=$('drawerMask'); const drawer=$('drawer'); const usageDrawer=$('usageDrawer'); const promptDrawer=$('promptDrawer');
+async function openExternalUrl(url){
+  try { await fetch('/api/open_url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})}); }
+  catch(e){ log('[打开链接] 失败：'+e); }
+}
+async function checkUpdate(){
+  const st=$('updateStatus');
+  if(!st) return;
+  st.textContent='检查中…'; st.style.color='var(--mut)';
+  try{
+    const r=await fetch('/api/check_update',{cache:'no-store'});
+    const j=await r.json();
+    if(!j.ok) throw new Error(j.error||'检查失败');
+    if(j.need){
+      let html='发现新版本 <b>'+escHtml(j.latest)+'</b>（当前 '+escHtml(j.current||'--')+'）';
+      html+=' <button class="sec" id="doUpdate" style="margin-left:8px;">立即更新</button>';
+      st.innerHTML=html;
+      $('doUpdate').onclick=()=>startUpdate(j);
+    } else {
+      st.textContent='当前已是最新版本（'+escHtml(j.current||'--')+'）'; st.style.color='var(--ok)';
+    }
+  }catch(e){
+    st.innerHTML='检查失败：'+escHtml((e&&e.message)||e)+' <button class="sec" id="gotoReleaseFallback">手动打开发布页</button>'; st.style.color='var(--warn)';
+    $('gotoReleaseFallback').onclick=()=>openExternalUrl(RELEASE_PAGE_URL);
+  }
+}
+async function startUpdate(j){
+  const st=$('updateStatus'); if(!st) return;
+  st.textContent='正在下载更新包…（可能需要一会儿）'; st.style.color='var(--mut)';
+  try{
+    const r=await fetch('/api/update_download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({download_url:j.download_url, sha256_url:j.sha256_url})});
+    const d=await r.json();
+    if(!d.ok) throw new Error(d.error||'下载失败');
+    st.textContent='下载完成，正在重启以完成升级…'; st.style.color='var(--ok)';
+    try{ await fetch('/api/update_apply',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); }catch(e){}
+  }catch(e){
+    st.innerHTML='下载失败：'+escHtml((e&&e.message)||e)+' <button class="sec" id="gotoReleaseFallback2">手动打开发布页</button>'; st.style.color='var(--err)';
+    const fb=$('gotoReleaseFallback2'); if(fb) fb.onclick=()=>openExternalUrl(j.page_url||RELEASE_PAGE_URL);
+  }
+}
 function openSettingsDrawer(){ drawer.classList.add('open'); usageDrawer.classList.remove('open'); promptDrawer.classList.remove('open'); mask.classList.add('open'); }
 function openUsageDrawer(){ usageDrawer.classList.add('open'); drawer.classList.remove('open'); promptDrawer.classList.remove('open'); mask.classList.add('open'); loadUsage(); }
 function openPromptDrawer(){ loadPrompts(); promptDrawer.classList.add('open'); drawer.classList.remove('open'); usageDrawer.classList.remove('open'); mask.classList.add('open'); }
@@ -2336,6 +2761,7 @@ function closeDrawers(){ drawer.classList.remove('open'); usageDrawer.classList.
 $('gearBtn').onclick=openSettingsDrawer; $('drawerClose').onclick=closeDrawers;
 $('usageBtn').onclick=openUsageDrawer; $('usageClose').onclick=closeDrawers; mask.onclick=closeDrawers;
 $('promptBtn').onclick=openPromptDrawer; $('promptClose').onclick=closeDrawers;
+$('checkUpdateBtn').onclick=checkUpdate;
 document.addEventListener('keydown', e=>{ if(e.key==='Escape'&&(drawer.classList.contains('open')||usageDrawer.classList.contains('open')||promptDrawer.classList.contains('open'))) closeDrawers(); });
 
 // ---------- 提示词抽屉 ----------
@@ -2353,9 +2779,9 @@ async function loadPrompts(){
     $('prompt_ocr').value = (c.values && c.values.PROMPT_OCR && c.values.PROMPT_OCR.trim()) ? c.values.PROMPT_OCR : (c.prompt_ocr_default || '');
     postPrompts.kb    = (c.values && c.values.PROMPT_POST       && c.values.PROMPT_POST.trim())       ? c.values.PROMPT_POST       : postDef.kb;
     postPrompts.plain = (c.values && c.values.PROMPT_POST_PLAIN && c.values.PROMPT_POST_PLAIN.trim()) ? c.values.PROMPT_POST_PLAIN : postDef.plain;
-    postEditMode = 'kb';
-    const rb = document.querySelector('input[name=postModeEdit][value=kb]'); if (rb) rb.checked = true;
-    $('prompt_post').value = postPrompts.kb;
+    postEditMode = 'plain';
+    const rb = document.querySelector('input[name=postModeEdit][value=plain]'); if (rb) rb.checked = true;
+    $('prompt_post').value = postPrompts.plain;
     updatePostHint();
   } catch(e){ log('[提示词] 读取配置失败：'+e); }
 }
@@ -2448,8 +2874,17 @@ $('logBtn').onclick=toggleLogSheet; $('logSheetClose').onclick=closeLogSheet;
 const EYE_OPEN=`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
 const EYE_CLOSED=`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.84 9.84 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-3.72.91-3.46 3.46"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`;
 document.querySelectorAll('.eye').forEach(e=>{ e.innerHTML=EYE_CLOSED; e.onclick=()=>{ const inp=$(e.dataset.target); const show=inp.type==='password'; inp.type=show?'text':'password'; e.innerHTML=show?EYE_OPEN:EYE_CLOSED; }; });
-function collectCfg(){ return { BOX_OCR_API_KEY:$('cfgApiKey').value.trim(), BOX_OCR_BASE_URL:$('cfgBaseUrl').value.trim(), BOX_OCR_MODEL:$('cfgModel').value.trim(),
-  DEEPSEEK_API_KEY:$('cfgDsKey').value.trim(), DEEPSEEK_BASE_URL:$('cfgDsUrl').value.trim(), DEEPSEEK_MODEL:$('cfgDsModel').value.trim() }; }
+// OCR 服务商：输入框实时暂存 + 切换时回填对应服务商凭据
+['cfgApiKey','cfgBaseUrl','cfgModel'].forEach(id=>{ const el=$(id); if(el) el.addEventListener('input', stashActive); });
+document.querySelectorAll('input[name="cfgProvider"]').forEach(r=>{ r.addEventListener('change',()=>{ if(r.checked){ stashActive(); ocrProvider=r.value; fillActiveProviderInputs(); } }); });
+function collectCfg(){
+  stashActive();
+  const d = { BOX_OCR_PROVIDER: ocrProvider };
+  for(const p of ['qwen','doubao','other']){ const pre=p.toUpperCase(); const s=ocrStash[p];
+    d[pre+'_API_KEY']=s.api_key; d[pre+'_BASE_URL']=s.base_url; d[pre+'_MODEL']=s.model; }
+  d.DEEPSEEK_API_KEY=$('cfgDsKey').value.trim(); d.DEEPSEEK_BASE_URL=$('cfgDsUrl').value.trim(); d.DEEPSEEK_MODEL=$('cfgDsModel').value.trim();
+  return d;
+}
 function saveCfgToBackend(clear){ const data=collectCfg(); if(clear)for(const k in data)data[k]='';
   const hint=$('saveHint'); hint.textContent='保存中…'; hint.style.color='var(--mut)';
   fetch('/api/config/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)}).then(r=>r.json()).then(j=>{
@@ -2623,6 +3058,7 @@ def main():
             except ValueError:
                 pass
     _ensure_blank_config()
+    _migrate_cfg()
     _enforce_single_instance(port)
     server = None
     for _ in range(10):
