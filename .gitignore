@@ -41,3 +41,6 @@ scripts/民国报纸OCR/
 scripts/box_launcher.py.current_img_*
 # 注：scripts/stop_flag.py 是核心运行时文件（子进程 --run-script 机制依赖，
 #     box_launcher.py 会 import 它），必须随仓库发布，故不在此忽略。
+
+# 开发者私有文件（本人内部文档，不对外公开、不进任何远程仓库）
+SKILL.md
