@@ -101,7 +101,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -144,6 +144,8 @@ GITEE_REPO = "dabuxiaobu/mohen-newspaper-ocr"
 GITHUB_REPO = "dabuxiaobu/mohen-newspaper-ocr"
 # 自动更新挑选 Windows 包的关键字（release asset 名称含其一且以 .zip 结尾）
 WIN_PKG_KEYWORDS = ("windows", "win", "onedir", "exe")
+# 自动更新挑选 macOS 包的关键字（release asset 名称含 macos 且以 .zip 结尾，即 build_mac.sh 的绿色版 zip）
+MAC_PKG_KEYWORDS = ("macos",)
 # 跨「下载→应用」的更新状态（单进程内存；下载后写入，重启时读取）
 _UPDATE_STATE = {}
 
@@ -199,22 +201,55 @@ def _query_latest_release(repo, provider):
                        "url": a.get("browser_download_url") or a.get("url") or ""})
     return {"tag": tag, "notes": notes, "assets": assets, "page_url": page_url}
 
+def _mac_arch_keyword():
+    """当前 Mac 架构关键词（arm64 / x86_64 / None），用于匹配 release 中对应架构的包。"""
+    try:
+        import platform as _platform
+        m = _platform.machine()
+    except Exception:
+        m = ""
+    if m in ("arm64", "aarch64"):
+        return "arm64"
+    if m in ("x86_64", "amd64"):
+        return "x86_64"
+    return None
+
 def _build_update_result(current, rel, provider):
+    is_mac = (sys.platform == "darwin")
     win_asset = None
+    mac_asset = None
     fallback_zip = None
     for a in rel["assets"]:
         n = a["name"].lower()
-        if n.endswith(".zip"):
-            if fallback_zip is None:
-                fallback_zip = a
+        if not n.endswith(".zip"):
+            continue
+        if fallback_zip is None:
+            fallback_zip = a
+        if is_mac:
+            # macOS：挑含 macos 的 zip；优先匹配当前架构（arm64/x86_64）
+            if "macos" in n:
+                arch = _mac_arch_keyword()
+                if arch is None or arch in n:
+                    mac_asset = a
+                    break
+        else:
             if any(k in n for k in WIN_PKG_KEYWORDS):
                 win_asset = a
                 break
-    target = win_asset or fallback_zip
+    target = mac_asset or win_asset or fallback_zip
+    # sha256 校验文件：优先「与选中包同名 + .sha256.txt」（本工具发布物的命名方式），
+    # 其次兼容通用名 sha256.txt / checksums.txt 等。
     sha_asset = None
-    for a in rel["assets"]:
-        if a["name"].lower() in ("sha256.txt", "sha256sums.txt", "checksums.txt", "checksums.sha256"):
-            sha_asset = a
+    if target:
+        want = target["name"] + ".sha256.txt"
+        for a in rel["assets"]:
+            if a["name"] == want:
+                sha_asset = a
+                break
+    if sha_asset is None:
+        for a in rel["assets"]:
+            if a["name"].lower() in ("sha256.txt", "sha256sums.txt", "checksums.txt", "checksums.sha256"):
+                sha_asset = a
     need = bool(target) and bool(rel["tag"]) and rel["tag"] != current
     return {
         "ok": True, "current": current, "latest": rel["tag"],
@@ -223,6 +258,7 @@ def _build_update_result(current, rel, provider):
         "asset_name": target["name"] if target else "",
         "sha256_url": sha_asset["url"] if sha_asset else "",
         "need": need,
+        "platform": "macos" if is_mac else "windows",
     }
 
 def _check_update():
@@ -532,16 +568,16 @@ def _aggregate_usage(model_filter="", stage_filter=""):
     by_model = {}
     calls = 0; pt = 0; ct = 0; tt = 0; dur = 0.0
     models = set()
-    # OCR 运行次数按「组」聚合：一次「识别全部」里，每个 group（含未标 group 自动合并的默认组）算 1 次。
-    # 兼容旧 ocr_runs.csv（无 calls 列）：缺省按 1 次计。
-    ocr_runs = {}
+    # OCR「运行次数」= 一次「识别全部」算 1 次（按 ocr_runs.csv 行数计），与框数/组数无关。
+    # 平均耗时 = 该模型累计耗时 ÷ 运行次数。
+    ocr_run_count = {}
     if os.path.exists(OCR_RUN_LOG):
         with open(OCR_RUN_LOG, encoding="utf-8", newline="") as f:
             for row in csv.DictReader(f):
                 mdl = (row.get("model") or "").strip()
                 if model_filter and model_filter != "全部" and mdl != model_filter:
                     continue
-                ocr_runs[mdl] = ocr_runs.get(mdl, 0) + int(row.get("calls") or 1)
+                ocr_run_count[mdl] = ocr_run_count.get(mdl, 0) + 1  # 每行即一次「识别全部」
     if not os.path.exists(TOKEN_LOG):
         return {"summary": dict(empty), "by_model": [], "models": []}
     with open(TOKEN_LOG, encoding="utf-8", newline="") as f:
@@ -566,10 +602,10 @@ def _aggregate_usage(model_filter="", stage_filter=""):
             bm = by_model.setdefault((model, stage), dict(empty))
             bm["calls"] += 1; bm["prompt"] += p; bm["completion"] += c
             bm["total"] += t; bm["duration_s"] += d
-    # OCR 阶段「调用」列用 ocr_runs（一次识别=1），结构化阶段用实际 calls
+    # OCR 阶段「调用/平均耗时」用运行次数（一次识别=1），结构化阶段用实际 API 调用数
     for (model, stage), bm in by_model.items():
         if stage == "box_ocr":
-            bm["ocr_calls"] = ocr_runs.get(model, 0)
+            bm["ocr_calls"] = ocr_run_count.get(model, 0)
         else:
             bm["ocr_calls"] = bm["calls"]
     summary = {"calls": calls, "prompt": pt, "completion": ct, "total": tt,
@@ -664,7 +700,15 @@ def _gather_round(out_root, work, pages, old_cross_dir):
         os.makedirs(work, exist_ok=True)
         for src, dst, fn in to_move:
             if os.path.exists(dst):
-                skipped.append(fn)
+                # 重新结构化（如隔天重识别同一批图）：用本次最新 OCR 产物覆盖 work 中的旧文件，
+                # 否则上次/昨日产物会残留在 work 里，postprocess 会拿旧 OCR 当输入，
+                # 导致结构化的 知识库/纯文本 内容不更新（但仍被一键导出复制，呈现「文件夹更新了、产物没更新」）。
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                shutil.move(src, dst)
+                moved.append(fn)
             else:
                 shutil.move(src, dst)
                 moved.append(fn)
@@ -1190,6 +1234,7 @@ class Handler(BaseHTTPRequestHandler):
     def _update_download(self, data):
         """下载更新包 zip → 校验 SHA256 → 解压 → 排除 box_config.json → 生成 TEMP 更新器 bat。
         返回 ok 后由前端调 /api/update_apply 触发「退出主程序 + bat 覆盖 exe 目录 + 重启」。"""
+        global _UPDATE_STATE
         import os, zipfile, shutil, tempfile, urllib.request, urllib.error, ssl
         url = (data.get("download_url") or "").strip()
         sha_url = (data.get("sha256_url") or "").strip()
@@ -1237,6 +1282,54 @@ class Handler(BaseHTTPRequestHandler):
             src_root = pkg_dir
             if len(entries) == 1 and os.path.isdir(os.path.join(pkg_dir, entries[0])):
                 src_root = os.path.join(pkg_dir, entries[0])
+
+            # ===== macOS 分支：整包替换 .app 并回写用户配置 =====
+            if sys.platform == "darwin":
+                # 定位解压出的 .app 包（ditto --keepParent 打包，zip 顶层即 墨痕.app）
+                app_candidates = []
+                for _root, _dirs, _files in os.walk(pkg_dir):
+                    for _d in _dirs:
+                        if _d.lower().endswith(".app"):
+                            app_candidates.append(os.path.join(_root, _d))
+                if not app_candidates:
+                    return self._json({"ok": False, "error": "解压后未找到 .app 包"})
+                new_app = sorted(app_candidates, key=lambda p: len(p))[0]
+                # 若新包误带配置则移除，再从当前运行实例回写（保留 API Key 等）
+                _cfg_pkg = os.path.join(new_app, "Contents", "MacOS", "box_config.json")
+                if os.path.exists(_cfg_pkg):
+                    os.remove(_cfg_pkg)
+                _old_cfg = os.path.join(APP_DIR, "box_config.json")
+                if os.path.exists(_old_cfg):
+                    try:
+                        shutil.copyfile(_old_cfg, os.path.join(new_app, "Contents", "MacOS", "box_config.json"))
+                    except Exception:
+                        pass
+                # .app 路径：APP_DIR 在 macOS = <app>/Contents/MacOS
+                app_bundle = os.path.dirname(os.path.dirname(APP_DIR))
+                sh_path = os.path.join(work, "apply.sh")
+                sh_content = (
+                    "#!/bin/sh\n"
+                    "sleep 3\n"
+                    'APP_BUNDLE="$1"\n'
+                    'NEW_APP="$2"\n'
+                    'OLD_BAK="${APP_BUNDLE}.old"\n'
+                    'pkill -f "$(basename "$APP_BUNDLE")" 2>/dev/null || true\n'
+                    'if [ -e "$APP_BUNDLE" ]; then\n'
+                    '  mv "$APP_BUNDLE" "$OLD_BAK" 2>/dev/null || rm -rf "$APP_BUNDLE" 2>/dev/null || true\n'
+                    "fi\n"
+                    'cp -R "$NEW_APP" "$APP_BUNDLE" 2>/dev/null\n'
+                    'xattr -dr com.apple.quarantine "$APP_BUNDLE" 2>/dev/null || true\n'
+                    'open "$APP_BUNDLE" 2>/dev/null || true\n'
+                    'rm -rf "$OLD_BAK" 2>/dev/null || true\n'
+                )
+                with open(sh_path, "w", encoding="utf-8") as _f:
+                    _f.write(sh_content)
+                try:
+                    os.chmod(sh_path, 0o755)
+                except Exception:
+                    pass
+                _UPDATE_STATE = {"script": sh_path, "app_bundle": app_bundle, "new_app": new_app}
+                return self._json({"ok": True, "exe_name": "墨痕.app", "asset": os.path.basename(url)})
             # 5) 排除用户配置：不覆盖 box_config.json（保留 API Key 等）
             cfg_in_pkg = os.path.join(src_root, "box_config.json")
             if os.path.exists(cfg_in_pkg):
@@ -1258,7 +1351,6 @@ class Handler(BaseHTTPRequestHandler):
             )
             with open(bat_path, "w", encoding="ascii") as f:
                 f.write(bat_content)
-            global _UPDATE_STATE
             _UPDATE_STATE = {"bat": bat_path, "app_dir": APP_DIR,
                              "src_root": src_root, "exe_name": exe_name}
             return self._json({"ok": True, "exe_name": exe_name, "asset": os.path.basename(url)})
@@ -1266,10 +1358,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": False, "error": f"{type(e).__name__}: {e}"})
 
     def _update_apply(self):
-        """启动 TEMP 更新器 bat（覆盖 exe 目录后重启），随后退出主程序。"""
+        """启动 TEMP 更新器（Windows: bat 覆盖 exe 目录；macOS: sh 替换 .app），随后退出主程序。"""
         global _UPDATE_STATE
         st = _UPDATE_STATE
-        if not st or not os.path.exists(st.get("bat", "")):
+        if not st:
+            return self._json({"ok": False, "error": "未找到已下载的更新包，请先点「立即更新」"})
+        # ===== macOS：/bin/sh 启动 apply.sh 替换 .app 后退出 =====
+        if sys.platform == "darwin":
+            if not os.path.exists(st.get("script", "")):
+                return self._json({"ok": False, "error": "未找到已下载的更新包，请先点「立即更新」"})
+            try:
+                subprocess.Popen(
+                    ["/bin/sh", st["script"], st["app_bundle"], st["new_app"]],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except Exception as e:
+                return self._json({"ok": False, "error": f"{type(e).__name__}: {e}"})
+            import threading, time as _t
+            def _exit():
+                _t.sleep(0.6)
+                os._exit(0)
+            threading.Thread(target=_exit, daemon=True).start()
+            return self._json({"ok": True, "restarting": True})
+        # ===== Windows：cmd 启动 apply.bat 覆盖 exe 目录后重启 =====
+        if not os.path.exists(st.get("bat", "")):
             return self._json({"ok": False, "error": "未找到已下载的更新包，请先点「立即更新」"})
         try:
             subprocess.Popen(
@@ -1316,6 +1428,17 @@ class Handler(BaseHTTPRequestHandler):
             if not moved and not skipped:
                 # 没有任何可结构化产物，不创建空目录、不调用 postprocess.py
                 return self._json({"ok": True, "stdout": "该工作集没有可结构化的 OCR 产物（未生成 .txt / .json / 原图），未创建输出文件夹。", "skipped": True})
+            # 重新结构化（如隔天重识别同一批图）：先清掉 work 里上一轮已生成的产品
+            # （_题录.md / 结构化_*.txt）。否则 postprocess.py 检测到产物已存在会 skip，
+            # 导致重识别后的新 OCR 无法重新生成题录，产物内容停留在旧版——one-click 导出
+            # 复制到的仍是旧内容。清理后 postprocess 必重新调用模型生成最新产物。
+            if os.path.isdir(work):
+                for _fn in os.listdir(work):
+                    if _fn.endswith("_题录.md") or _fn.startswith("结构化_"):
+                        try:
+                            os.remove(os.path.join(work, _fn))
+                        except OSError:
+                            pass
             extra = ["--root", work, "--post-mode", pmode]   # 串联断点修复：指向本工具 OCR 产物
             # 提示词抽屉保存的覆盖：kb 模式用 PROMPT_POST，plain 模式用 PROMPT_POST_PLAIN
             pp = (cfg.get("PROMPT_POST") or "").strip()
@@ -2262,10 +2385,13 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
   const cross = mergeMode==='cross';
   const okCount = pageOrder.length - failedPages.length;
   const wall = ((performance.now()-tStart)/1000).toFixed(2);
+  const _prov=(backendCfg&&backendCfg.values&&backendCfg.values.BOX_OCR_PROVIDER)||'qwen';
+  const _pre=_prov.toUpperCase();
+  const cfgModel=(backendCfg&&backendCfg.values&&backendCfg.values[_pre+'_MODEL'])||'';
   log('[识别全部] 已识别 '+okCount+' / '+pageOrder.length+' 版'+(cross?'（跨页模式：按阅读顺序合并为一篇）':'（单页模式：每版独立）')+'。');
-  log('[识别全部] 本次 OCR 消耗 → 输入 '+ocrPt.toLocaleString()+' + 输出 '+ocrCt.toLocaleString()+' = 总 '+ocrTt.toLocaleString()+' tokens；OCR 接口耗时 '+ocrDur.toFixed(2)+'s，总耗时 '+wall+'s。');
+  log('[识别全部] 本次 OCR 消耗'+(cfgModel?'（'+cfgModel+'）':'')+' → 输入 '+ocrPt.toLocaleString()+' + 输出 '+ocrCt.toLocaleString()+' = 总 '+ocrTt.toLocaleString()+' tokens；OCR 接口耗时 '+ocrDur.toFixed(2)+'s，总耗时 '+wall+'s。');
   // 记录一次「识别全部」运行；OCR 调用次数按本次识别的「组」数计（每个 group 1 次，含未标 group 自动合并的默认组）
-  if(okCount>0){ try{ const _prov=(backendCfg&&backendCfg.values&&backendCfg.values.BOX_OCR_PROVIDER)||'qwen'; const _pre=_prov.toUpperCase(); const cfgModel=(backendCfg&&backendCfg.values&&backendCfg.values[_pre+'_MODEL'])||''; const callGroups=aggregateCrossTargets(); fetch('/api/ocr_run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:cfgModel,pages:pageOrder.length,boxes:pageOrder.reduce((s,p)=>s+((allPageData[p]&&allPageData[p].boxes)?allPageData[p].boxes.length:0),0),calls:callGroups.length})}).catch(()=>{}); }catch(e){} }
+  if(okCount>0){ try{ const callGroups=aggregateCrossTargets(); fetch('/api/ocr_run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:cfgModel,pages:pageOrder.length,boxes:pageOrder.reduce((s,p)=>s+((allPageData[p]&&allPageData[p].boxes)?allPageData[p].boxes.length:0),0),calls:callGroups.length})}).catch(()=>{}); }catch(e){} }
   if(failedPages.length) log('[识别全部] 以下版识别失败：'+failedPages.join('、'));
   // 跨页模式：循环结束后统一导出合并结果；单页模式已在循环内逐版导出，此处不再重复导出
   if(cross){ exportTxt(false); exportJson(false); } }
@@ -2848,7 +2974,7 @@ async function loadUsage(){
         tr.innerHTML =
           `<td>${escHtml(row.model || '—')}</td>` +
           `<td class="dim">${escHtml(stageLabel)}</td>` +
-          `<td class="num">${row.ocr_calls != null ? row.ocr_calls : row.calls}</td>` +
+          `<td class="num">${(row.stage==='box_ocr'?(row.ocr_calls||0):(row.calls||0)).toLocaleString()}</td>` +
           `<td class="num">${(row.prompt || 0).toLocaleString()}</td>` +
           `<td class="num">${(row.completion || 0).toLocaleString()}</td>` +
           `<td class="num">${(row.total || 0).toLocaleString()}</td>` +
