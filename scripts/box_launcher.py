@@ -31,12 +31,19 @@ import threading
 import time
 import socket
 import webbrowser
+import ctypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from functools import partial
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+
+# 主窗口对象引用（在 main() 中绑定），供后端接口调整窗口大小/位置
+_MAIN_WINDOW = None
+
+# 悬浮窗（右下角小窗）状态
+_MINI_STATE = {"active": False, "prev": None}
 
 # 程序根目录：冻结（exe）时写到 exe 所在目录，否则写到脚本同目录。
 # 注意：onedir 模式下 sys.executable 在 Windows 上会被 PyInstaller 解析为
@@ -124,7 +131,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "1.1.4"
+VERSION = "1.2.0"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -198,7 +205,11 @@ def _parse_sha256(text, filename):
     return best
 
 def _query_latest_release(repo, provider):
-    """查询 Gitee/GitHub 最新 release，返回 dict 或 None。"""
+    """查询 Gitee/GitHub 最新 release。
+    成功：{"ok": True, "tag":..., "notes":..., "assets":..., "page_url":...}
+    失败：{"ok": False, "error": "<具体原因>"}（含 URL、错误类型、HTTP 状态码/异常详情，
+          便于排查网络不通 / SSL / 404 限流等问题，不再笼统报「均失败」）。
+    """
     import urllib.request, urllib.error, ssl, json as _json_mod
     if provider == "gitee":
         api = f"https://gitee.com/api/v5/repos/{repo}/releases/latest"
@@ -210,9 +221,22 @@ def _query_latest_release(repo, provider):
         req.add_header("User-Agent", "mohen-updater")
         ctx = ssl.create_default_context()
         with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
-            data = _json_mod.loads(resp.read().decode("utf-8"))
-    except Exception:
-        return None
+            status = getattr(resp, "status", resp.getcode())
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        return {"ok": False, "error": f"{provider} 接口返回 HTTP {e.code} @ {api}（{e.reason}）"}
+    except urllib.error.URLError as e:
+        reason = getattr(e, "reason", None)
+        rname = type(reason).__name__ if reason is not None else "URLError"
+        return {"ok": False, "error": f"{provider} 请求失败 @ {api}：{rname} {reason}"}
+    except ssl.SSLError as e:
+        return {"ok": False, "error": f"{provider} SSL 证书错误 @ {api}：{e}"}
+    except Exception as e:
+        return {"ok": False, "error": f"{provider} 异常 @ {api}：{type(e).__name__} {e}"}
+    try:
+        data = _json_mod.loads(raw)
+    except Exception as e:
+        return {"ok": False, "error": f"{provider} 响应非 JSON（HTTP {status}）@ {api}：{type(e).__name__} {e}"}
     tag = data.get("tag_name") or data.get("name") or ""
     notes = data.get("body") or ""
     page_url = data.get("html_url") or ""
@@ -222,7 +246,7 @@ def _query_latest_release(repo, provider):
     for a in (data.get("assets") or []):
         assets.append({"name": a.get("name", ""),
                        "url": a.get("browser_download_url") or a.get("url") or ""})
-    return {"tag": tag, "notes": notes, "assets": assets, "page_url": page_url}
+    return {"ok": True, "tag": tag, "notes": notes, "assets": assets, "page_url": page_url}
 
 def _mac_arch_keyword():
     """当前 Mac 架构关键词（arm64 / x86_64 / None），用于匹配 release 中对应架构的包。"""
@@ -286,14 +310,26 @@ def _build_update_result(current, rel, provider):
 
 def _check_update():
     current = VERSION
+    errors = []
     if GITEE_REPO:
         r = _query_latest_release(GITEE_REPO, "gitee")
-        if r and r["tag"]:
+        if r.get("ok") and r.get("tag"):
             return _build_update_result(current, r, "gitee")
+        if not r.get("ok"):
+            errors.append(r.get("error", "Gitee 未知错误"))
     r = _query_latest_release(GITHUB_REPO, "github")
-    if r and r["tag"]:
+    if r.get("ok") and r.get("tag"):
         return _build_update_result(current, r, "github")
-    return {"ok": False, "error": "无法获取更新信息（Gitee/GitHub 均失败）"}
+    if not r.get("ok"):
+        errors.append(r.get("error", "GitHub 未知错误"))
+    detail = "；".join(errors) if errors else "Gitee/GitHub 均无可用版本"
+    # 落日志留存，便于后续排查（时间戳 + 各源具体原因）
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as _lf:
+            _lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [update] 检查失败：{detail}\n")
+    except Exception:
+        pass
+    return {"ok": False, "error": f"无法获取更新信息：{detail}"}
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 
@@ -938,6 +974,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._open_folder_api(data)
         if u.path == "/api/import_source":
             return self._import_source(data)
+        if u.path == "/api/import_clipboard":
+            return self._import_clipboard()
         if u.path == "/api/list_source":
             return self._list_source()
         if u.path == "/api/clear_source":
@@ -1112,6 +1150,63 @@ class Handler(BaseHTTPRequestHandler):
                 skipped.append(f"{name}: {e}")
         return self._json({"ok": True, "written": written, "skipped": skipped,
                            "source_dir": src_dir, "count": len(written)})
+
+    def _import_clipboard(self):
+        """从剪贴板读取图像（用户用外部截图工具复制的位图），存为 source/ 下一张源图。
+
+        与「导入文件」完全等价：结果都进入 source/ 列表，后续「抽图并归档」逻辑不变。
+        macOS 上 Pillow 的 grabclipboard 需要 pyobjc / 屏幕录制授权，失败会给出明确提示。
+        """
+        src_dir = _img_dir("source")
+        os.makedirs(src_dir, exist_ok=True)
+        try:
+            from PIL import ImageGrab
+        except Exception:
+            return self._json({"ok": False, "error": "未安装 Pillow，无法读取剪贴板图像。"})
+        try:
+            img = ImageGrab.grabclipboard()
+        except Exception as e:
+            return self._json({"ok": False, "error": "读取剪贴板失败：" + str(e)})
+        if img is None:
+            return self._json({"ok": False,
+                               "error": "剪贴板中没有图像。请先用截图工具（如微信截图 / Snipaste / 系统截图）复制一张图片，再点「粘贴截图」。"})
+        # 有些截图工具会把多张图以「文件路径列表」形式放入剪贴板（而非位图对象）
+        if isinstance(img, (list, tuple)):
+            copied = []; skipped = []
+            for p in img:
+                if not isinstance(p, str) or not os.path.isfile(p):
+                    continue
+                ext = os.path.splitext(p)[1].lower()
+                if ext not in IMG_EXTS:
+                    skipped.append(os.path.basename(p)); continue
+                dst = os.path.join(src_dir, os.path.basename(p))
+                base, e = os.path.splitext(dst); i = 1
+                while os.path.exists(dst):
+                    dst = f"{base}-{i}{e}"; i += 1
+                try:
+                    shutil.copyfile(p, dst); copied.append(os.path.basename(dst))
+                except Exception as e:
+                    skipped.append(f"{os.path.basename(p)}: {e}")
+            if not copied:
+                return self._json({"ok": False, "error": "剪贴板里的文件不是可导入的图片。"})
+            return self._json({"ok": True, "written": copied, "skipped": skipped,
+                               "source_dir": src_dir, "count": len(copied)})
+        if not hasattr(img, "save"):
+            return self._json({"ok": False,
+                               "error": "剪贴板内容不是可直接粘贴的图像（可能是文件或文本）。请把截图复制为图片位图后再试。"})
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        fname = "clipboard-" + ts + ".png"
+        base, _ = os.path.splitext(fname)
+        i = 1
+        while os.path.exists(os.path.join(src_dir, fname)):
+            fname = base + "-" + str(i) + ".png"
+            i += 1
+        try:
+            img.save(os.path.join(src_dir, fname), "PNG")
+        except Exception as e:
+            return self._json({"ok": False, "error": "保存剪贴板图像失败：" + str(e)})
+        return self._json({"ok": True, "written": [fname], "skipped": [],
+                           "source_dir": src_dir, "count": 1})
 
     def _list_source(self):
         d = _img_dir("source")
@@ -1885,6 +1980,7 @@ HTML = r"""<!doctype html>
             <label class="chk"><input type="checkbox" id="sourceSelAll"> <span>全选</span></label>
             <button class="src-head-btn gray" id="importSource" title="导入 PDF / 图片到 source/">导入文件</button>
             <input type="file" id="importSourceIn" multiple accept="image/*,.pdf" style="display:none;">
+            <button class="src-head-btn gray" id="importClipboard" title="从剪贴板粘贴截图到 source/（请先用截图工具复制图片）">粘贴截图</button>
             <button class="src-head-btn sec" id="runExtractGroup" title="从 source/ 抽图并归档">抽图并归档</button>
             <button class="src-head-btn stop" id="delSource" title="删除选中的导入文件（含派生产物）">删除</button>
             <span class="cnt" id="sourceCnt"></span>
@@ -2740,6 +2836,16 @@ $('importSourceIn').onchange=async e=>{
   }catch(err){ log('导入文件失败：'+(err&&err.message||err)); }
   e.target.value='';
 };
+$('importClipboard').onclick=async ()=>{
+  log('[粘贴截图] 正在读取剪贴板图像…');
+  try{
+    fetch('/api/import_clipboard',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})
+      .then(r=>r.json()).then(j=>{
+        if(j.ok){ log('[粘贴截图] 已写入 '+j.count+' 张到 source/：'+(j.written.join(', ')||'(无)')); if(j.skipped&&j.skipped.length)log('[粘贴截图] 跳过：'+j.skipped.join(', ')); refreshSourceList().then(fs=>{ if(fs&&fs.length){ document.querySelectorAll('.source-chk').forEach(c=>c.checked=true); syncSourceSelAll(); } }); }
+        else log('[粘贴截图] 失败：'+(j.error||''));
+      }).catch(e=>log('粘贴截图失败：'+e));
+  }catch(err){ log('粘贴截图失败：'+(err&&err.message||err)); }
+};
 // ---------- 文件删除机制 ----------
 function resetCanvasState(){
   // 彻底复位：回到未载入的初始状态
@@ -3257,12 +3363,25 @@ def main():
         print(f"启动失败：HTTP 端口 {port} 在 10s 内未就绪")
         os._exit(1)
 
+    # 默认还原位置：屏幕右侧、垂直居中（Windows 用 GetSystemMetrics，失败则随系统默认）
+    win_x = win_y = None
+    if sys.platform == "win32":
+        try:
+            _sw = ctypes.windll.user32.GetSystemMetrics(0)
+            _sh = ctypes.windll.user32.GetSystemMetrics(1)
+            _margin_right = 40
+            win_x = max(0, _sw - 480 - _margin_right)
+            win_y = max(0, (_sh - 760) // 2)
+        except Exception:
+            pass
+
     try:
         win = webview.create_window(
             "墨痕 · 近代报刊转录助手",
             url,
-            width=1280, height=800,
-            min_size=(1000, 700),
+            width=480, height=760,
+            x=win_x, y=win_y,
+            min_size=(360, 220),
             background_color="#f5f6f8",
             maximized=True,
             text_select=True,
@@ -3270,6 +3389,8 @@ def main():
     except Exception as e:
         print(f"pywebview 窗口创建失败：{e}")
         os._exit(1)
+    global _MAIN_WINDOW
+    _MAIN_WINDOW = win
     win.events.closed += lambda: stop_all()
     print(f"墨痕 · 近代报刊转录助手 已启动（内嵌窗口，端口 {port}；关闭窗口即退出）")
     webview.start(lambda: _set_window_icon("墨痕 · 近代报刊转录助手"))
