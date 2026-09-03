@@ -101,7 +101,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "1.1.2"
+VERSION = "1.1.3"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，

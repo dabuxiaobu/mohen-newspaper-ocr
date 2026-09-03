@@ -36,7 +36,7 @@ except Exception:
 # 导致启动器下一步去 DATA_DIR 读 cropped_hi/ 时抛出 WinError 3。
 _MOHEN_DATA = os.environ.get("MOHEN_DATA_DIR")
 if _MOHEN_DATA and os.path.isdir(_MOHEN_DATA):
-    HERE = _MOEHEN_DATA
+    HERE = _MOHEN_DATA
 elif getattr(sys, "frozen", False):
     # 打包态（onedir）：exe 在 <应用根>/民国报纸OCR.exe，工作目录须落在应用根，
     # 否则会解析到 _internal/ 而读不到 source/、写不到 cropped_hi/。
