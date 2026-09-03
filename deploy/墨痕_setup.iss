@@ -20,7 +20,7 @@
 ; ============================================================================
 
 #define MyAppName "墨痕·近代报刊转录助手"
-#define MyAppVersion "1.1.3"
+#define MyAppVersion "1.1.4"
 #define MyPublisher "墨痕"
 ; dist 路径：相对本 .iss（技能根/deploy/）→ 技能根/dist/墨痕/
 #define DistDir "..\dist\墨痕"
@@ -36,7 +36,7 @@ DefaultGroupName={#MyAppName}
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=commandline
 OutputDir=Output
-OutputBaseFilename=墨痕-1.1.3-windows-setup
+OutputBaseFilename=墨痕-1.1.4-windows-setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern

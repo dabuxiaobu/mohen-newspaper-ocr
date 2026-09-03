@@ -38,7 +38,7 @@ from functools import partial
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
-# 配置落盘目录：冻结（exe）时写到 exe 所在目录，否则写到脚本同目录。
+# 程序根目录：冻结（exe）时写到 exe 所在目录，否则写到脚本同目录。
 # 注意：onedir 模式下 sys.executable 在 Windows 上会被 PyInstaller 解析为
 # scripts/ 下的路径（而非 dist 内的 exe），导致 dirname(sys.executable) 落到
 # scripts/，所有运行数据误写进 skill 源码目录、且与 dist 副本永不同步。
@@ -52,8 +52,31 @@ def _app_dir():
             d = os.path.dirname(d)
         return d
     return HERE
+
+# 配置落盘目录：Windows 仍随 exe 目录；macOS .app bundle 只读，且受 App Translocation
+# 影响，.app 包旁目录并不可靠，直接把配置放到 ~/Library/Application Support/墨痕。
+def _config_dir():
+    if sys.platform == "darwin" and getattr(sys, "frozen", False):
+        support = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "墨痕")
+        os.makedirs(support, exist_ok=True)
+        return support
+    return _app_dir()
+
 APP_DIR = _app_dir()
-CONFIG_DIR = APP_DIR   # 配置（API Key 等）仍随 exe 目录，更新靠「覆盖解压」保留，行为不变
+CONFIG_DIR = _config_dir()
+
+# macOS：兼容旧版把配置放在 .app/Contents/MacOS/ 内部的情况，启动时迁移到 CONFIG_DIR。
+def _migrate_macos_config():
+    if sys.platform != "darwin" or not getattr(sys, "frozen", False):
+        return
+    old = os.path.join(APP_DIR, "box_config.json")
+    new = os.path.join(CONFIG_DIR, "box_config.json")
+    if old != new and os.path.exists(old) and not os.path.exists(new):
+        try:
+            shutil.copyfile(old, new)
+        except Exception as _e:
+            sys.stderr.write(f"[migrate] macOS 配置迁移失败：{_e}\n")
+_migrate_macos_config()
 
 # 用户产物目录：脱离 exe 所在目录，固定落到「文档/墨痕数据」，与版本无关。
 # 无论新版本解压到哪、几个版本并存，识别产物 output/ 都自动共享、不会随旧版本丢失。
@@ -101,7 +124,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "1.1.3"
+VERSION = "1.1.4"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -1294,14 +1317,16 @@ class Handler(BaseHTTPRequestHandler):
                 if not app_candidates:
                     return self._json({"ok": False, "error": "解压后未找到 .app 包"})
                 new_app = sorted(app_candidates, key=lambda p: len(p))[0]
-                # 若新包误带配置则移除，再从当前运行实例回写（保留 API Key 等）
+                # 配置现在放在 .app 包外，新包内不应包含配置；如误带则删除。
                 _cfg_pkg = os.path.join(new_app, "Contents", "MacOS", "box_config.json")
                 if os.path.exists(_cfg_pkg):
                     os.remove(_cfg_pkg)
+                # 兼容旧版：若当前运行实例的配置仍在 .app 内部，尝试迁移到 CONFIG_DIR。
                 _old_cfg = os.path.join(APP_DIR, "box_config.json")
-                if os.path.exists(_old_cfg):
+                _new_cfg = os.path.join(CONFIG_DIR, "box_config.json")
+                if _old_cfg != _new_cfg and os.path.exists(_old_cfg) and not os.path.exists(_new_cfg):
                     try:
-                        shutil.copyfile(_old_cfg, os.path.join(new_app, "Contents", "MacOS", "box_config.json"))
+                        shutil.copyfile(_old_cfg, _new_cfg)
                     except Exception:
                         pass
                 # .app 路径：APP_DIR 在 macOS = <app>/Contents/MacOS
