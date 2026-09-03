@@ -31,7 +31,13 @@ try:
 except Exception:
     STOP_EVENT = threading.Event()
 
-if getattr(sys, "frozen", False):
+# 子脚本落点须与启动器的数据目录对齐：启动器会把 RUNTIME_DIR 注入 MOHEN_DATA_DIR。
+# 打包态下若仍用 sys.executable 推导目录，产物会落到 exe 目录而非「文档/墨痕数据」，
+# 导致启动器下一步去 DATA_DIR 读 cropped_hi/ 时抛出 WinError 3。
+_MOHEN_DATA = os.environ.get("MOHEN_DATA_DIR")
+if _MOHEN_DATA and os.path.isdir(_MOHEN_DATA):
+    HERE = _MOEHEN_DATA
+elif getattr(sys, "frozen", False):
     # 打包态（onedir）：exe 在 <应用根>/民国报纸OCR.exe，工作目录须落在应用根，
     # 否则会解析到 _internal/ 而读不到 source/、写不到 cropped_hi/。
     HERE = os.path.dirname(os.path.abspath(sys.executable))
@@ -90,11 +96,14 @@ def autocrop(img, margin_ratio=0.003):
 
 
 def main():
-    # 允许命令行 --src 覆盖来源文件夹
+    global DST_DIR
+    # 允许命令行 --src / --dst 覆盖默认目录；启动器已把 MOHEN_DATA_DIR 注入环境变量。
     SRC_DIR = SRC_DIR_DEFAULT
     for i, a in enumerate(sys.argv):
         if a == "--src" and i + 1 < len(sys.argv):
             SRC_DIR = sys.argv[i + 1]
+        if a == "--dst" and i + 1 < len(sys.argv):
+            DST_DIR = sys.argv[i + 1]
 
     os.makedirs(DST_DIR, exist_ok=True)
 

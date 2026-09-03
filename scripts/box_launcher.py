@@ -101,7 +101,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -1477,6 +1477,9 @@ class Handler(BaseHTTPRequestHandler):
             if cfg.get(k):
                 env[k] = cfg[k]
         env.setdefault("DEEPSEEK_MODEL", "deepseek-v4-flash")
+        # 把数据目录注入子进程，确保 extract_original.py / postprocess.py 等子脚本
+        # 在打包态下把产物写到「文档/墨痕数据」而不是 exe 目录。
+        env["MOHEN_DATA_DIR"] = RUNTIME_DIR
         # 把脚本目录(HERE，冻结态为 _MEIPASS/scripts)加进子进程 PYTHONPATH，
         # 让 extract_original.py 能 import 到 stop_flag（否则子进程找不到模块会崩）。
         env["PYTHONPATH"] = HERE + os.pathsep + env.get("PYTHONPATH", "")
@@ -1511,6 +1514,7 @@ class Handler(BaseHTTPRequestHandler):
             out_root = _img_dir("output")
             cropped = _img_dir("cropped_hi")
             os.makedirs(out_root, exist_ok=True)
+            os.makedirs(cropped, exist_ok=True)   # 防御：子进程若因异常未创建，则本进程兜底
             pngs = sorted(f for f in os.listdir(cropped)
                           if f.lower().endswith(".png"))
             archived = 0; skipped = 0

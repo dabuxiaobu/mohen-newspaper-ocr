@@ -44,8 +44,17 @@ class _SafeDict(dict):
         return "{" + key + "}"
 
 # 每次运行的 token 消耗持久化到工作区根目录 token_log.csv（doubao/deepseek 各记一行）
-# 冻结态 __file__ 解析到 _internal，故改用 exe 所在目录（应用根），与启动器 HERE 对齐。
-_TOKEN_BASE = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+# 子脚本落点须与启动器的数据目录对齐：启动器会把 RUNTIME_DIR 注入 MOHEN_DATA_DIR。
+# 打包态下若仍用 sys.executable 推导目录，token_log 会落到 exe 目录而非「文档/墨痕数据」，
+# 与启动器（读写同一 token_log.csv 供用量面板统计）分裂，导致结构化 token 统计缺失。
+_MOHEN_DATA = os.environ.get("MOHEN_DATA_DIR")
+if _MOHEN_DATA and os.path.isdir(_MOHEN_DATA):
+    _TOKEN_BASE = _MOHEN_DATA
+elif getattr(sys, "frozen", False):
+    # 打包态兜底（仅当未注入 MOHEN_DATA_DIR 时）：exe 所在目录（应用根）
+    _TOKEN_BASE = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _TOKEN_BASE = os.path.dirname(os.path.abspath(__file__))
 TOKEN_LOG = os.path.join(_TOKEN_BASE, "token_log.csv")
 
 
