@@ -103,7 +103,7 @@ if errorlevel 1 (
 echo [4/5] purity self-check
 set "OUT=%SKILL_DIR%\dist\Ä«ºÛ"
 set "BAD=0"
-if exist "%OUT%\_internal\box_config.json" (echo   [WARN] real box_config.json & set BAD=1)
+if exist "%OUT%\_internal\box_config.json" (del /q "%OUT%\_internal\box_config.json" & echo   [clean] removed bundled _internal\box_config.json)
 if exist "%OUT%\_internal\token_log.csv"   (echo   [WARN] token_log.csv & set BAD=1)
 if exist "%OUT%\_internal\source"          (echo   [WARN] source/ & set BAD=1)
 if exist "%OUT%\_internal\output"          (echo   [WARN] output/ & set BAD=1)

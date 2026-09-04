@@ -131,7 +131,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -473,6 +473,16 @@ def _load_cfg():
 def _ensure_blank_config():
     p = os.path.join(CONFIG_DIR, "box_config.json")
     if os.path.exists(p):
+        # 旧配置迁移：若缺少 AUTO_UPDATE 键，默认补 false（避免旧包/旧配置默认开启）
+        try:
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+            if "AUTO_UPDATE" not in data:
+                data["AUTO_UPDATE"] = False
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
         return
     blank = {k: "" for k in ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
                              "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
@@ -480,6 +490,7 @@ def _ensure_blank_config():
                              "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                              "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")}
     blank["BOX_OCR_PROVIDER"] = "qwen"
+    blank["AUTO_UPDATE"] = False
     try:
         with open(p, "w", encoding="utf-8") as f:
             json.dump(blank, f, ensure_ascii=False, indent=2)
@@ -905,6 +916,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(data)
         if u.path == "/api/check_update":
             return self._json(_check_update())
+        if u.path == "/api/auto_update":
+            return self._json(self._read_auto_update())
         return self._send(404, "not found")
 
     def do_POST(self):
@@ -992,6 +1005,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._update_download(data)
         if u.path == "/api/update_apply":
             return self._update_apply()
+        if u.path == "/api/auto_update":
+            return self._set_auto_update(data)
         return self._send(404, "not found")
 
     def _export(self, data):
@@ -1684,6 +1699,45 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             return self._json({"ok": False, "error": str(e), "path": p})
 
+    def _read_auto_update(self):
+        p = os.path.join(CONFIG_DIR, "box_config.json")
+        try:
+            if os.path.exists(p):
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+                raw = data.get("AUTO_UPDATE", False)
+                return {"auto_update": bool(raw),
+                        "skip_version": data.get("UPDATE_SKIP_VERSION") or None}
+        except Exception:
+            pass
+        return {"auto_update": False, "skip_version": None}
+
+    def _set_auto_update(self, data):
+        p = os.path.join(CONFIG_DIR, "box_config.json")
+        cur = {}
+        if os.path.exists(p):
+            try:
+                cur = json.load(open(p, encoding="utf-8"))
+            except Exception:
+                cur = {}
+        if "auto_update" in data:
+            cur["AUTO_UPDATE"] = bool(data.get("auto_update", False))
+        sv = data.get("skip_version")
+        if sv:
+            cur["UPDATE_SKIP_VERSION"] = str(sv)
+        elif "skip_version" in data and sv in (None, ""):
+            cur.pop("UPDATE_SKIP_VERSION", None)
+        # 清理空值保持文件整洁，但保留布尔（含 False）键
+        cur = {k: v for k, v in cur.items() if v not in (None, "")}
+        try:
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(cur, f, ensure_ascii=False, indent=2)
+            return self._json({"ok": True,
+                               "auto_update": bool(cur.get("AUTO_UPDATE", False)),
+                               "skip_version": cur.get("UPDATE_SKIP_VERSION") or None})
+        except Exception as e:
+            return self._json({"ok": False, "error": str(e)})
+
 
 # ---------- 前端 HTML（套 modern 的 CSS 外壳，内嵌 canvas 框选核心） ----------
 HTML = r"""<!doctype html>
@@ -1772,6 +1826,9 @@ HTML = r"""<!doctype html>
   .flow-num { display:inline-flex; align-items:center; justify-content:center; width:1.5em; height:1.5em;
               border-radius:50%; background:#e8eefd; color:var(--pri); font-weight:700; font-size:11px; }
   .sub { color:var(--mut); margin:10px 0 0; font-size:12px; line-height:1.6; }
+  .version-row { align-items:center; gap:12px; flex-wrap:wrap; }
+  .version-row .sub { margin:0; line-height:1.4; display:inline-flex; align-items:center; }
+  .version-row button { display:inline-flex; align-items:center; justify-content:center; }
   .rdo { display:inline-flex; align-items:center; gap:4px; font-size:13px; white-space:nowrap; }
   .rdo input { margin:0; width:auto; min-width:auto; flex-shrink:0; vertical-align:middle; }
   .btns .sub { margin:0; font-size:12px; }
@@ -1921,6 +1978,16 @@ HTML = r"""<!doctype html>
   #ctxMenu button { display:block; width:100%; text-align:left; padding:6px 14px; border:none; background:transparent; cursor:pointer; font-size:12px; color:var(--ink); }
   #ctxMenu button:hover { background:var(--pri); color:#fff; }
   #ctxMenu hr { border:none; border-top:1px solid var(--bd); margin:4px 0; }
+  /* 自动更新提示弹窗 */
+  .modal-mask{ position:fixed; inset:0; background:rgba(0,0,0,.45); display:none; align-items:center; justify-content:center; z-index:1200; }
+  .modal-mask.open{ display:flex; }
+  .modal-card{ background:#fff; border-radius:12px; padding:22px 24px; max-width:380px; width:calc(100% - 48px); box-shadow:0 16px 48px rgba(0,0,0,.28); }
+  .modal-title{ font-size:16px; font-weight:700; margin-bottom:10px; color:var(--ink); }
+  .modal-body{ font-size:14px; color:var(--ink); margin-bottom:18px; line-height:1.55; }
+  .modal-foot{ display:flex; justify-content:flex-end; gap:10px; }
+  .switch-row{ display:inline-block; font-size:13.5px; color:var(--ink); cursor:pointer; line-height:1.4; }
+  .switch-row input{ width:14px; height:14px; margin:0 6px 0 0; vertical-align:middle; }
+  .switch-row span{ vertical-align:middle; line-height:1.4; }
 </style>
 </head>
 <body>
@@ -2105,10 +2172,14 @@ HTML = r"""<!doctype html>
     </div>
     <div class="set-group">
       <h3>版本更新</h3>
-      <div class="row" style="align-items:center; gap:12px; flex-wrap:wrap;">
+      <div class="row version-row">
         <span class="sub">当前版本：<span id="curVersion">--</span></span>
         <button class="sec" id="checkUpdateBtn" type="button">检查更新</button>
       </div>
+      <label class="switch-row" style="margin-top:10px;">
+        <input type="checkbox" id="autoUpdateChk">
+        <span>自动更新（检测到新版本时自动下载并重启墨痕）</span>
+      </label>
       <div id="updateStatus" class="sub" style="margin-top:6px;"></div>
     </div>
   </div>
@@ -2201,10 +2272,14 @@ const HANDLE=9, HIT_PAD=2;
 
 // ---------- 配置 / 状态 ----------
 let CURRENT_VERSION = '';
+let AUTO_UPDATE = false;
+let SKIP_VERSION = null;
 const RELEASE_PAGE_URL = 'https://github.com/dabuxiaobu/mohen-newspaper-ocr/releases';
 fetch('/api/config').then(r=>r.json()).then(c=>{ backendCfg=c; window.__RUNTIME_DIR=c.runtime_dir||''; CURRENT_VERSION = c.version || ''; if($('curVersion')) $('curVersion').textContent = CURRENT_VERSION || '--'; fillCfgInputs(c.values||{}); updateCfgLine(); }).catch(()=>{ $('cfgLine').textContent='配置读取失败'; });
 // 启动恢复历史日志（关闭 exe 不丢失）
 restoreLogs();
+// 启动后自动检查新版本（点3）：内部读取自动更新开关并决定弹窗或自动更新
+autoUpdateCheckOnLaunch();
 // 启动时把已保存的密钥/模型回填进输入框，避免重开后看似"丢失"
 // OCR 服务商切换：每个服务商各存一组凭据，切换时回填对应值
 let ocrProvider = 'qwen';
@@ -2816,23 +2891,31 @@ $('exportAll').onclick=()=>{
 $('prevPage').onclick=()=>gotoPage(pageIdx-1);
 $('nextPage').onclick=()=>gotoPage(pageIdx+1);
 $('importSource').onclick=()=>$('importSourceIn').click();
+const IMPORT_BATCH = 20;
 $('importSourceIn').onchange=async e=>{
   const files=Array.from(e.target.files||[]);
   if(!files.length)return;
   try{
-    const payload=[];
-    for(const f of files){
-      const buf=await f.arrayBuffer();
-      const bytes=new Uint8Array(buf); const CH=0x8000; let bin='';
-      for(let i=0;i<bytes.length;i+=CH){ bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+CH)); }
-      payload.push({name:f.name,data:btoa(bin)});
+    let okCount=0;
+    for(let s=0;s<files.length;s+=IMPORT_BATCH){
+      const slice=files.slice(s,s+IMPORT_BATCH);
+      const payload=[];
+      for(const f of slice){
+        const buf=await f.arrayBuffer();
+        const bytes=new Uint8Array(buf); const CH=0x8000; let bin='';
+        for(let i=0;i<bytes.length;i+=CH){ bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+CH)); }
+        payload.push({name:f.name,data:btoa(bin)});
+      }
+      const segStart=s+1, segEnd=Math.min(s+IMPORT_BATCH,files.length);
+      log('[导入文件] 正在写入第 '+segStart+'–'+segEnd+' / '+files.length+' 个文件…');
+      const j=await (await fetch('/api/import_source',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files:payload})})).json();
+      if(j.ok){ okCount+=j.count; log('[导入文件] 已写入 '+j.count+' 个文件到 source/：'+(j.written.join(', ')||'(无)')); if(j.skipped&&j.skipped.length)log('[导入文件] 跳过：'+j.skipped.join(', ')); }
+      else log('[导入文件] 失败：'+(j.error||''));
+      // 让出主线程：大批量导入时分批释放，避免 UI 假死与单包过大
+      await new Promise(res=>setTimeout(res,0));
     }
-    log('[导入文件] 正在写入 '+files.length+' 个文件…');
-    fetch('/api/import_source',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files:payload})})
-      .then(r=>r.json()).then(j=>{
-        if(j.ok){ log('[导入文件] 已写入 '+j.count+' 个文件到 source/：'+(j.written.join(', ')||'(无)')); if(j.skipped&&j.skipped.length)log('[导入文件] 跳过：'+j.skipped.join(', ')); refreshSourceList().then(fs=>{ if(fs&&fs.length){ document.querySelectorAll('.source-chk').forEach(c=>c.checked=true); syncSourceSelAll(); } }); }
-        else log('[导入文件] 失败：'+(j.error||''));
-      }).catch(e=>log('导入文件失败：'+e));
+    log('[导入文件] 全部完成，共导入 '+okCount+' 个文件');
+    refreshSourceList().then(fs=>{ if(fs&&fs.length){ document.querySelectorAll('.source-chk').forEach(c=>c.checked=true); syncSourceSelAll(); } });
   }catch(err){ log('导入文件失败：'+(err&&err.message||err)); }
   e.target.value='';
 };
@@ -3015,6 +3098,53 @@ async function startUpdate(j){
     const fb=$('gotoReleaseFallback2'); if(fb) fb.onclick=()=>openExternalUrl(j.page_url||RELEASE_PAGE_URL);
   }
 }
+// 启动后自动检查更新：读开关 → 有新版则按开关决定自动更新或弹窗
+async function autoUpdateCheckOnLaunch(){
+  try{
+    const r=await fetch('/api/auto_update'); const j=await r.json();
+    AUTO_UPDATE=!!j.auto_update;
+    SKIP_VERSION=j.skip_version||null;
+    const c=$('autoUpdateChk'); if(c) c.checked=AUTO_UPDATE;
+  }catch(e){}
+  try{
+    const r=await fetch('/api/check_update',{cache:'no-store'});
+    const j=await r.json();
+    if(!j.ok || !j.need) return;
+    if(j.latest===SKIP_VERSION){ log('[更新] 已设置跳过 '+SKIP_VERSION+'，暂不提醒'); return; }
+    if(AUTO_UPDATE){ log('[更新] 已开启自动更新，正在下载新版本…'); startUpdate(j); }
+    else { showUpdateModal(j); }
+  }catch(e){ /* 启动检查失败不打扰用户 */ }
+}
+// 可关闭的更新提示弹窗（点3）：询问是否立即更新
+function showUpdateModal(j){
+  let m=document.getElementById('updateModal');
+  if(!m){
+    m=document.createElement('div'); m.id='updateModal'; m.className='modal-mask';
+    m.innerHTML='<div class="modal-card">'
+      +'<div class="modal-title">发现新版本</div>'
+      +'<div class="modal-body">墨痕已发布新版本 <b class="um-latest"></b>，是否立即更新？</div>'
+      +'<label class="switch-row um-skip-row" style="margin:6px 0 14px;">'
+      +'<input type="checkbox" id="umSkip"><span>不再提示该版本</span></label>'
+      +'<div class="modal-foot"><button class="ghost" id="umLater">稍后</button>'
+      +'<button class="sec" id="umNow">立即更新</button></div></div>';
+    document.body.appendChild(m);
+  }
+  m.querySelector('.um-latest').textContent=j.latest||'';
+  const skipBox=m.querySelector('#umSkip'); if(skipBox) skipBox.checked=false;
+  m.classList.add('open');
+  m.querySelector('#umLater').onclick=async ()=>{
+    const skip=skipBox&&skipBox.checked;
+    if(skip){
+      try{
+        await fetch('/api/auto_update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({skip_version:j.latest})});
+        SKIP_VERSION=j.latest; log('[更新] 已设置跳过 '+j.latest);
+      }catch(e){ log('[更新] 保存跳过版本失败：'+e.message); }
+    }
+    m.classList.remove('open');
+  };
+  m.querySelector('#umNow').onclick=()=>{ m.classList.remove('open'); startUpdate(j); };
+  m.onclick=(e)=>{ if(e.target===m) m.classList.remove('open'); };
+}
 function openSettingsDrawer(){ drawer.classList.add('open'); usageDrawer.classList.remove('open'); promptDrawer.classList.remove('open'); mask.classList.add('open'); }
 function openUsageDrawer(){ usageDrawer.classList.add('open'); drawer.classList.remove('open'); promptDrawer.classList.remove('open'); mask.classList.add('open'); loadUsage(); }
 function openPromptDrawer(){ loadPrompts(); promptDrawer.classList.add('open'); drawer.classList.remove('open'); usageDrawer.classList.remove('open'); mask.classList.add('open'); }
@@ -3023,6 +3153,13 @@ $('gearBtn').onclick=openSettingsDrawer; $('drawerClose').onclick=closeDrawers;
 $('usageBtn').onclick=openUsageDrawer; $('usageClose').onclick=closeDrawers; mask.onclick=closeDrawers;
 $('promptBtn').onclick=openPromptDrawer; $('promptClose').onclick=closeDrawers;
 $('checkUpdateBtn').onclick=checkUpdate;
+// 自动更新开关：开启时把开关状态持久化到 box_config.json
+const autoChk=$('autoUpdateChk');
+if(autoChk) autoChk.onchange=async ()=>{
+  const v=autoChk.checked;
+  try{ await fetch('/api/auto_update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto_update:v})}); AUTO_UPDATE=v; log('[设置] 自动更新已'+(v?'开启':'关闭')); }
+  catch(e){ log('[设置] 自动更新开关保存失败：'+e.message); }
+};
 document.addEventListener('keydown', e=>{ if(e.key==='Escape'&&(drawer.classList.contains('open')||usageDrawer.classList.contains('open')||promptDrawer.classList.contains('open'))) closeDrawers(); });
 
 // ---------- 提示词抽屉 ----------
