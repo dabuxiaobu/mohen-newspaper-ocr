@@ -330,10 +330,20 @@ def _pop_ocr_time(root, name):
 
 
 def postprocess(txt_path, client, model, prompt_override=None, rename=True,
-                timing_root=None, mode="kb"):
+                timing_root=None, mode="kb",
+                src_name=None, src_date=None, src_page=None):
     t0 = time.time()
     text = open(txt_path, encoding="utf-8").read()
     src = parse_source(txt_path)
+
+    # 来源补充覆盖：用户通过启动器在「导入文件名未携带题录信息」时手动补充。
+    # 仅非空字段生效，覆盖 parse_source 从文件名抽取的结果（或空）；未填则保留原逻辑。
+    if src_name:
+        src["journal"] = src_name          # 期刊刊名占位符 {journal}；报纸名由启动器写入「出处：」行供模型读取
+    if src_date:
+        src["date"] = src_date
+    if src_page:
+        src["page"] = src_page
 
     # 提示词选择：
     #  - plain 模式（纯文本）：模型直接产出含正文的完整条目，走 SYSTEM_PROMPT_SHORT_PLAIN；
@@ -513,6 +523,14 @@ def main():
                     help="覆盖内置纯文本提示词（plain 模式）；留空用内置默认")
     ap.add_argument("--no-rename", action="store_true",
                     help="关闭「按题录标题重命名 _框N 子目录 + 回写出处」（仅 kb 模式生效）")
+    # 来源补充：用户在文件名未携带题录信息时手动补充（载体名称/出版日期/版次）。
+    # 仅在非空时覆盖 parse_source 从文件名抽取的结果，不填则完全走原逻辑（向后兼容）。
+    ap.add_argument("--src-name", default=None,
+                    help="来源补充·载体名称（报纸名/刊名）；覆盖 journal 占位符，并在启动器已把名称写入「出处：」行时供模型读取")
+    ap.add_argument("--src-date", default=None,
+                    help="来源补充·出版日期 YYYY-MM-DD；覆盖 date 占位符")
+    ap.add_argument("--src-page", default=None,
+                    help="来源补充·版次（数字即可）；覆盖 page 占位符（即 frontmatter 的 edition）")
     args = ap.parse_args()
 
     api_key = os.environ.get("DEEPSEEK_API_KEY")
@@ -561,14 +579,16 @@ def main():
                 print(f"skip (已结构化): {os.path.basename(plain_path)}")
                 continue
             postprocess(tp, client, model, prompt_override=args.prompt_post_plain,
-                        rename=False, timing_root=args.root, mode="plain")
+                        rename=False, timing_root=args.root, mode="plain",
+                        src_name=args.src_name, src_date=args.src_date, src_page=args.src_page)
         else:
             md_path = os.path.splitext(tp)[0] + "_题录.md"
             if os.path.exists(md_path):
                 print(f"skip (已后置): {os.path.basename(md_path)}")
                 continue
             postprocess(tp, client, model, prompt_override=args.prompt_post,
-                        rename=not args.no_rename, timing_root=args.root, mode="kb")
+                        rename=not args.no_rename, timing_root=args.root, mode="kb",
+                        src_name=args.src_name, src_date=args.src_date, src_page=args.src_page)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,7 @@ import time
 import socket
 import webbrowser
 import ctypes
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 from functools import partial
@@ -131,7 +132,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "1.2.1"
+VERSION = "2.0.0"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -692,6 +693,15 @@ def _img_dir(sub):
     return os.path.join(RUNTIME_DIR, sub)
 
 
+def _probe_log(*parts):
+    """postprocess 诊断探针日志：写 RUNTIME_DIR/postprocess_probe.log，失败静默。"""
+    try:
+        with open(os.path.join(RUNTIME_DIR, "postprocess_probe.log"), "a", encoding="utf-8") as f:
+            f.write("%s | %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), " | ".join(str(p) for p in parts)))
+    except Exception:
+        pass
+
+
 def _py():
     """子进程要用的 Python 解释器。
 
@@ -976,7 +986,13 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/config/save":
             return self._save_cfg(data)
         if u.path in ("/api/extract", "/api/postprocess", "/api/group"):
-            return self._run_script(u.path.split("/")[-1], data)
+            try:
+                return self._run_script(u.path.split("/")[-1], data)
+            except Exception as _e:
+                import traceback as _tb
+                _probe_log("!!! do_POST _run_script CRASH path=%s: %s\n%s" % (u.path, _e, _tb.format_exc()))
+                return self._json({"ok": False, "error": "PROBE_CRASH: " + str(_e),
+                                   "traceback": _tb.format_exc()[-1800:]})
         if u.path == "/api/extract_and_group":
             return self._extract_and_group(data)
         if u.path == "/api/export_json":
@@ -1533,7 +1549,55 @@ class Handler(BaseHTTPRequestHandler):
         threading.Thread(target=_exit, daemon=True).start()
         return self._json({"ok": True, "restarting": True})
 
+    def _parse_source_text(self, text):
+        """把用户自由输入的来源串解析成 (名称, 日期, 版次)。
+
+        支持格式示例：
+          大公报 1943-01-17 第2版
+          大公报 1943年1月17日 第2版
+          近代史研究 2020
+        返回 (name, date_iso, page_str)。date 尽量归一化为 YYYY-MM-DD；page 只识别"第N版/No.N"。
+        """
+        if not text:
+            return "", "", ""
+        t = text.strip()
+        date = ""
+        page = ""
+        # 日期：优先 ISO，再中文
+        date_patterns = [
+            (r"(\d{4})-(\d{1,2})-(\d{1,2})", lambda m: f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"),
+            (r"(\d{4})/(\d{1,2})/(\d{1,2})", lambda m: f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"),
+            (r"(\d{4})\.(\d{1,2})\.(\d{1,2})", lambda m: f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"),
+            (r"(\d{4})年(\d{1,2})月(\d{1,2})日?", lambda m: f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"),
+            (r"(\d{4})年(\d{1,2})月", lambda m: f"{m.group(1)}-{int(m.group(2)):02d}"),
+        ]
+        for pat, fmt in date_patterns:
+            m = re.search(pat, t)
+            if m:
+                date = fmt(m)
+                t = t[:m.start()] + t[m.end():]
+                break
+        # 裸年兜底：期刊常只给"2013"这类独立年份（无"年/月"或 ISO 分隔符），卷(期)交给模型处理
+        if not date:
+            ym = re.search(r"(?<![\d.])\d{4}(?![\d.])", t)
+            if ym:
+                y = int(ym.group(0))
+                if 1800 <= y <= 2100:
+                    date = str(y)
+                    t = t[:ym.start()] + t[ym.end():]
+        # 版次：第N版 / No.N / No N
+        page_pat = re.compile(r"第\s*(\d+)\s*版|No\.?\s*(\d+)", re.IGNORECASE)
+        m = page_pat.search(t)
+        if m:
+            page = m.group(1) if m.group(1) else m.group(2)
+            t = t[:m.start()] + t[m.end():]
+        # 名称：清理多余空白
+        name = re.sub(r"\s+", " ", t).strip(" ,、；;").strip()
+        return name, date, page
+
     def _run_script(self, name, data):
+        _probe_log("ENTER _run_script name=%s mode=%r out_dir=%r pages=%r no_open=%r source_override=%r"
+                   % (name, data.get("mode"), data.get("out_dir"), data.get("pages"), data.get("no_open"), data.get("source_override")))
         cfg, _ = _load_cfg()
         script = os.path.join(HERE, {"extract": "extract_original.py",
                                      "postprocess": "postprocess.py",
@@ -1582,6 +1646,44 @@ class Handler(BaseHTTPRequestHandler):
             ppp = (cfg.get("PROMPT_POST_PLAIN") or "").strip()
             if ppp:
                 extra = extra + ["--prompt-post-plain", ppp]
+            # 来源补充：当导入文件名未携带题录信息时，用户在 ④ 面板手动补充来源串（如"大公报 1943-01-17 第2版"），
+            # 结构化前注入 OCR 转录 txt 首行的「出处：」行（载体名由模型从此行读取）并覆盖提示词占位符，
+            # 使 DeepSeek 生成完整 GB/T 7714 引用。仅非空字段生效，未填则完全走原逻辑。
+            so = data.get("source_override") or {}
+            if isinstance(so, dict):
+                if so.get("text"):
+                    _so_name, _so_date, _so_page = self._parse_source_text(so.get("text"))
+                else:
+                    # 兼容旧版三字段格式（name/date/page）
+                    _so_name = (so.get("name") or "").strip()
+                    _so_date = (so.get("date") or "").strip()
+                    _so_page = (so.get("page") or "").strip()
+                if _so_name or _so_date or _so_page:
+                    _parts = []
+                    if _so_name: _parts.append(_so_name)
+                    if _so_date: _parts.append(_so_date)
+                    if _so_page: _parts.append("第" + _so_page + "版")
+                    _new_src = " ".join(_parts)
+                    if os.path.isdir(work):
+                        for _fn in os.listdir(work):
+                            if not _fn.endswith(".txt"):
+                                continue
+                            if _fn.startswith("结构化_") or _fn.endswith("_题录.md"):
+                                continue
+                            _fp = os.path.join(work, _fn)
+                            try:
+                                _lines = open(_fp, encoding="utf-8").read().split("\n")
+                                for _i, _ln in enumerate(_lines):
+                                    if _ln.startswith("出处：") or _ln.startswith("出处:"):
+                                        _lines[_i] = "出处：" + _new_src
+                                        break
+                                open(_fp, "w", encoding="utf-8").write("\n".join(_lines))
+                            except Exception as _e:
+                                print(f"[来源补充] 重写出处失败 {_fn}: {_e}")
+                    if _so_name: extra = extra + ["--src-name", _so_name]
+                    if _so_date: extra = extra + ["--src-date", _so_date]
+                    if _so_page: extra = extra + ["--src-page", _so_page]
+                    print(f"[来源补充] 已注入：名称={_so_name or '-'} 日期={_so_date or '-'} 版次={_so_page or '-'}")
         elif name == "group":
             mode = (data.get("mode") or "auto").strip() or "auto"
             extra = ["--mode", mode, "--src", _img_dir("cropped_hi"), "--dst", _img_dir("民国报纸OCR")]
@@ -1601,6 +1703,8 @@ class Handler(BaseHTTPRequestHandler):
                         res["opened_dir"] = open_target
             return self._json(res)
         except Exception as e:
+            import traceback as _tb2
+            _probe_log("subprocess EXCEPTION: %s\n%s" % (e, _tb2.format_exc()))
             return self._json({"ok": False, "error": str(e)})
 
     def _extract_and_group(self, data):
@@ -1865,7 +1969,8 @@ HTML = r"""<!doctype html>
   #boxList .bx-group { font-size:11px; color:var(--mut); flex:0 1 auto; min-width:0; max-width:100px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #boxList .bx-ops { grid-column:1 / -1; display:flex; gap:4px; margin-top:2px; }
   #boxList .bx-ops .mini { padding:2px 6px; font-size:11px; flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  #resultList .card { border:1px solid var(--bd); border-radius:6px; padding:8px; margin-bottom:8px; min-width:0; }
+  #resultList .card { border:1px solid var(--bd); border-radius:6px; padding:8px; margin-bottom:8px; min-width:0; transition:border-color .12s, box-shadow .12s; }
+  #resultList .card:hover { border-color:var(--pri); box-shadow:0 1px 4px rgba(37,99,235,.18); }
   #resultList .card .hd { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:12px; color:var(--mut); margin-bottom:4px; min-width:0; }
   #resultList .card .hd .title { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #resultList .card .hd .meta { flex-shrink:0; white-space:nowrap; }
@@ -1939,6 +2044,8 @@ HTML = r"""<!doctype html>
   .key-field .eye svg { display:block; }
   .key-field input::-ms-reveal { display:none; }
   .key-field input::-webkit-credentials-auto-fill-button { visibility:hidden; display:none !important; }
+  /* API Key 用 type=text + CSS 遮挡：避免 macOS WebKit 把 password 字段识别为系统凭据而拦截粘贴；眼睛按钮切换 .secret 类 */
+  .key-field input.secret { -webkit-text-security: disc; text-security: disc; }
 
   /* 用量统计抽屉：筛选 + 表格 */
   .filter-row { display:grid; grid-template-columns:1fr 1fr auto; gap:12px; align-items:end; }
@@ -2033,7 +2140,7 @@ HTML = r"""<!doctype html>
       <span class="stage"><span class="flow-num">①</span>导入文件 → 抽图并归档</span>
       <span class="stage"><span class="flow-num">②</span>载入图片 → 框选</span>
       <span class="stage"><span class="flow-num">③</span>识别全部</span>
-      <span class="stage"><span class="flow-num">④</span>校对 → 保存 → 结构化</span>
+      <span class="stage"><span class="flow-num">④</span>校对 → 保存 → 来源补充（可选） → 结构化</span>
     </div>
   </div>
 
@@ -2104,6 +2211,22 @@ HTML = r"""<!doctype html>
       <div class="btns" style="margin-top:10px; align-items:center;">
         <button class="run" id="saveEdit">保存修改</button>
       </div>
+      <!-- 来源补充：墨痕题录信息默认取自导入文件名。文件名未携带报刊名/日期/版次时，在此按版补充。同一版内多篇共享来源，不同版各自填；留空沿用原逻辑。 -->
+      <details class="src-extra" style="margin-top:8px; font-size:12.5px;" open>
+        <summary style="cursor:pointer; color:var(--sub);">来源补充（导入文件名未含报刊名/日期/版次时填）</summary>
+        <div style="margin-top:8px; display:flex; flex-direction:column; gap:6px;">
+          <!-- 跨页模式：多图合并为一篇，只需填一份来源 -->
+          <div id="srcSingleWrap">
+            <textarea id="srcGlobalText" rows="2" placeholder="如：大公报 1943-01-17 第2版（自由输入，自动解析）" style="width:100%; resize:vertical; box-sizing:border-box; font-family:inherit; font-size:13px; padding:6px 8px;"></textarea>
+            <p class="sub" style="margin:2px 0 0; color:var(--sub);">跨页模式：多图合并为一篇，填一份来源即可。</p>
+          </div>
+          <!-- 单页模式：一次性导入多版，每版来源不同，按版分别填（同一版内多篇共享该来源） -->
+          <div id="srcPerPageWrap" style="display:none;">
+            <p class="sub" style="margin:0 0 4px; color:var(--sub);">单页模式：每版来源不同，请分别填写（同一版内多篇共享该来源）。</p>
+            <div id="perPageSrc"></div>
+          </div>
+        </div>
+      </details>
       <div class="btns" style="margin-top:10px; align-items:center; flex-wrap:nowrap; gap:8px;">
         <label style="margin:0; display:flex; align-items:center; white-space:nowrap;">结构化模式：</label>
         <select id="postMode" style="width:auto; min-width:90px;">
@@ -2149,7 +2272,7 @@ HTML = r"""<!doctype html>
       <div class="row">
         <div class="key-field"><label>OCR API Key</label>
           <div class="input-wrap">
-            <input id="cfgApiKey" type="password" placeholder="ARK...">
+            <input id="cfgApiKey" class="secret" type="text" placeholder="ARK..." autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
             <span class="eye" data-target="cfgApiKey" title="显示/隐藏"></span>
           </div></div>
         <div><label>模型名</label><input id="cfgModel" placeholder=""></div>
@@ -2162,7 +2285,7 @@ HTML = r"""<!doctype html>
       <div class="row">
         <div class="key-field"><label>DeepSeek API Key</label>
           <div class="input-wrap">
-            <input id="cfgDsKey" type="password" placeholder="sk-...">
+            <input id="cfgDsKey" class="secret" type="text" placeholder="sk-..." autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
             <span class="eye" data-target="cfgDsKey" title="显示/隐藏"></span>
           </div></div>
         <div><label>DeepSeek 模型名</label><input id="cfgDsModel" placeholder="deepseek-v4-flash"></div>
@@ -2343,7 +2466,8 @@ function loadDataURL(url,name,idx){ const pname=(name||'').replace(/\.[^.]+$/,''
     updatePageNav();
   }; im.src=url; }
 function updatePageNav(){ const pc=$('pageCounter'); if(pc){ pc.textContent=pageIdx<0?'未载入（共 '+pageList.length+' 版可载入）':'第 '+(pageIdx+1)+' / '+navList.length+' 版'; }
-  const cs=$('crossStatus'); if(cs){ const cross=mergeMode==='cross'; cs.style.display=cross?'block':'none'; cs.textContent=cross?('跨页 · 已载入 '+pageOrder.length+' 版'):'单页模式'; } }
+  const cs=$('crossStatus'); if(cs){ const cross=mergeMode==='cross'; cs.style.display=cross?'block':'none'; cs.textContent=cross?('跨页 · 已载入 '+pageOrder.length+' 版'):'单页模式'; }
+  renderPerPageSrc(); }
 function gotoPage(i){ if(i<0||i>=navList.length) return; const name=navList[i];
   // 同步设置页码并立即刷新导航，不依赖图片 onload 反推（避免竞态/反推失败导致翻页失效）
   pageIdx=i; updatePageNav();
@@ -2374,7 +2498,8 @@ function draw(){ if(!img){ drawPlaceholder(); return; } ctx.clearRect(0,0,cv.wid
     const color=(b.group?groupColor(b.group):LBL_COLOR[b.label])||'#dc2626';
     ctx.strokeStyle=color; ctx.lineWidth=isSel?3:2; ctx.strokeRect(X,Y,W,H);
     ctx.fillStyle=color; ctx.fillRect(X,Y-16,20,16); ctx.fillStyle='#fff'; ctx.font='12px sans-serif';
-    ctx.textAlign='center'; ctx.fillText(String(cross?globalBoxIndex(i):(i+1)),X+10,Y-4); ctx.textAlign='left'; drawHandles(b,isSel); });
+    ctx.textAlign='center'; ctx.fillText(String(cross?globalBoxIndex(i):(i+1)),X+10,Y-4);     ctx.textAlign='left'; drawHandles(b,isSel);
+  });
   if(cur){ const X=cur.x*scale+PAD,Y=cur.y*scale+PAD,W=cur.w*scale,H=cur.h*scale; ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([5,3]); ctx.strokeRect(X,Y,W,H); ctx.setLineDash([]); } }
 // commitCanvas 已移除：回退到 #166 同步绘制方案——绘制在图片 onload 同步任务内完成即可随该次渲染上屏，无需点击。
 function drawHandles(b,isSel){ const hs=handlesOf(b); ctx.fillStyle=isSel?'#2563eb':'rgba(37,99,235,0.45)'; ctx.strokeStyle='#fff'; ctx.lineWidth=1;
@@ -2634,7 +2759,8 @@ function renderResults(){ const el=$('resultList');
       if(b.label==='title')display=item.title?`标题：${item.title}`:item.raw;
       else if(b.label==='author')display=item.author?`作者：${item.author}`:item.raw;
       else if(b.label==='text'){ const ls=[]; if(item.title)ls.push(`标题：${item.title}`); if(item.author)ls.push(`作者：${item.author}`); if(item.body)ls.push(item.body); display=ls.join('\n')||item.raw; } }
-    const d=document.createElement('div'); d.className='card'; d.innerHTML=`<div class="hd"><span class="title">${title}</span><span class="meta">${size}</span></div><textarea data-key="${esc(t.key)}">${esc(display)}</textarea>`; el.appendChild(d); });
+    const d=document.createElement('div'); d.className='card'; d.innerHTML=`<div class="hd"><span class="title">${title}</span><span class="meta">${size}</span></div><textarea data-key="${esc(t.key)}">${esc(display)}</textarea>`;
+    el.appendChild(d); });
   el.querySelectorAll('textarea').forEach(ta=>ta.oninput=e=>{ const k=e.target.dataset.key; const item=resultToItem(crossResults[k]); item.raw=e.target.value;
     const p=parseArticle(e.target.value); item.title=p.title; item.author=p.author; item.body=p.body; crossResults[k]=item; }); }
 
@@ -2763,9 +2889,56 @@ function runExtractAndGroup(){
     }
     else log('失败：'+(j.error||''));
   }).catch(e=>log('抽图并归档失败：'+e)); }
+// 来源补充：根据当前模式与工作集，渲染「按版来源」输入行。跨页合并一篇→隐藏并改用全局框；
+// 单页一次多版→每版一行（同一版内多篇共享）。按版名暂存已填值，刷新时不丢失。
+let _savedSrcByPage = {};
+function attrEsc(s){ return (s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function renderPerPageSrc(){
+  const wrap = document.getElementById('srcPerPageWrap');
+  const single = document.getElementById('srcSingleWrap');
+  if(!wrap || !single) return;
+  // UI 切换只看用户选的模式；真正的跨页结构化在 runPost 里仍要求 pageOrder.length>1
+  const isCross = mergeMode==='cross';
+  wrap.style.display = isCross ? 'none' : 'block';
+  single.style.display = isCross ? 'block' : 'none';
+  if(isCross) return;  // 跨页模式不渲染每版行，保留全局框
+  const box = document.getElementById('perPageSrc');
+  if(!box) return;
+  // 暂存已填值（按版名），避免 updatePageNav 频繁刷新导致输入丢失
+  box.querySelectorAll('.pp-row').forEach(row=>{
+    const idx = parseInt(row.dataset.idx, 10); const pg = pageOrder[idx]; if(!pg) return;
+    _savedSrcByPage[pg] = row.querySelector('.pp-text').value;
+  });
+  if(!pageOrder.length){ box.innerHTML = '<p class="sub" style="margin:2px 0; color:var(--sub);">尚未载入工作集。载入后将按版显示来源输入框。</p>'; return; }
+  let html = '';
+  pageOrder.forEach((pg, idx)=>{
+    const s = _savedSrcByPage[pg] || '';
+    html += '<div class="pp-row" data-idx="'+idx+'" style="display:flex; align-items:flex-start; gap:8px; margin-bottom:6px;">'
+          + '<span style="flex:0 0 130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding-top:4px;" title="'+attrEsc(pg)+'">'+esc(pg)+'</span>'
+          + '<textarea class="pp-text" rows="2" placeholder="如：大公报 1943-01-17 第2版" style="flex:1; min-width:0; resize:vertical; box-sizing:border-box; font-family:inherit; font-size:13px; padding:4px 6px;">'+attrEsc(s)+'</textarea>'
+          + '</div>';
+  });
+  box.innerHTML = html;
+}
 async function runPost(){
   const mode = $('postMode') ? $('postMode').value : 'plain';
+  // 来源补充：区分单页/跨页。跨页合并一篇→一份全局自由文本；单页一次多版→每版各自自由文本。
   const isCross = mergeMode==='cross' && pageOrder.length>1;
+  let globalSO = null;
+  if(isCross){
+    const t = (document.getElementById('srcGlobalText')||{}).value||'';
+    if(t.trim()) globalSO = {text: t.trim()};
+  }
+  const perPageSO = {};
+  if(!isCross){
+    document.querySelectorAll('#perPageSrc .pp-row').forEach(row=>{
+      const idx = parseInt(row.dataset.idx, 10);
+      const pg = pageOrder[idx];
+      if(!pg) return;
+      const t = row.querySelector('.pp-text').value.trim();
+      if(t) perPageSO[pg] = {text: t};
+    });
+  }
   const top = (mode==='plain' ? 'plain_text' : 'knowledge_base');
   // 统一空状态守卫：未载入任何版时直接提示，不调用后端，避免生成「未命名」空文件夹
   if(!pageOrder.length){ alert('请先载入工作集（勾选整版原图并点「载入所选」），再点结构化。'); return; }
@@ -2805,7 +2978,7 @@ async function runPost(){
     // 跨页：合并为一篇，单文件夹，打开该合并子文件夹（维持原行为）
     const outDir = crossBaseName().replace(/\.[^.]+$/,'');
     const pages = pageOrder.slice();
-    fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:outDir,pages})})
+    fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:outDir,pages,source_override:globalSO})})
       .then(r=>r.json()).then(j=>{ let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+']\n'+(j.stdout||'')+(j.stderr?'\n'+j.stderr:''); if(j.ok&&j.opened_dir){ const rel=osRel(j.opened_dir); s+='\n↑ 已打开该轮文件夹：'+rel; }
         if(j.ok && !j.skipped){ clearPost(); s+='\n[结构化] 已清空当前工作集与勾选状态。'; } log(s); })
       .catch(e=>log('后置失败：'+e));
@@ -2817,10 +2990,11 @@ async function runPost(){
   let done=0, okCount=0, hasRealOutput=false; const logs=[];
   pages.forEach(pname=>{
     const od = pname.replace(/\.[^.]+$/,'');
-    fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:od,pages:[pname],no_open:true})})
-      .then(r=>r.json()).then(j=>{ if(j.ok && !j.skipped){ okCount++; hasRealOutput=true; }
-        const head=(j.stdout||'').split('\n').slice(0,2).join(' / '); logs.push('[版 '+esc(pname)+'] '+(head||(j.ok?(j.skipped?'无产物':'成功'):'失败'))); })
-      .catch(e=>logs.push('[版 '+esc(pname)+'] 后置失败：'+e))
+    fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:od,pages:[pname],no_open:true,source_override:(perPageSO[pname]||null)})})
+      .then(r=>r.json())      .then(j=>{ if(j.ok && !j.skipped){ okCount++; hasRealOutput=true; }
+        let st = j.ok ? (j.skipped?'无产物':'成功') : ('失败: '+(j.error||''));
+        const head=(j.stdout||'').split('\n').slice(0,2).join(' / '); logs.push('[版 '+esc(pname)+'] '+(head||st)); })
+      .catch(e=>{ const detail=(e&&e.stack)?e.stack:(''+e); logs.push('[版 '+esc(pname)+'] 后置失败：'+(e&&e.message?e.message:e)); fetch('/api/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({line:'[探针] 版 '+pname+' postprocess fetch 失败: '+detail})}).catch(()=>{}); })
       .finally(()=>{ done++; if(done===pages.length){
         let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+'] 单页模式：已逐版检查 '+pages.length+' 版，其中可结构化 '+okCount+' 版，每版独立子文件夹（output/'+top+'/整版名/）。';
         if(logs.length) s+='\n'+logs.join('\n');
@@ -3271,7 +3445,7 @@ function toggleLogSheet(){ logSheet.classList.contains('open')?closeLogSheet():o
 $('logBtn').onclick=toggleLogSheet; $('logSheetClose').onclick=closeLogSheet;
 const EYE_OPEN=`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
 const EYE_CLOSED=`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.84 9.84 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-3.72.91-3.46 3.46"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`;
-document.querySelectorAll('.eye').forEach(e=>{ e.innerHTML=EYE_CLOSED; e.onclick=()=>{ const inp=$(e.dataset.target); const show=inp.type==='password'; inp.type=show?'text':'password'; e.innerHTML=show?EYE_OPEN:EYE_CLOSED; }; });
+document.querySelectorAll('.eye').forEach(e=>{ e.innerHTML=EYE_CLOSED; e.onclick=()=>{ const inp=$(e.dataset.target); const hidden=inp.classList.contains('secret'); inp.classList.toggle('secret'); e.innerHTML=hidden?EYE_OPEN:EYE_CLOSED; }; });
 // OCR 服务商：输入框实时暂存 + 切换时回填对应服务商凭据
 ['cfgApiKey','cfgBaseUrl','cfgModel'].forEach(id=>{ const el=$(id); if(el) el.addEventListener('input', stashActive); });
 document.querySelectorAll('input[name="cfgProvider"]').forEach(r=>{ r.addEventListener('change',()=>{ if(r.checked){ stashActive(); ocrProvider=r.value; fillActiveProviderInputs(); } }); });
@@ -3323,8 +3497,6 @@ resizeCanvas(); draw();
 # ---------- pywebview 窗体（复用 modern 的骨架） ----------
 ICON = os.path.join(os.path.dirname(HERE), "icon", "newspaper.ico")
 
-IDLE_TIMEOUT = 30 * 60  # 空闲 30 分钟自动退出
-LAST_ACTIVE = {"t": time.time()}
 _cfg_lock = threading.Lock()
 
 
@@ -3479,15 +3651,6 @@ def main():
         finally:
             os._exit(0)
 
-    def idle_watchdog():
-        while True:
-            time.sleep(60)
-            if time.time() - LAST_ACTIVE["t"] > IDLE_TIMEOUT:
-                print(f"空闲超过 {IDLE_TIMEOUT // 60} 分钟，自动退出")
-                stop_all()
-
-    threading.Thread(target=idle_watchdog, daemon=True).start()
-
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     _t0 = time.time()
@@ -3520,7 +3683,6 @@ def main():
             x=win_x, y=win_y,
             min_size=(360, 220),
             background_color="#f5f6f8",
-            maximized=True,
             text_select=True,
         )
     except Exception as e:
@@ -3530,7 +3692,86 @@ def main():
     _MAIN_WINDOW = win
     win.events.closed += lambda: stop_all()
     print(f"墨痕 · 近代报刊转录助手 已启动（内嵌窗口，端口 {port}；关闭窗口即退出）")
-    webview.start(lambda: _set_window_icon("墨痕 · 近代报刊转录助手"))
+    def _on_app_ready():
+        _set_window_icon("墨痕 · 近代报刊转录助手")
+        try:
+            win.maximize()
+        except Exception:
+            pass
+        threading.Thread(target=_watch_topmost, args=(win,), daemon=True).start()
+    webview.start(_on_app_ready)
+
+
+def _decl_topmost_api():
+    """一次性声明 ctypes 参数/返回类型。
+    关键：64 位 Python 下 ctypes 默认把句柄当 32 位 c_int 传递，会导致窗口句柄高位被截断，
+    FindWindowW 返回的句柄值错误、SetWindowPos 拿到无效句柄而静默失败——正是小窗置顶一直无效的元凶。"""
+    try:
+        u = ctypes.windll.user32
+        u.FindWindowW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        u.FindWindowW.restype = ctypes.c_void_p
+        u.IsZoomed.argtypes = [ctypes.c_void_p]
+        u.IsZoomed.restype = ctypes.c_bool
+        u.IsWindow.argtypes = [ctypes.c_void_p]
+        u.IsWindow.restype = ctypes.c_bool
+        u.SetWindowPos.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+        u.SetWindowPos.restype = ctypes.c_bool
+        u.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+        u.GetWindowTextW.restype = ctypes.c_int
+    except Exception:
+        pass
+
+
+def _resolve_hwnd(title):
+    """在所有顶层窗口中按标题定位墨痕主窗口句柄，失败返回 None（下一轮重试）。"""
+    try:
+        user32 = ctypes.windll.user32
+        # 1) 精确匹配窗口标题
+        hwnd = user32.FindWindowW(None, title)
+        if hwnd:
+            return int(hwnd)
+        # 2) 子串兜底（标题可能带后缀，或句柄尚未就绪）
+        found = []
+        WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+        def _enum(h, _lp):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(h, buf, 256)
+            if title[:2] in buf.value:
+                found.append(int(h))
+            return True
+        user32.EnumWindows(WNDENUMPROC(_enum), 0)
+        if found:
+            return found[0]
+    except Exception:
+        pass
+    return None
+
+
+def _watch_topmost(win):
+    """根据窗口状态动态调整置顶：全屏/最大化时不置顶（可自由切换其他软件），
+    还原成小窗时自动置顶（侧边栏常驻不被遮挡）。纯 Windows API，跨平台安全降级。"""
+    _decl_topmost_api()
+    user32 = ctypes.windll.user32
+    SWP_NOMOVE, SWP_NOSIZE = 0x0002, 0x0001
+    HWND_TOPMOST, HWND_NOTOPMOST = -1, -2
+    last = None
+    while True:
+        try:
+            hwnd = _resolve_hwnd("墨痕 · 近代报刊转录助手")
+            if not hwnd:
+                time.sleep(0.5)
+                continue
+            zoomed = user32.IsZoomed(hwnd)
+            # 全屏(最大化) -> 不置顶；小窗 -> 置顶
+            want_top = 0 if zoomed else 1
+            if want_top != last:
+                user32.SetWindowPos(hwnd, HWND_TOPMOST if want_top else HWND_NOTOPMOST,
+                                    0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE)
+                last = want_top
+        except Exception:
+            pass
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":
