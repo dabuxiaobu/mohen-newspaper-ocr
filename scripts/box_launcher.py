@@ -132,7 +132,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -2954,6 +2954,10 @@ async function runPost(){
     const cleaned = pageOrder.slice();  // 本次已结构化处理的整版名（cropped_hi 文件名）
     const crossRaw = (mergeMode==='cross' && pageOrder.length>1) ? crossBaseName() : '';  // 跨页 raw 中转目录名（output/{crossRaw}/）
     pageOrder=[]; crossResults={}; allPageData={}; navList=[]; pageList=[]; pageIdx=-1; srcName=''; img=null; boxes=[]; results={};
+    // 清空来源补充输入：跨页全局框 + 单页按版暂存（_savedSrcByPage 按文件名映射，若不重置，下一轮载入同名文件会复活旧来源），避免结构化后来源残留 / 重填失效
+    const _g=document.getElementById('srcGlobalText'); if(_g) _g.value='';
+    _savedSrcByPage = {};
+    const _pp=document.getElementById('perPageSrc'); if(_pp) _pp.innerHTML='';
     // 同步复位「当前源」显示，避免 DOM 残留旧文件名
     const sn=$('srcName'); if(sn) sn.textContent='未载入';
     updatePageNav(); renderSrcList(); renderBoxList(); renderResults(); draw();
