@@ -132,7 +132,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "2.0.1"
+VERSION = "2.0.2"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -2153,7 +2153,7 @@ HTML = r"""<!doctype html>
             <button class="fold-toggle" type="button" title="折叠 / 展开列表"></button>
             <label class="chk"><input type="checkbox" id="sourceSelAll"> <span>全选</span></label>
             <button class="src-head-btn gray" id="importSource" title="导入 PDF / 图片到 source/">导入文件</button>
-            <input type="file" id="importSourceIn" multiple accept="image/*,.pdf" style="display:none;">
+            <input type="file" id="importSourceIn" multiple accept=".png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.gif,.pdf" style="display:none;">
             <button class="src-head-btn gray" id="importClipboard" title="从剪贴板粘贴截图到 source/（请先用截图工具复制图片）">粘贴截图</button>
             <button class="src-head-btn sec" id="runExtractGroup" title="从 source/ 抽图并归档">抽图并归档</button>
             <button class="src-head-btn stop" id="delSource" title="删除选中的导入文件（含派生产物）">删除</button>
