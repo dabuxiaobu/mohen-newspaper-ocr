@@ -132,7 +132,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "2.0.3"
+VERSION = "2.0.4"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -209,10 +209,16 @@ def _ssl_ctx():
     """构造跨平台一致的 TLS 上下文。
 
     macOS 打包态（PyInstaller 冻结）下 ssl.create_default_context() 无系统根证书，
-    会导致所有 HTTPS 请求报 CERTIFICATE_VERIFY_FAILED。改用 certifi 自带的 CA 根证书包
-    （与浏览器同源），Windows 下同样有效、验证逻辑不变。certifi 不可用时退回默认上下文。
+    会导致所有 HTTPS 请求报 CERTIFICATE_VERIFY_FAILED。优先用 truststore 桥接
+    系统证书存储（macOS 钥匙串 / Windows CryptoAPI，与 openai→httpx 结构化链路
+    同源、已在两平台验证可用）；truststore 不可用时退 certifi CA 包；再退默认上下文。
     """
     import ssl
+    try:
+        import truststore
+        return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    except Exception:
+        pass
     try:
         import certifi
         return ssl.create_default_context(cafile=certifi.where())

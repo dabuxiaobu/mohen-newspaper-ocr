@@ -40,6 +40,7 @@ a = Analysis(
         "PIL",
         "opencc",
         "openai",
+        "truststore",  # _ssl_ctx() 优先用它桥接系统证书存储（macOS 冻结态无默认 CA 文件）
         "pypdf",
         "msvcrt",  # 单实例文件锁（Windows 专属，冻结态需显式收集）
         # 人工框选链路子模块（import 模式冻结进 exe；均已有 main()）
