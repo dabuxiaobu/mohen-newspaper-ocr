@@ -132,7 +132,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "2.0.2"
+VERSION = "2.0.3"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -205,6 +205,21 @@ def _parse_sha256(text, filename):
         best = h
     return best
 
+def _ssl_ctx():
+    """构造跨平台一致的 TLS 上下文。
+
+    macOS 打包态（PyInstaller 冻结）下 ssl.create_default_context() 无系统根证书，
+    会导致所有 HTTPS 请求报 CERTIFICATE_VERIFY_FAILED。改用 certifi 自带的 CA 根证书包
+    （与浏览器同源），Windows 下同样有效、验证逻辑不变。certifi 不可用时退回默认上下文。
+    """
+    import ssl
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
 def _query_latest_release(repo, provider):
     """查询 Gitee/GitHub 最新 release。
     成功：{"ok": True, "tag":..., "notes":..., "assets":..., "page_url":...}
@@ -220,7 +235,7 @@ def _query_latest_release(repo, provider):
         req = urllib.request.Request(api, method="GET")
         req.add_header("Accept", "application/json")
         req.add_header("User-Agent", "mohen-updater")
-        ctx = ssl.create_default_context()
+        ctx = _ssl_ctx()
         with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
             status = getattr(resp, "status", resp.getcode())
             raw = resp.read().decode("utf-8")
@@ -604,7 +619,7 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None):
     req.add_header("Authorization", "Bearer " + api_key)
     t0 = time.time()
     try:
-        ctx = ssl.create_default_context()
+        ctx = _ssl_ctx()
         with urllib.request.urlopen(req, timeout=120, context=ctx) as resp:
             j = json.loads(resp.read().decode("utf-8"))
         text = j["choices"][0]["message"]["content"]
@@ -1397,7 +1412,7 @@ class Handler(BaseHTTPRequestHandler):
             # 1) 下载更新包
             req = urllib.request.Request(url, method="GET")
             req.add_header("User-Agent", "mohen-updater")
-            ctx = ssl.create_default_context()
+            ctx = _ssl_ctx()
             with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
                 with open(zip_path, "wb") as f:
                     while True:
