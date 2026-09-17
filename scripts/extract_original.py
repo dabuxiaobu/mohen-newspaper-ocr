@@ -99,10 +99,22 @@ def extract_images_per_page(pdf_path: str):
     return out, errors
 
 
-def autocrop(img, margin_ratio=0.003):
-    """四角采样背景色，与背景差异 > 28 的像素视为内容，按相对长边 0.3% 留 margin。"""
-    arr = np.array(img.convert("RGB"))
-    h, w, _ = arr.shape
+def autocrop(img, margin_ratio=0.003, max_side=1024):
+    """四角采样背景色，与背景差异 > 28 的像素视为内容，按相对长边 0.3% 留 margin。
+
+    大图优化：先在长边 <= max_side 的低分辨率副本上求内容边界框（保真不变，
+    裁的是原图全分辨率像素），避免对整张图建 numpy 数组导致的 O(像素) 开销。
+    """
+    w, h = img.size
+    scale = (max_side / max(w, h)) if max(w, h) > max_side else 1.0
+    if scale < 1.0:
+        sw_ = max(1, int(round(w * scale)))
+        sh_ = max(1, int(round(h * scale)))
+        small = img.resize((sw_, sh_), Image.BILINEAR)
+        arr = np.array(small.convert("RGB"))
+    else:
+        arr = np.array(img.convert("RGB"))
+    sh, sw, _ = arr.shape
     corners = np.array([arr[0, 0], arr[0, -1], arr[-1, 0], arr[-1, -1]])
     bg = np.median(corners, axis=0)
     diff = np.abs(arr.astype(int) - bg.astype(int)).max(axis=2)
@@ -111,10 +123,11 @@ def autocrop(img, margin_ratio=0.003):
     if len(xs) == 0:
         return img
     margin = max(4, int(round(max(w, h) * margin_ratio)))
-    x0 = max(int(xs.min()) - margin, 0)
-    x1 = min(int(xs.max()) + margin, w)
-    y0 = max(int(ys.min()) - margin, 0)
-    y1 = min(int(ys.max()) + margin, h)
+    sx, sy = w / sw, h / sh
+    x0 = max(int(round(xs.min() * sx)) - margin, 0)
+    x1 = min(int(round(xs.max() * sx)) + margin, w)
+    y0 = max(int(round(ys.min() * sy)) - margin, 0)
+    y1 = min(int(round(ys.max() * sy)) + margin, h)
     return img.crop((x0, y0, x1, y1))
 
 
@@ -181,7 +194,7 @@ def main():
                     w0, h0 = im.size
                     cropped = autocrop(im)
                     w1, h1 = cropped.size
-                    cropped.save(out, optimize=True)
+                    cropped.save(out)
                     print(f"{name[:30]:32} [{kind}] page {pnum} 原图 {w0}x{h0} -> 裁切 {w1}x{h1} "
                           f"(留 {100*w1*h1/(w0*h0):.0f}%)")
             else:
@@ -191,7 +204,7 @@ def main():
                 cropped = autocrop(im)
                 w1, h1 = cropped.size
                 out = os.path.join(DST_DIR, os.path.splitext(name)[0] + ".png")
-                cropped.save(out, optimize=True)
+                cropped.save(out)
                 print(f"{name[:30]:32} [{kind}] 原图 {w0}x{h0} -> 裁切 {w1}x{h1} "
                       f"(留 {100*w1*h1/(w0*h0):.0f}%)")
         except Exception as e:

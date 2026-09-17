@@ -132,7 +132,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "2.0.5"
+VERSION = "2.1.0"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -283,49 +283,48 @@ def _mac_arch_keyword():
         return "x86_64"
     return None
 
-def _build_update_result(current, rel, provider):
+def _build_update_result(current, rel, rel2=None):
     is_mac = (sys.platform == "darwin")
-    win_asset = None
-    mac_asset = None
-    fallback_zip = None
-    for a in rel["assets"]:
-        n = a["name"].lower()
-        if not n.endswith(".zip"):
-            continue
-        if fallback_zip is None:
-            fallback_zip = a
-        if is_mac:
-            # macOS：挑含 macos 的 zip；优先匹配当前架构（arm64/x86_64）
-            if "macos" in n:
-                arch = _mac_arch_keyword()
-                if arch is None or arch in n:
-                    mac_asset = a
-                    break
-        else:
-            if any(k in n for k in WIN_PKG_KEYWORDS):
-                win_asset = a
-                break
-    target = mac_asset or win_asset or fallback_zip
-    # sha256 校验文件：优先「与选中包同名 + .sha256.txt」（本工具发布物的命名方式），
-    # 其次兼容通用名 sha256.txt / checksums.txt 等。
-    sha_asset = None
-    if target:
-        want = target["name"] + ".sha256.txt"
-        for a in rel["assets"]:
-            if a["name"] == want:
-                sha_asset = a
-                break
-    if sha_asset is None:
-        for a in rel["assets"]:
-            if a["name"].lower() in ("sha256.txt", "sha256sums.txt", "checksums.txt", "checksums.sha256"):
-                sha_asset = a
-    need = bool(target) and bool(rel["tag"]) and rel["tag"] != current
+    def _pick(r):
+        if not r: return None, None
+        win_asset=None; mac_asset=None; fallback_zip=None
+        for a in r["assets"]:
+            n=a["name"].lower()
+            if not n.endswith(".zip"): continue
+            if fallback_zip is None: fallback_zip=a
+            if is_mac:
+                if "macos" in n:
+                    arch=_mac_arch_keyword()
+                    if arch is None or arch in n:
+                        mac_asset=a; break
+            else:
+                if any(k in n for k in WIN_PKG_KEYWORDS):
+                    win_asset=a; break
+        tgt = mac_asset or win_asset or fallback_zip
+        if not tgt: return None, None
+        sha=None
+        want=tgt["name"]+".sha256.txt"
+        for a in r["assets"]:
+            if a["name"]==want: sha=a; break
+        if sha is None:
+            for a in r["assets"]:
+                if a["name"].lower() in ("sha256.txt","sha256sums.txt","checksums.txt","checksums.sha256"):
+                    sha=a
+        return tgt, sha
+    tgt, sha = _pick(rel)
+    if not tgt:
+        return {"ok": True, "current": current, "latest": (rel or {}).get("tag",""), "notes": (rel or {}).get("notes",""), "page_url": (rel or {}).get("page_url",""),
+                "download_url":"", "asset_name":"", "sha256_url":"", "alt_download_url":"", "alt_sha256_url":"",
+                "need": False, "platform":"macos" if is_mac else "windows"}
+    tgt2, sha2 = _pick(rel2) if rel2 else (None, None)
+    need = bool(tgt) and bool((rel or {}).get("tag")) and (rel or {}).get("tag") != current
     return {
-        "ok": True, "current": current, "latest": rel["tag"],
-        "notes": rel["notes"], "page_url": rel["page_url"],
-        "download_url": target["url"] if target else "",
-        "asset_name": target["name"] if target else "",
-        "sha256_url": sha_asset["url"] if sha_asset else "",
+        "ok": True, "current": current, "latest": (rel or {}).get("tag",""),
+        "notes": (rel or {}).get("notes",""), "page_url": (rel or {}).get("page_url",""),
+        "download_url": tgt["url"], "asset_name": tgt["name"],
+        "sha256_url": sha["url"] if sha else "",
+        "alt_download_url": tgt2["url"] if tgt2 else "",
+        "alt_sha256_url": sha2["url"] if sha2 else "",
         "need": need,
         "platform": "macos" if is_mac else "windows",
     }
@@ -333,25 +332,33 @@ def _build_update_result(current, rel, provider):
 def _check_update():
     current = VERSION
     errors = []
+    g_res = None
+    gh_res = None
     if GITEE_REPO:
         r = _query_latest_release(GITEE_REPO, "gitee")
-        if r.get("ok") and r.get("tag"):
-            return _build_update_result(current, r, "gitee")
-        if not r.get("ok"):
-            errors.append(r.get("error", "Gitee 未知错误"))
+        if r.get("ok"): g_res = r
+        elif not r.get("ok"): errors.append(r.get("error", "Gitee 未知错误"))
     r = _query_latest_release(GITHUB_REPO, "github")
-    if r.get("ok") and r.get("tag"):
-        return _build_update_result(current, r, "github")
-    if not r.get("ok"):
-        errors.append(r.get("error", "GitHub 未知错误"))
-    detail = "；".join(errors) if errors else "Gitee/GitHub 均无可用版本"
-    # 落日志留存，便于后续排查（时间戳 + 各源具体原因）
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as _lf:
-            _lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [update] 检查失败：{detail}\n")
-    except Exception:
-        pass
-    return {"ok": False, "error": f"无法获取更新信息：{detail}"}
+    if r.get("ok"): gh_res = r
+    elif not r.get("ok"): errors.append(r.get("error", "GitHub 未知错误"))
+    # 主源优先 Gitee（国内顺畅，海外可在下载环节自动回退 GitHub）；无 Gitee 时直接用 GitHub
+    primary = g_res if g_res else gh_res
+    if not primary:
+        detail = "；".join(errors) if errors else "Gitee/GitHub 均无可用版本"
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as _lf:
+                _lf.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [update] 检查失败：{detail}\n")
+        except Exception:
+            pass
+        return {"ok": False, "error": f"无法获取更新信息：{detail}"}
+    secondary = gh_res if primary is g_res else g_res
+    res = _build_update_result(current, primary, secondary)
+    # 主源无可用下载包但备用源有，则互换主备
+    if not res.get("download_url") and secondary:
+        res2 = _build_update_result(current, secondary, primary)
+        if res2.get("download_url"):
+            res = res2
+    return res
 
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}
 
@@ -1415,31 +1422,54 @@ class Handler(BaseHTTPRequestHandler):
         os.makedirs(work, exist_ok=True)
         zip_path = os.path.join(work, "pkg.zip")
         try:
-            # 1) 下载更新包
-            req = urllib.request.Request(url, method="GET")
-            req.add_header("User-Agent", "mohen-updater")
             ctx = _ssl_ctx()
-            with urllib.request.urlopen(req, timeout=300, context=ctx) as resp:
-                with open(zip_path, "wb") as f:
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-            # 2) 校验 SHA256（若 release 附带 checksum 文件）
-            if sha_url:
+            # 1) 下载更新包：主源失败自动切换备用源（Gitee↔GitHub），兼顾国内/海外网络
+            srcs = [(url, sha_url)]
+            alt_url = (data.get("alt_download_url") or "").strip()
+            alt_sha = (data.get("alt_sha256_url") or "").strip()
+            if alt_url:
+                srcs.append((alt_url, alt_sha))
+            downloaded = False
+            last_err = None
+            for _i, (_u, _s) in enumerate(srcs):
                 try:
-                    sreq = urllib.request.Request(sha_url, method="GET")
-                    sreq.add_header("User-Agent", "mohen-updater")
-                    with urllib.request.urlopen(sreq, timeout=30, context=ctx) as sresp:
-                        sha_text = sresp.read().decode("utf-8", "ignore")
-                    expected = _parse_sha256(sha_text, os.path.basename(url))
-                    if expected:
-                        actual = _sha256_of_file(zip_path)
-                        if actual.lower() != expected.lower():
-                            return self._json({"ok": False, "error": "SHA256 校验失败，下载可能被篡改"})
-                except Exception as _se:
-                    sys.stderr.write(f"[update] sha 校验跳过：{_se}\n")
+                    _req = urllib.request.Request(_u, method="GET")
+                    _req.add_header("User-Agent", "mohen-updater")
+                    with urllib.request.urlopen(_req, timeout=300, context=ctx) as _resp:
+                        with open(zip_path, "wb") as _f:
+                            while True:
+                                _chunk = _resp.read(65536)
+                                if not _chunk:
+                                    break
+                                _f.write(_chunk)
+                    # 2) 校验 SHA256（若 release 附带 checksum 文件）
+                    if _s:
+                        try:
+                            _sreq = urllib.request.Request(_s, method="GET")
+                            _sreq.add_header("User-Agent", "mohen-updater")
+                            with urllib.request.urlopen(_sreq, timeout=30, context=ctx) as _sresp:
+                                _sha_text = _sresp.read().decode("utf-8", "ignore")
+                            _expected = _parse_sha256(_sha_text, os.path.basename(_u))
+                            if _expected:
+                                _actual = _sha256_of_file(zip_path)
+                                if _actual.lower() != _expected.lower():
+                                    if os.path.exists(zip_path):
+                                        try: os.remove(zip_path)
+                                        except Exception: pass
+                                    raise ValueError("SHA256 校验失败，下载可能被篡改或损坏")
+                        except Exception as _se:
+                            sys.stderr.write(f"[update] sha 校验跳过：{_se}\n")
+                    downloaded = True
+                    sys.stderr.write(f"[update] 已从源 {_i+1} 下载成功：{_u}\n")
+                    break
+                except Exception as _e:
+                    last_err = _e
+                    sys.stderr.write(f"[update] 源 {_i+1} 下载失败：{type(_e).__name__} {_e}\n")
+                    if os.path.exists(zip_path):
+                        try: os.remove(zip_path)
+                        except Exception: pass
+            if not downloaded:
+                return self._json({"ok": False, "error": f"更新包下载失败（已尝试 {len(srcs)} 个源）：{type(last_err).__name__} {last_err}"})
             # 3) 解压
             pkg_dir = os.path.join(work, "pkg")
             if os.path.isdir(pkg_dir):
@@ -1731,86 +1761,96 @@ class Handler(BaseHTTPRequestHandler):
     def _extract_and_group(self, data):
         """抽图 + 归档：先抽 source/ -> cropped_hi/，再把整版 PNG 归档进 output/{整版名}/
         便于溯源原始图片（与 OCR 产物 {整版名}_框N/ 同处 output/ 下）。"""
-        cfg, _ = _load_cfg()
-        env = dict(os.environ)
-        for k in ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL"):
-            if cfg.get(k):
-                env[k] = cfg[k]
-        env.setdefault("DEEPSEEK_MODEL", "deepseek-v4-flash")
-        # 把数据目录注入子进程，确保 extract_original.py / postprocess.py 等子脚本
-        # 在打包态下把产物写到「文档/墨痕数据」而不是 exe 目录。
-        env["MOHEN_DATA_DIR"] = RUNTIME_DIR
-        # 把脚本目录(HERE，冻结态为 _MEIPASS/scripts)加进子进程 PYTHONPATH，
-        # 让 extract_original.py 能 import 到 stop_flag（否则子进程找不到模块会崩）。
-        env["PYTHONPATH"] = HERE + os.pathsep + env.get("PYTHONPATH", "")
-        src_dir = _img_dir("source")
-        # 自愈：source/ 不存在时先创建，避免「不存在」阻断；空目录再往下抽图仍会失败，届时给出明确提示
-        os.makedirs(src_dir, exist_ok=True)
-        if not any(os.listdir(src_dir)):
-            return self._json({"ok": False,
-                               "error": "来源文件夹 source/ 已创建但仍为空。请先用卡片①的「导入文件」放入要抽图的 PDF / 图片，再点「抽图并归档」。"})
-        src_files = [f for f in os.listdir(src_dir)
-                     if os.path.splitext(f)[1].lower() in IMG_EXTS | {".pdf"}]
-        if not src_files:
-            return self._json({"ok": False,
-                               "error": "source/ 中没有可抽图的 PDF / 图片（支持 png/jpg/pdf 等）。请先用「导入文件」放入文件。"})
-        out = {"ok": False, "steps": [], "stdout": "", "stderr": ""}
+        # 防重复触发：抽图并归档是整机单任务（对整个 source/ 操作），进入前若已在跑则直接拒绝。
+        global _extract_busy
+        with _extract_lock:
+            if _extract_busy:
+                return self._json({"ok": False,
+                                   "error": "抽图并归档正在进行，请勿重复点击，稍候即可。"})
+            _extract_busy = True
         try:
-            # 1) 抽图：source/ -> cropped_hi/（绝对路径传给脚本，对齐 DATA_DIR，避免脚本回退到 exe 目录）
-            r1 = subprocess.run([_py(), "--run-script", os.path.join(HERE, "extract_original.py"),
-                                 "--src", src_dir, "--dst", _img_dir("cropped_hi")],
-                                cwd=RUNTIME_DIR, capture_output=True, text=True, env=env, timeout=600)
-            out["steps"].append({"step": "extract", "ok": r1.returncode == 0,
-                                 "returncode": r1.returncode})
-            out["stdout"] += r1.stdout[-4000:] + "\n"
-            out["stderr"] += r1.stderr[-2000:] + "\n"
-            if r1.returncode != 0:
-                out["ok"] = False
-                out["error"] = "抽图步骤失败，已停止"
-                return self._json(out)
+            cfg, _ = _load_cfg()
+            env = dict(os.environ)
+            for k in ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL"):
+                if cfg.get(k):
+                    env[k] = cfg[k]
+            env.setdefault("DEEPSEEK_MODEL", "deepseek-v4-flash")
+            # 把数据目录注入子进程，确保 extract_original.py / postprocess.py 等子脚本
+            # 在打包态下把产物写到「文档/墨痕数据」而不是 exe 目录。
+            env["MOHEN_DATA_DIR"] = RUNTIME_DIR
+            # 把脚本目录(HERE，冻结态为 _MEIPASS/scripts)加进子进程 PYTHONPATH，
+            # 让 extract_original.py 能 import 到 stop_flag（否则子进程找不到模块会崩）。
+            env["PYTHONPATH"] = HERE + os.pathsep + env.get("PYTHONPATH", "")
+            src_dir = _img_dir("source")
+            # 自愈：source/ 不存在时先创建，避免「不存在」阻断；空目录再往下抽图仍会失败，届时给出明确提示
+            os.makedirs(src_dir, exist_ok=True)
+            if not any(os.listdir(src_dir)):
+                return self._json({"ok": False,
+                                   "error": "来源文件夹 source/ 已创建但仍为空。请先用卡片①的「导入文件」放入要抽图的 PDF / 图片，再点「抽图并归档」。"})
+            src_files = [f for f in os.listdir(src_dir)
+                         if os.path.splitext(f)[1].lower() in IMG_EXTS | {".pdf"}]
+            if not src_files:
+                return self._json({"ok": False,
+                                   "error": "source/ 中没有可抽图的 PDF / 图片（支持 png/jpg/pdf 等）。请先用「导入文件」放入文件。"})
+            out = {"ok": False, "steps": [], "stdout": "", "stderr": ""}
+            try:
+                # 1) 抽图：source/ -> cropped_hi/（绝对路径传给脚本，对齐 DATA_DIR，避免脚本回退到 exe 目录）
+                r1 = subprocess.run([_py(), "--run-script", os.path.join(HERE, "extract_original.py"),
+                                     "--src", src_dir, "--dst", _img_dir("cropped_hi")],
+                                    cwd=RUNTIME_DIR, capture_output=True, text=True, env=env, timeout=600)
+                out["steps"].append({"step": "extract", "ok": r1.returncode == 0,
+                                     "returncode": r1.returncode})
+                out["stdout"] += r1.stdout[-4000:] + "\n"
+                out["stderr"] += r1.stderr[-2000:] + "\n"
+                if r1.returncode != 0:
+                    out["ok"] = False
+                    out["error"] = "抽图步骤失败，已停止"
+                    return self._json(out)
 
-            # 2) 归档：把 cropped_hi/ 下每个整版 PNG 平铺复制到 output/ 根目录（溯源原始图片）
-            #    不按整版建子目录，避免 output/ 下散落大量 {篇名}/ 目录。
-            out_root = _img_dir("output")
-            cropped = _img_dir("cropped_hi")
-            os.makedirs(out_root, exist_ok=True)
-            os.makedirs(cropped, exist_ok=True)   # 防御：子进程若因异常未创建，则本进程兜底
-            pngs = sorted(f for f in os.listdir(cropped)
-                          if f.lower().endswith(".png"))
-            archived = 0; skipped = 0
-            for png in pngs:
-                dst_png = os.path.join(out_root, png)
-                if os.path.exists(dst_png):
-                    skipped += 1
-                    continue
-                shutil.copy2(os.path.join(cropped, png), dst_png)
-                archived += 1
-            out["steps"].append({"step": "archive", "ok": True,
-                                 "returncode": 0})
-            # 打包态（windowed exe）下子进程 stdout 被丢弃，前端只能看到 returncode。
-            # 把子脚本落盘的抽取日志尾部附进来，让 [no image]/页级错误可见。
-            _exlog = os.path.join(RUNTIME_DIR, "extract_original.log")
-            if os.path.exists(_exlog):
-                try:
-                    tail = open(_exlog, encoding="utf-8", errors="replace").read()[-2000:]
-                    out["stdout"] += "\n[extract log]\n" + tail + "\n"
-                except Exception:
-                    pass
-            out["stdout"] += (f"\n[archive] 归档整版原图到 output/（平铺，不建子目录）：新增 {archived} 张，"
-                              f"跳过已存在 {skipped} 张。\n")
-            if archived == 0 and skipped == 0:
-                # source 有文件但本次一张图都没产出：明确报错，不让用户误以为成功
-                out["ok"] = False
-                out["error"] = ("抽图结果为 0 张：PDF/图片中未抽出任何图像。常见原因："
-                                "① 文字型 PDF（页面为矢量文字，无内嵌扫描图）；"
-                                "② PDF 为 AES 加密但打包环境缺 cryptography（2.0.5 起已内置）；"
-                                "③ 图像编码不支持。详情见上方抽取日志，建议将 PDF 页面导出为图片后重新导入。")
+                # 2) 归档：把 cropped_hi/ 下每个整版 PNG 平铺复制到 output/ 根目录（溯源原始图片）
+                #    不按整版建子目录，避免 output/ 下散落大量 {篇名}/ 目录。
+                out_root = _img_dir("output")
+                cropped = _img_dir("cropped_hi")
+                os.makedirs(out_root, exist_ok=True)
+                os.makedirs(cropped, exist_ok=True)   # 防御：子进程若因异常未创建，则本进程兜底
+                pngs = sorted(f for f in os.listdir(cropped)
+                              if f.lower().endswith(".png"))
+                archived = 0; skipped = 0
+                for png in pngs:
+                    dst_png = os.path.join(out_root, png)
+                    if os.path.exists(dst_png):
+                        skipped += 1
+                        continue
+                    shutil.copy2(os.path.join(cropped, png), dst_png)
+                    archived += 1
+                out["steps"].append({"step": "archive", "ok": True,
+                                     "returncode": 0})
+                # 打包态（windowed exe）下子进程 stdout 被丢弃，前端只能看到 returncode。
+                # 把子脚本落盘的抽取日志尾部附进来，让 [no image]/页级错误可见。
+                _exlog = os.path.join(RUNTIME_DIR, "extract_original.log")
+                if os.path.exists(_exlog):
+                    try:
+                        tail = open(_exlog, encoding="utf-8", errors="replace").read()[-2000:]
+                        out["stdout"] += "\n[extract log]\n" + tail + "\n"
+                    except Exception:
+                        pass
+                out["stdout"] += (f"\n[archive] 归档整版原图到 output/（平铺，不建子目录）：新增 {archived} 张，"
+                                  f"跳过已存在 {skipped} 张。\n")
+                if archived == 0 and skipped == 0:
+                    # source 有文件但本次一张图都没产出：明确报错，不让用户误以为成功
+                    out["ok"] = False
+                    out["error"] = ("抽图结果为 0 张：PDF/图片中未抽出任何图像。常见原因："
+                                    "① 文字型 PDF（页面为矢量文字，无内嵌扫描图）；"
+                                    "② PDF 为 AES 加密但打包环境缺 cryptography（2.0.5 起已内置）；"
+                                    "③ 图像编码不支持。详情见上方抽取日志，建议将 PDF 页面导出为图片后重新导入。")
+                    return self._json(out)
+                out["ok"] = True
                 return self._json(out)
-            out["ok"] = True
-            return self._json(out)
-        except Exception as e:
-            out["error"] = str(e)
-            return self._json(out)
+            except Exception as e:
+                out["error"] = str(e)
+                return self._json(out)
+        finally:
+            _extract_busy = False
 
     def _save_cfg(self, data):
         allowed = ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
@@ -2922,6 +2962,9 @@ function syncSelAll(){ const sa=$('selAll'); if(!sa) return; const chks=document
   sa.checked = all; sa.indeterminate = !all && !none; }
 function flashHint(msg){ alert(msg); }
 function runExtractAndGroup(){
+  const btn = $('runExtractGroup');
+  if(btn && btn.disabled){ return; }            // 防重：抽图中禁止再次触发（用户可能因慢而连点）
+  if(btn){ btn.disabled = true; btn.textContent = '抽图中…'; }
   log('[抽图并归档] 开始…');
   fetch('/api/extract_and_group',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:'auto'})}).then(r=>r.json()).then(j=>{
     (j.steps||[]).forEach(s=>log('['+s.step+'] '+(s.ok?'成功':'失败')+' (returncode='+s.returncode+')'));
@@ -2937,7 +2980,8 @@ function runExtractAndGroup(){
       }).catch(e=>{ log('清空 source/ 失败：'+e); refreshImageList(); refreshSourceList(); });
     }
     else log('失败：'+(j.error||''));
-  }).catch(e=>log('抽图并归档失败：'+e)); }
+  }).catch(e=>log('抽图并归档失败：'+e))
+    .finally(()=>{ if(btn){ btn.disabled=false; btn.textContent='抽图并归档'; } }); }
 // 来源补充：根据当前模式与工作集，渲染「按版来源」输入行。跨页合并一篇→隐藏并改用全局框；
 // 单页一次多版→每版一行（同一版内多篇共享）。按版名暂存已填值，刷新时不丢失。
 let _savedSrcByPage = {};
@@ -3316,7 +3360,7 @@ async function startUpdate(j){
   const st=$('updateStatus'); if(!st) return;
   st.textContent='正在下载更新包…（可能需要一会儿）'; st.style.color='var(--mut)';
   try{
-    const r=await fetch('/api/update_download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({download_url:j.download_url, sha256_url:j.sha256_url})});
+    const r=await fetch('/api/update_download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({download_url:j.download_url, sha256_url:j.sha256_url, alt_download_url:j.alt_download_url||'', alt_sha256_url:j.alt_sha256_url||''})});
     const d=await r.json();
     if(!d.ok) throw new Error(d.error||'下载失败');
     st.textContent='下载完成，正在重启以完成升级…'; st.style.color='var(--ok)';
@@ -3552,6 +3596,8 @@ resizeCanvas(); draw();
 ICON = os.path.join(os.path.dirname(HERE), "icon", "newspaper.ico")
 
 _cfg_lock = threading.Lock()
+_extract_lock = threading.Lock()   # 抽图并归档跨请求互斥：防止用户误以为卡顿而重复点击触发并发抽图
+_extract_busy = False
 
 
 def _port_listening(host, port, timeout=0.3):
