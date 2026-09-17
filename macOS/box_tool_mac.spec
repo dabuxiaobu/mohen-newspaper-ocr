@@ -41,6 +41,7 @@ a = Analysis(
         "openai",
         "truststore",  # _ssl_ctx() 优先用它桥接系统钥匙串证书（macOS 冻结态无默认 CA 文件）
         "pypdf",
+        "cryptography",  # pypdf 可选依赖：AES 加密 PDF 解密必需（缺失则抽图静默 0 张）
         # 人工框选链路子模块（import 模式冻结进 app；均已有 main()）
         "extract_original",
         "postprocess",

@@ -132,7 +132,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "2.0.4"
+VERSION = "2.0.5"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -1787,8 +1787,25 @@ class Handler(BaseHTTPRequestHandler):
                 archived += 1
             out["steps"].append({"step": "archive", "ok": True,
                                  "returncode": 0})
+            # 打包态（windowed exe）下子进程 stdout 被丢弃，前端只能看到 returncode。
+            # 把子脚本落盘的抽取日志尾部附进来，让 [no image]/页级错误可见。
+            _exlog = os.path.join(RUNTIME_DIR, "extract_original.log")
+            if os.path.exists(_exlog):
+                try:
+                    tail = open(_exlog, encoding="utf-8", errors="replace").read()[-2000:]
+                    out["stdout"] += "\n[extract log]\n" + tail + "\n"
+                except Exception:
+                    pass
             out["stdout"] += (f"\n[archive] 归档整版原图到 output/（平铺，不建子目录）：新增 {archived} 张，"
                               f"跳过已存在 {skipped} 张。\n")
+            if archived == 0 and skipped == 0:
+                # source 有文件但本次一张图都没产出：明确报错，不让用户误以为成功
+                out["ok"] = False
+                out["error"] = ("抽图结果为 0 张：PDF/图片中未抽出任何图像。常见原因："
+                                "① 文字型 PDF（页面为矢量文字，无内嵌扫描图）；"
+                                "② PDF 为 AES 加密但打包环境缺 cryptography（2.0.5 起已内置）；"
+                                "③ 图像编码不支持。详情见上方抽取日志，建议将 PDF 页面导出为图片后重新导入。")
+                return self._json(out)
             out["ok"] = True
             return self._json(out)
         except Exception as e:
@@ -2435,6 +2452,10 @@ function applyProviderFromValues(v){
   ocrProvider = (['qwen','doubao','other'].includes(v.BOX_OCR_PROVIDER)) ? v.BOX_OCR_PROVIDER : 'qwen';
   setProviderRadio(ocrProvider);
   fillActiveProviderInputs();
+  // 回填独立的结构化（DeepSeek）密钥/地址/模型，否则重启后设置面板显示为空（密钥已落盘只是未恢复显示）
+  $('cfgDsKey').value = v.DEEPSEEK_API_KEY || '';
+  $('cfgDsUrl').value = v.DEEPSEEK_BASE_URL || '';
+  $('cfgDsModel').value = v.DEEPSEEK_MODEL || '';
 }
 function setProviderRadio(p){ const r=document.querySelector('input[name="cfgProvider"][value="'+p+'"]'); if(r) r.checked=true; }
 function fillActiveProviderInputs(){
@@ -2479,7 +2500,7 @@ function loadDataURL(url,name,idx){ const pname=(name||'').replace(/\.[^.]+$/,''
     // 懒初始化该版存储；pageOrder 仅由「载入所选」批量填充，翻页（loadDataURL）绝不改动
     if(!allPageData[srcName]) allPageData[srcName]={boxes:[],results:{}};
     boxes=allPageData[srcName].boxes; results=allPageData[srcName].results;   // 引用，编辑即持久化
-    selectedId=null; renderBoxList(); renderResults(); resizeCanvas();   // 同步 resize + draw：随本任务渲染上屏，无需点击
+    selectedId=null; renderBoxList(); if(mergeMode!=='cross') renderResults(); resizeCanvas();   // 跨页模式面板内容与当前页无关，翻页不重建，避免校对文本框重置
     if(pendingSelectId!=null){ selectedId=pendingSelectId; pendingSelectId=null; renderBoxList(); draw(); }
     // 页码优先用调用方传入的 idx（gotoPage 已同步设过，最可靠），反推仅作兜底（均基于 navList，即当前载入的工作集）
     if(typeof idx==='number' && idx>=0 && navList[idx] && navList[idx].replace(/\.[^.]+$/,'')===srcName) pageIdx=idx;
@@ -2519,7 +2540,7 @@ function draw(){ if(!img){ drawPlaceholder(); return; } ctx.clearRect(0,0,cv.wid
     const color=(b.group?groupColor(b.group):LBL_COLOR[b.label])||'#dc2626';
     ctx.strokeStyle=color; ctx.lineWidth=isSel?3:2; ctx.strokeRect(X,Y,W,H);
     ctx.fillStyle=color; ctx.fillRect(X,Y-16,20,16); ctx.fillStyle='#fff'; ctx.font='12px sans-serif';
-    ctx.textAlign='center'; ctx.fillText(String(cross?globalBoxIndex(i):(i+1)),X+10,Y-4);     ctx.textAlign='left'; drawHandles(b,isSel);
+    ctx.textAlign='center'; ctx.fillText(String(cross?globalBoxIndex(i):(i+1)),X+10,Y-4);     ctx.textAlign='left'; if(isSel) drawHandles(b,isSel);
   });
   if(cur){ const X=cur.x*scale+PAD,Y=cur.y*scale+PAD,W=cur.w*scale,H=cur.h*scale; ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([5,3]); ctx.strokeRect(X,Y,W,H); ctx.setLineDash([]); } }
 // commitCanvas 已移除：回退到 #166 同步绘制方案——绘制在图片 onload 同步任务内完成即可随该次渲染上屏，无需点击。
@@ -2536,9 +2557,11 @@ function hitHandle(e){ const [cx,cy]=toCanvas(e); for(let i=boxes.length-1;i>=0;
 function hitBox(e){ const [cx,cy]=toCanvas(e); for(let i=boxes.length-1;i>=0;i--){ const b=boxes[i];
   const X=b.x*scale+PAD,Y=b.y*scale+PAD,W=b.w*scale,H=b.h*scale; if(cx>=X&&cx<=X+W&&cy>=Y&&cy<=Y+H) return b; } return null; }
 
-cv.addEventListener('mousedown',e=>{ if(!img)return; const hh=hitHandle(e); if(hh){ const [x,y]=toNat(e);
+cv.addEventListener('mousedown',e=>{ if(!img)return;
+  if(!e.altKey){ const hh=hitHandle(e); if(hh){ const [x,y]=toNat(e);
   dragState={kind:'resize',id:hh.box.id,handle:hh.handle,startX:x,startY:y,origBox:{...hh.box}}; selectedId=hh.box.id; renderBoxList(); draw(); return; }
-  const hb=hitBox(e); if(hb){ const [x,y]=toNat(e); dragState={kind:'move',id:hb.id,startX:x,startY:y,origBox:{...hb}}; selectedId=hb.id; renderBoxList(); draw(); return; }
+  const hb=hitBox(e); if(hb){ const [x,y]=toNat(e); dragState={kind:'move',id:hb.id,startX:x,startY:y,origBox:{...hb}}; selectedId=hb.id; renderBoxList(); draw(); return; } }
+  // Alt+左键：跳过命中检测，强制从空白起画新框（应对排版紧凑/框体重叠场景）
   selectedId=null; renderBoxList(); draw(); const [x,y]=toNat(e); drawing={x,y}; cur=null; });
 cv.addEventListener('mousemove',e=>{ if(drawing){ const [x,y]=toNat(e);
   cur={x:Math.min(drawing.x,x),y:Math.min(drawing.y,y),w:Math.abs(x-drawing.x),h:Math.abs(y-drawing.y)}; draw(); return; }
@@ -2762,6 +2785,9 @@ function renderResults(){ const el=$('resultList');
   if(!img){ el.innerHTML='<div style="color:var(--mut); font-size:12px;">载入整版图片后，在此显示可核对 / 编辑的识别结果。</div>'; return; }
   const cross = mergeMode==='cross';
   const targets=aggregateCrossTargets(); if(!targets.length){ el.innerHTML='<div style="color:var(--mut); font-size:12px;">多篇模式需先框选区域，再点「识别全部」。</div>'; return; }
+  // 重建前快照：容器滚动位置 + 各 textarea 的高度/滚动位置，避免翻页/重渲染后校对位置丢失
+  const keepSc=el.scrollTop; const keep={};
+  el.querySelectorAll('textarea[data-key]').forEach(ta=>{ keep[ta.dataset.key]={h:ta.style.height, st:ta.scrollTop}; });
   el.innerHTML='';
   // 全局序号映射：box 对象 -> 阅读顺序中的连续编号（与 renderBoxList 展平一致），避免多版时局部序号错乱
   const flat=flattenBoxes(); const gIdx=new Map(); flat.forEach(v=>gIdx.set(v.box, v.globalIdx+1));
@@ -2782,8 +2808,10 @@ function renderResults(){ const el=$('resultList');
       else if(b.label==='text'){ const ls=[]; if(item.title)ls.push(`标题：${item.title}`); if(item.author)ls.push(`作者：${item.author}`); if(item.body)ls.push(item.body); display=ls.join('\n')||item.raw; } }
     const d=document.createElement('div'); d.className='card'; d.innerHTML=`<div class="hd"><span class="title">${title}</span><span class="meta">${size}</span></div><textarea data-key="${esc(t.key)}">${esc(display)}</textarea>`;
     el.appendChild(d); });
-  el.querySelectorAll('textarea').forEach(ta=>ta.oninput=e=>{ const k=e.target.dataset.key; const item=resultToItem(crossResults[k]); item.raw=e.target.value;
-    const p=parseArticle(e.target.value); item.title=p.title; item.author=p.author; item.body=p.body; crossResults[k]=item; }); }
+  el.querySelectorAll('textarea').forEach(ta=>{ const k=ta.dataset.key; const kb=keep[k]; if(kb){ if(kb.h) ta.style.height=kb.h; ta.scrollTop=kb.st; }
+    ta.oninput=e=>{ const item=resultToItem(crossResults[k]); item.raw=e.target.value;
+    const p=parseArticle(e.target.value); item.title=p.title; item.author=p.author; item.body=p.body; crossResults[k]=item; }; });
+  el.scrollTop=keepSc; }
 
 // ---------- 导出 ----------
 function computeUnionBox(bs){ let x0=Infinity,y0=Infinity,x1=-Infinity,y1=-Infinity; bs.forEach(b=>{x0=Math.min(x0,b.x);y0=Math.min(y0,b.y);x1=Math.max(x1,b.x+b.w);y1=Math.max(y1,b.y+b.h);});
@@ -2971,8 +2999,9 @@ async function runPost(){
   // 结构化成功后的统一清理：清空当前工作集与勾选状态，避免重复处理
   // clearPost 统一清空「已载入工作集 + 画布 + 勾选状态 + 整版原图目录列表（pageList）」。
   // 单页与跨页模式均清空 pageList：结构化完成后整轮工作结束，目录列表一并归零，避免出现「残留文件可重新打开」。
-  const clearPost = ()=>{
-    const cleaned = pageOrder.slice();  // 本次已结构化处理的整版名（cropped_hi 文件名）
+  const clearPost = (cleanFiles)=>{
+    // 仅物理删除「本次结构化实际成功产出（ok 且未 skipped）」的版；未完成的版源图保留，可重新载入识别
+    const cleaned = (cleanFiles && cleanFiles.length) ? cleanFiles.slice() : pageOrder.slice();  // 本次已结构化处理的整版名（cropped_hi 文件名）
     const crossRaw = (mergeMode==='cross' && pageOrder.length>1) ? crossBaseName() : '';  // 跨页 raw 中转目录名（output/{crossRaw}/）
     pageOrder=[]; crossResults={}; allPageData={}; navList=[]; pageList=[]; pageIdx=-1; srcName=''; img=null; boxes=[]; results={};
     // 清空来源补充输入：跨页全局框 + 单页按版暂存（_savedSrcByPage 按文件名映射，若不重置，下一轮载入同名文件会复活旧来源），避免结构化后来源残留 / 重填失效
@@ -3005,25 +3034,25 @@ async function runPost(){
     const pages = pageOrder.slice();
     fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:outDir,pages,source_override:globalSO})})
       .then(r=>r.json()).then(j=>{ let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+']\n'+(j.stdout||'')+(j.stderr?'\n'+j.stderr:''); if(j.ok&&j.opened_dir){ const rel=osRel(j.opened_dir); s+='\n↑ 已打开该轮文件夹：'+rel; }
-        if(j.ok && !j.skipped){ clearPost(); s+='\n[结构化] 已清空当前工作集与勾选状态。'; } log(s); })
+        if(j.ok && !j.skipped){ clearPost(pageOrder.slice()); s+='\n[结构化] 已清空当前工作集与勾选状态。'; } log(s); })
       .catch(e=>log('后置失败：'+e));
     return;
   }
   // 单页模式：逐版调用 postprocess，每版独立子文件夹（output/{top}/{整版名}/）；
   // 全部完成后统一打开父目录 output/{top}（多子文件夹，不钻进某一页）
   const pages = pageOrder.slice();
-  let done=0, okCount=0, hasRealOutput=false; const logs=[];
+  let done=0, okCount=0, hasRealOutput=false; const logs=[]; const okPages=[];
   pages.forEach(pname=>{
     const od = pname.replace(/\.[^.]+$/,'');
     fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:od,pages:[pname],no_open:true,source_override:(perPageSO[pname]||null)})})
-      .then(r=>r.json())      .then(j=>{ if(j.ok && !j.skipped){ okCount++; hasRealOutput=true; }
+      .then(r=>r.json())      .then(j=>{ if(j.ok && !j.skipped){ okCount++; hasRealOutput=true; okPages.push(pname); }
         let st = j.ok ? (j.skipped?'无产物':'成功') : ('失败: '+(j.error||''));
         const head=(j.stdout||'').split('\n').slice(0,2).join(' / '); logs.push('[版 '+esc(pname)+'] '+(head||st)); })
       .catch(e=>{ const detail=(e&&e.stack)?e.stack:(''+e); logs.push('[版 '+esc(pname)+'] 后置失败：'+(e&&e.message?e.message:e)); fetch('/api/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({line:'[探针] 版 '+pname+' postprocess fetch 失败: '+detail})}).catch(()=>{}); })
       .finally(()=>{ done++; if(done===pages.length){
         let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+'] 单页模式：已逐版检查 '+pages.length+' 版，其中可结构化 '+okCount+' 版，每版独立子文件夹（output/'+top+'/整版名/）。';
         if(logs.length) s+='\n'+logs.join('\n');
-        const after = ()=>{ if(hasRealOutput){ clearPost(); s+='\n[结构化] 已清空当前工作集与勾选状态。'; } log(s); };
+        const after = ()=>{ if(hasRealOutput){ const failed = pages.filter(p=>!okPages.includes(p)); clearPost(okPages); s+='\n[结构化] 已清空当前工作集与勾选状态。'; if(failed.length){ s+='\n[清理] 以下版未完成结构化（无产物/失败），源图已保留在 cropped_hi/，可重新载入识别：'+failed.join('、'); } } log(s); };
         // 统一打开父目录 output/{top}（多子文件夹，不钻进某一页）
         fetch('/api/open_folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:top})})
           .then(r=>r.json()).then(j=>{ if(j.ok){ const rel=osRel(j.path); s+='\n↑ 已打开父文件夹：'+rel; } }).catch(()=>{})

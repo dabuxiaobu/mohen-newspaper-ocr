@@ -19,6 +19,7 @@ autocrop 阈值：diff > 28（与背景色 RGB max 差），margin 相对长边 
 """
 import os
 import sys
+import time
 import threading
 import numpy as np
 from PIL import Image
@@ -45,25 +46,47 @@ else:
     HERE = os.path.dirname(os.path.abspath(__file__))
 SRC_DIR_DEFAULT = os.path.join(HERE, "source")   # 默认来源：脚本同目录的 source/
 DST_DIR = os.path.join(HERE, "cropped_hi")       # 输出到 cropped_hi/，供阶段 ③ 标注
+LOG_PATH = os.path.join(HERE, "extract_original.log")
+
+# 打包态（windowed exe）下子进程 sys.stdout 被 PyInstaller 丢弃，print 全部消失，
+# 启动器与用户都看不到 [no image]/异常原因。因此关键事件同步落一份日志文件，
+# 启动器在 0 产出时读取该文件回传前端，便于定位（如 AES 加密 PDF 缺 cryptography）。
+def _elog(msg: str):
+    print(msg)
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(time.strftime("[%Y-%m-%d %H:%M:%S] ") + msg + "\n")
+    except Exception:
+        pass
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}  # 直接放入的图片格式
 
 
 def extract_images_per_page(pdf_path: str):
     """从 PDF 每页抽出面积最大的内嵌图（数据库导出一般是单图全页）。
 
-    返回 [(page_num, pil_image), ...]，保留所有页，以支持跨页文章。
-    若某页无内嵌图则跳过该页。
+    返回 ([(page_num, pil_image), ...], [错误描述, ...])，保留所有页，以支持跨页文章。
+    单页整体失败（如 AES 加密 PDF 缺 cryptography、图像编码不支持）只跳过该页并记录错误。
     """
     reader = PdfReader(pdf_path)
     out = []
+    errors = []
     for i, page in enumerate(reader.pages, 1):
         best = None
         best_area = 0
-        for im in page.images:
+        try:
+            images = list(page.images)
+        except Exception as e:
+            msg = f"{os.path.basename(pdf_path)} page {i}: 页面图像枚举失败: {type(e).__name__}: {e}"
+            errors.append(msg)
+            _elog(f"  [skip page] {msg}")
+            continue
+        for im in images:
             try:
                 pil = im.image
             except Exception as e:
-                print(f"  [skip image] {os.path.basename(pdf_path)} page {i}: {e!r}")
+                msg = f"{os.path.basename(pdf_path)} page {i} 图 {getattr(im, 'name', '?')}: 解码失败: {type(e).__name__}: {e}"
+                errors.append(msg)
+                _elog(f"  [skip image] {msg}")
                 continue
             if pil is None:
                 continue
@@ -73,7 +96,7 @@ def extract_images_per_page(pdf_path: str):
                 best = pil.convert("RGB")
         if best:
             out.append((i, best))
-    return out
+    return out, errors
 
 
 def autocrop(img, margin_ratio=0.003):
@@ -106,6 +129,12 @@ def main():
             DST_DIR = sys.argv[i + 1]
 
     os.makedirs(DST_DIR, exist_ok=True)
+    # 每次运行重置日志文件（打包态 stdout 被丢弃，此文件是与启动器/用户对齐的关键通道）
+    try:
+        with open(LOG_PATH, "w", encoding="utf-8") as _f:
+            _f.write(time.strftime("[%Y-%m-%d %H:%M:%S] === 抽图开始 ===\n"))
+    except Exception:
+        pass
 
     if not os.path.isdir(SRC_DIR):
         print(f"[empty] 来源文件夹不存在：{SRC_DIR}")
@@ -122,6 +151,7 @@ def main():
         sys.exit(0)
 
     print(f"来源：{SRC_DIR}（{len(pdfs)} 个 PDF + {len(imgs)} 张图片）-> 输出：{DST_DIR}（已存在则跳过）")
+    _elog(f"来源：{SRC_DIR}（{len(pdfs)} 个 PDF + {len(imgs)} 张图片）")
     skipped = 0
     for name in files:
         if STOP_EVENT.is_set():
@@ -136,9 +166,10 @@ def main():
             continue
         try:
             if ext == ".pdf":
-                pages = extract_images_per_page(src)
+                pages, errs = extract_images_per_page(src)
                 if not pages:
-                    print("[no image]", name)
+                    _elog(f"[no image] {name}"
+                          + (f"（{len(errs)} 条页级错误，详见上文）" if errs else "（未发现内嵌图片，可能是文字型 PDF）"))
                     continue
                 kind = "PDF"
                 for pnum, im in pages:
@@ -164,7 +195,7 @@ def main():
                 print(f"{name[:30]:32} [{kind}] 原图 {w0}x{h0} -> 裁切 {w1}x{h1} "
                       f"(留 {100*w1*h1/(w0*h0):.0f}%)")
         except Exception as e:
-            print(f"[skip] {name}: {e!r}")
+            _elog(f"[skip] {name}: {e!r}")
     if skipped:
         print(f"[info] 已跳过 {skipped} 个已存在")
 

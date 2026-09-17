@@ -58,7 +58,7 @@ source "$VENV/bin/activate"
 # [3/6] 依赖
 echo "[3/6] 安装依赖"
 pip install -U pip >/dev/null 2>&1
-pip install pyinstaller pywebview numpy Pillow opencc-python-reimplemented openai pypdf
+pip install pyinstaller pywebview numpy Pillow opencc-python-reimplemented openai pypdf cryptography
 
 # [4/6] .ico → .icns（PIL 原生支持 ICNS）
 echo "[4/6] 生成 AppIcon.icns"
