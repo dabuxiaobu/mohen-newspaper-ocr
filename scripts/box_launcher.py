@@ -132,7 +132,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -401,7 +401,8 @@ SYSTEM_PROMPT = """你是近代文献（图书、期刊、报纸等）OCR 与转
 3. 异体字、俗字、旧字形、缺笔字按你的最佳判断直接转录，不擅自替换时也不加任何注记。
 4. 保留标题、副题、正文、图注、页码、书眉、版权页信息之间的层级与分隔；同一视觉块内的内容归为一段。
 5. 若区域含多篇文章/多栏接续，按视觉分块分别输出并明确标注边界，不要擅自拼接为一段。
-6. 不输出与转录无关的说明、寒暄或"以下是转录结果"之类前缀；直接给内容。"""
+6. 不输出与转录无关的说明、寒暄或"以下是转录结果"之类前缀；直接给内容。
+7. 同一栏/同一视觉块内连续排印的正文，不得因框选边缘几何截断而断行；栏内文字连排为一段，仅在确属新段落（上一句已有句末标点收尾，或存在明显层级/空行分隔）处换行。"""
 
 SINGLE_INSTRUCTION = """这是民国竖排报纸中的一篇文章（出处：{src}）。
 请你完成该篇文章的转录：
@@ -419,6 +420,7 @@ SINGLE_INSTRUCTION = """这是民国竖排报纸中的一篇文章（出处：{s
 4. 将竖排繁体转为简体中文输出；忠实原文，不擅自改写文意、不把旧用法改成现代用法。
 5. **不要对任何字词加注释或疑似说明**（如"疑为…""照录""（注：…）""（原文…）"等）。遇到模糊或疑似错字，凭你的最佳判断直接给出你认定的字；实在无法辨认才以 □ 占位。
 6. 若本图是该文的接续页（跨页续文，正文起首即承接上一版末句），则把**接续处上行尾与下行首连成一句完整输出**，不要在版/栏衔接处强行插入分段或空行；跨页的最终合并由系统完成，单页转录只需保证本页文字连续、不擅自断句。仅当确属新段落（上一版末已是完整句且有句号等收尾）时，才在段首正常起段。
+7. 本篇正文中，若文字因框选边缘被几何截断（如某句跨框、框底/框右切到句中），须保持句子连续，在截断处不得换行断句；仅在确属新段落时正常起段。
 
 示例（仅展示格式，不代表本文内容）：
 标题：五一劳动节纪
@@ -473,6 +475,44 @@ def _read_post_default_prompt_plain():
     return ""
 
 
+def _read_post_default_prompt_history():
+    """从 postprocess.py 源码以 AST 提取 SYSTEM_PROMPT_SHORT_HISTORY 常量（《历史研究》知识库模式默认提示词）。"""
+    p = os.path.join(HERE, "postprocess.py")
+    if not os.path.exists(p):
+        return ""
+    try:
+        import ast
+        tree = ast.parse(open(p, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "SYSTEM_PROMPT_SHORT_HISTORY":
+                        val = ast.literal_eval(node.value)
+                        return val if isinstance(val, str) else ""
+    except Exception:
+        pass
+    return ""
+
+
+def _read_post_default_prompt_plain_history():
+    """从 postprocess.py 源码以 AST 提取 SYSTEM_PROMPT_SHORT_PLAIN_HISTORY 常量（《历史研究》纯文本模式默认提示词）。"""
+    p = os.path.join(HERE, "postprocess.py")
+    if not os.path.exists(p):
+        return ""
+    try:
+        import ast
+        tree = ast.parse(open(p, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == "SYSTEM_PROMPT_SHORT_PLAIN_HISTORY":
+                        val = ast.literal_eval(node.value)
+                        return val if isinstance(val, str) else ""
+    except Exception:
+        pass
+    return ""
+
+
 def _load_cfg():
     cfg = {}
     explicit = set()
@@ -481,7 +521,8 @@ def _load_cfg():
                  "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
                  "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
                  "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
-                 "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")
+                 "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
+                 "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE")
     if os.path.exists(p):
         try:
             data = json.load(open(p, encoding="utf-8"))
@@ -517,7 +558,8 @@ def _ensure_blank_config():
                              "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
                              "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
                              "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
-                             "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")}
+                             "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
+                             "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE")}
     blank["BOX_OCR_PROVIDER"] = "qwen"
     blank["AUTO_UPDATE"] = False
     try:
@@ -532,7 +574,8 @@ def _cfg_status(cfg, explicit):
             "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
             "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
             "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
-            "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")
+            "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
+            "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE")
     return {k: (k in explicit) for k in keys}
 
 
@@ -578,6 +621,35 @@ def _safe_format(tpl, **kw):
         def __missing__(self, key):
             return "{" + key + "}"
     return tpl.format_map(_SafeDict(**kw))
+
+
+def _translate_api_error(detail, status_code=None):
+    """把模型服务商返回的原始错误报文翻成中文友好提示，便于普通用户定位。
+
+    仅做关键词识别，匹配不到时原样返回，绝不吞掉原始信息。
+    """
+    d = (detail or "").lower()
+    code = status_code
+    # 额度 / 免费额度耗尽（最常见，用户易误以为程序坏了）
+    if (code == 403 or "forbidden" in d or "free quota" in d or "freeter" in d
+            or "free tier" in d or "allocationquota" in d or "quota" in d):
+        return ("API 额度耗尽或账号处于「仅免费额度」模式：当前 API Key / 账号的免费额度已用完，"
+                "请求被服务商拒绝（HTTP 403）。\n"
+                "解决办法（任选其一）：\n"
+                "  1. 到对应平台控制台充值 / 绑卡；\n"
+                "  2. 关闭「仅使用免费额度（use free tier only）」开关；\n"
+                "  3. 更换仍有额度的 API Key 或模型后重试。")
+    if code == 401 or "unauthorized" in d or "invalid api key" in d or "authentication" in d:
+        return ("API Key 无效或已过期：请检查设置中填写的 API Key 是否正确、是否仍有有效额度，"
+                "确认后重新保存再试。")
+    if code == 429 or "rate limit" in d or "too many requests" in d:
+        return ("触发限流（请求过于频繁，HTTP 429）：请稍候再试；若经常触发，"
+                "可降低并发或换用额度更高的账号。")
+    if code in (502, 503, 504) or "bad gateway" in d or "service unavailable" in d or "timeout" in d:
+        return "模型服务暂时不可用（HTTP %s）：请稍后重试；若持续，可能是服务商侧故障。" % code
+    if code == 400 or "bad request" in d:
+        return "请求参数错误（HTTP 400）：" + (detail or "")[:300]
+    return detail or "未知错误（未返回任何信息）"
 
 
 def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None):
@@ -651,7 +723,7 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None):
         }}
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:600]
-        raise RuntimeError(f"HTTP {e.code} {e.reason}: {detail}")
+        raise RuntimeError(_translate_api_error(detail, e.code))
     except KeyError:
         raise RuntimeError("响应缺少 choices[0].message.content，返回体：" +
                           json.dumps(j, ensure_ascii=False)[:400])
@@ -895,11 +967,13 @@ class Handler(BaseHTTPRequestHandler):
                             "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
                             "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
                             "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
-                            "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")},
+                            "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY")},
                 # 提示词出厂默认（抽屉「恢复默认」回填；自定义留空则回落到此）
                 "prompt_ocr_default": SINGLE_INSTRUCTION,
                 "prompt_post_default": _read_post_default_prompt(),
                 "prompt_post_plain_default": _read_post_default_prompt_plain(),
+                "prompt_post_history_default": _read_post_default_prompt_history(),
+                "prompt_post_plain_history_default": _read_post_default_prompt_plain_history(),
             })
         if u.path == "/api/list_images":
             qs = parse_qs(u.query)
@@ -907,8 +981,17 @@ class Handler(BaseHTTPRequestHandler):
             d = _img_dir(sub)
             if not os.path.isdir(d):
                 return self._json({"dir": sub, "files": []})
-            fs = sorted(f for f in os.listdir(d)
-                        if os.path.splitext(f)[1].lower() in IMG_EXTS)
+            raw = [f for f in os.listdir(d)
+                   if os.path.splitext(f)[1].lower() in IMG_EXTS]
+            # 优先按抽图产物顺序索引（.order.json）排序，使翻页顺序 = 导入/抽图先后
+            _op = os.path.join(d, ".order.json")
+            _order = []
+            if os.path.isfile(_op):
+                try:
+                    _order = json.load(open(_op, encoding="utf-8")).get("order", [])
+                except Exception:
+                    _order = []
+            fs = sorted(raw, key=lambda f: (0, _order.index(f)) if f in _order else (1, f))
             return self._json({"dir": sub, "files": fs})
         if u.path == "/api/list_source":
             return self._list_source()
@@ -997,6 +1080,67 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": True})
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)[:120]})
+        if u.path == "/api/reorder_cropped":
+            # 持久化整版原图（cropped_hi）的前端排序到 cropped_hi/.order.json，
+            # 供后续 /api/list_images 按该顺序返回（翻页/载入顺序一致）。
+            try:
+                ch = _img_dir("cropped_hi")
+                if not os.path.isdir(ch):
+                    os.makedirs(ch, exist_ok=True)
+                raw = [f for f in os.listdir(ch)
+                       if os.path.splitext(f)[1].lower() in IMG_EXTS]
+                valid_l = set(x.lower() for x in raw)
+                order = [x for x in (data.get("order") or [])
+                         if isinstance(x, str) and x.lower() in valid_l]
+                seen = set()
+                uniq = []
+                for x in order:
+                    if x.lower() not in seen:
+                        uniq.append(x); seen.add(x.lower())
+                for x in raw:  # 补齐后端实际存在但前端未传的（按文件名排序追加）
+                    if x.lower() not in seen:
+                        uniq.append(x); seen.add(x.lower())
+                with open(os.path.join(ch, ".order.json"), "w", encoding="utf-8") as f:
+                    json.dump({"order": uniq}, f, ensure_ascii=False, indent=2)
+                return self._json({"ok": True, "order": uniq})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)[:200]})
+        if u.path == "/api/rebuild_ref":
+            # 手改作者/标题/日期后，本地确定性重算引用串并写回结构化产物（不调模型）。
+            # 走 subprocess 调 postprocess.py --rebuild-ref（与结构化调用一致，隔离主进程）。
+            try:
+                src = data.get("source_name", "")
+                out_dir = data.get("out_dir", "")
+                if not src:
+                    return self._json({"ok": False, "error": "缺少 source_name"})
+                out_root = _img_dir("output")
+                if out_dir:
+                    out_root = os.path.join(out_root, out_dir)
+                txt_path = os.path.join(out_root, src + ".txt")
+                cfg, _ = _load_cfg()
+                fmt = cfg.get("CITATION_FORMAT", "gb7714")
+                kt = bool(cfg.get("KEEP_TRADITIONAL", False))
+                cmd = [_py()]
+                if getattr(sys, "frozen", False):
+                    # 冻结态主 exe 当解释器：必须用 --run-script 拦截，否则会走默认入口
+                    # 重开 GUI → 单实例拦截弹出“程序已经在运行了”。开发态 python.exe 不识别该参数，不加。
+                    cmd.append("--run-script")
+                cmd += [os.path.join(HERE, "postprocess.py"),
+                        "--rebuild-ref", txt_path,
+                        "--citation-format", fmt,
+                        *(["--keep-traditional"] if kt else [])]
+                r = subprocess.run(cmd,
+                                   capture_output=True, text=True, cwd=HERE,
+                                   env=dict(os.environ, MOHEN_DATA_DIR=RUNTIME_DIR))
+                if r.returncode != 0:
+                    return self._json({"ok": False, "error": "(stderr) " + (r.stderr or r.stdout)[:300]})
+                try:
+                    res = json.loads(r.stdout.strip().splitlines()[-1])
+                except Exception:
+                    res = {"ok": True, "raw": r.stdout[:200]}
+                return self._json(res)
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)[:200]})
         if u.path == "/api/ocr":
             try:
                 # 前端未显式传 prompt_override 时，自动用配置里的 PROMPT_OCR 覆盖（提示词抽屉保存后即时生效）
@@ -1207,6 +1351,24 @@ class Handler(BaseHTTPRequestHandler):
                 written.append(name)
             except Exception as e:
                 skipped.append(f"{name}: {e}")
+        # 记录导入顺序，供后续抽图/翻页按导入先后排序（而非文件名序）
+        try:
+            _op = os.path.join(src_dir, ".import_order.json")
+            _od = []
+            if os.path.isfile(_op):
+                try:
+                    _od = json.load(open(_op, encoding="utf-8")).get("order", [])
+                except Exception:
+                    _od = []
+            _exist = set(os.listdir(src_dir))
+            _od = [n for n in _od if n in _exist]
+            for _n in written:
+                if _n not in _od:
+                    _od.append(_n)
+            with open(_op, "w", encoding="utf-8") as _f:
+                json.dump({"order": _od}, _f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
         return self._json({"ok": True, "written": written, "skipped": skipped,
                            "source_dir": src_dir, "count": len(written)})
 
@@ -1271,7 +1433,7 @@ class Handler(BaseHTTPRequestHandler):
         d = _img_dir("source")
         if not os.path.isdir(d):
             return self._json({"files": []})
-        fs = sorted(os.listdir(d))
+        fs = sorted(f for f in os.listdir(d) if not f.startswith('.'))
         return self._json({"files": fs})
 
     def _delete_file(self, data):
@@ -1339,6 +1501,12 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(files, list):
             files = [files]
         removed = []
+        diag = []
+        d = os.path.normpath(_img_dir("cropped_hi"))
+        try:
+            diag.append("dir=" + d + " files=" + ",".join(sorted(os.listdir(d))[:20]))
+        except Exception as _e:
+            diag.append("dir=" + d + " listdir_error=" + repr(_e))
         for name in files:
             name = (name or "").strip()
             if not name:
@@ -1346,16 +1514,18 @@ class Handler(BaseHTTPRequestHandler):
             # pageOrder 里存的是去扩展名的 basename，而 cropped_hi/ 实际文件带扩展名；
             # 先按原名试删，失败且原名无扩展名时，补 .png/.jpg/.jpeg 候选再试。
             fp = _safe_delete(name, "cropped_hi")
+            diag.append(repr(name) + ("->删除" if fp else "->未命中"))
             if not fp:
                 base, ext = os.path.splitext(name)
                 if not ext:
                     for e in (".png", ".jpg", ".jpeg"):
                         fp = _safe_delete(name + e, "cropped_hi")
+                        diag.append(repr(name + e) + ("->删除" if fp else "->未命中"))
                         if fp:
                             break
             if fp:
                 removed.append(os.path.basename(fp))
-        return self._json({"ok": True, "removed": removed, "count": len(removed)})
+        return self._json({"ok": True, "removed": removed, "count": len(removed), "diag": diag})
 
     def _cleanup_cross_raw(self, data):
         """结构化成功后删除 output/ 下本次跨页的 raw 中转目录（output/{crossBaseName}）。
@@ -1690,13 +1860,21 @@ class Handler(BaseHTTPRequestHandler):
                         except OSError:
                             pass
             extra = ["--root", work, "--post-mode", pmode]   # 串联断点修复：指向本工具 OCR 产物
-            # 提示词抽屉保存的覆盖：kb 模式用 PROMPT_POST，plain 模式用 PROMPT_POST_PLAIN
-            pp = (cfg.get("PROMPT_POST") or "").strip()
+            # 引用格式切换（GB/T 7714 ↔ 《历史研究》）与繁简转换开关：透传给 postprocess 子进程
+            cf = (cfg.get("CITATION_FORMAT") or "gb7714").strip() or "gb7714"
+            hist = (cf == "history_research")
+            # 提示词抽屉保存的覆盖：按 (输出模式, 引用格式) 选对应覆盖槽；空=用内置默认
+            if pmode == "kb":
+                pp_key, pp_arg = ("PROMPT_POST_HISTORY" if hist else "PROMPT_POST"), "--prompt-post"
+            else:
+                pp_key, pp_arg = ("PROMPT_POST_PLAIN_HISTORY" if hist else "PROMPT_POST_PLAIN"), "--prompt-post-plain"
+            pp = (cfg.get(pp_key) or "").strip()
             if pp:
-                extra = extra + ["--prompt-post", pp]
-            ppp = (cfg.get("PROMPT_POST_PLAIN") or "").strip()
-            if ppp:
-                extra = extra + ["--prompt-post-plain", ppp]
+                extra = extra + [pp_arg, pp]
+            if hist:
+                extra = extra + ["--citation-format", "history_research"]
+            if (cfg.get("KEEP_TRADITIONAL") or "").strip().lower() == "true":
+                extra = extra + ["--keep-traditional"]
             # 来源补充：当导入文件名未携带题录信息时，用户在 ④ 面板手动补充来源串（如"大公报 1943-01-17 第2版"），
             # 结构化前注入 OCR 转录 txt 首行的「出处：」行（载体名由模型从此行读取）并覆盖提示词占位符，
             # 使 DeepSeek 生成完整 GB/T 7714 引用。仅非空字段生效，未填则完全走原逻辑。
@@ -1857,7 +2035,8 @@ class Handler(BaseHTTPRequestHandler):
                    "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
                    "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
                    "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
-                   "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN")
+                   "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
+                   "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE")
         p = os.path.join(CONFIG_DIR, "box_config.json")
         merged = {}
         if os.path.exists(p):
@@ -1934,6 +2113,24 @@ HTML = r"""<!doctype html>
     --pri:#2f6fed; --ok:#1f9d55; --err:#d23f3f; --warn:#b86e00;
     --logbg:#f8fafc; --logink:#1f2328;
   }
+  /* 护眼模式：柔和豆沙绿系，仅作用于 UI 外壳（var 变量区）；画布区为固定色不受影响 */
+  .eye-care {
+    --bg:#D7E8D5; --card:#EAF3E8; --bd:#B9D4B4; --ink:#274534; --mut:#5C7A66;
+    --logbg:#EAF3E8; --logink:#274534;
+  }
+  .eye-care input, .eye-care select, .eye-care textarea { background:#F2F8F1; color:var(--ink); }
+  .eye-care .src-list-wrap { background:#F2F8F1; }
+  .eye-care .src-list .item:hover { background:#DCEBD9; }
+  .eye-care .src-list .item .ord { background:#cfe0cc; color:#274534; }
+  .eye-care .src-list .item .ops .mv { background:#EAF3E8; border-color:#cfe0cc; color:#274534; }
+  .eye-care .src-list .item .ops .mv:hover:not(:disabled) { background:#DCEBD9; }
+  .eye-care .left, .eye-care #canvasWrap { background:#D7E8D5; }
+  .eye-care #cv { background:#F2F8F1; }
+  .eye-care #hint { background:#EAF3E8; }
+  .eye-care #toolbar { background:#EAF3E8 !important; }
+  .eye-care .gear:hover, .eye-care .logbtn:hover { background:#DCEBD9; }
+  .gear.eyecare-on { background:#2E7D32; color:#fff; border-color:#2E7D32; }
+  .gear.eyecare-on:hover { filter:brightness(.95); }
   * { box-sizing: border-box; }
   body { margin:0; background:var(--bg); color:var(--ink);
          font-family: -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; font-size:14px; }
@@ -1945,7 +2142,7 @@ HTML = r"""<!doctype html>
              padding:6px 10px; border-radius:8px; border:1px solid var(--bd); box-shadow:0 2px 8px rgba(0,0,0,.08); }
   #zoomBar span { font-size:12.5px; color:var(--ink); min-width:44px; text-align:center; font-weight:600; }
   #zoomBar button { min-width:auto; padding:5px 10px; }
-  #pageBar { position:sticky; top:12px; float:right; margin:12px 12px 0 0; z-index:10;
+  #pageBar { position:sticky; top:12px; right:12px; float:right; margin:12px 12px 0 0; z-index:10;
              display:flex; align-items:center; gap:6px; background:rgba(255,255,255,0.95);
              padding:6px 10px; border-radius:8px; border:1px solid var(--bd); box-shadow:0 2px 8px rgba(0,0,0,.08); }
   #pageBar button { min-width:auto; padding:5px 10px; }
@@ -2069,11 +2266,16 @@ HTML = r"""<!doctype html>
   .src-list-head .src-head-btn.gray { background:#475569; }
   .src-list-head .src-head-btn.stop { background:var(--err); }
   .src-list { max-height:160px; overflow:auto; display:flex; flex-direction:column; gap:1px; }
-  .src-list label.item { display:grid; grid-template-columns:13px 1fr; gap:6px; align-items:center; padding:3px 6px; border-radius:4px; font-size:12px; cursor:pointer; }
-  .src-list label.item input { width:13px; height:13px; margin:0; }
-  .src-list label.item span { word-break:break-all; line-height:1.4; }
-  .src-list label.item:hover { background:#eef1f5; }
-  .src-list label.item.sel { background:#eff6ff; }
+  .src-list .item { display:flex; align-items:center; gap:6px; padding:3px 6px; border-radius:4px; font-size:12px; cursor:default; }
+  .src-list .item input { width:13px; height:13px; margin:0; padding:0; flex-shrink:0; cursor:pointer; }
+  .src-list .item .ord { flex-shrink:0; min-width:18px; height:18px; line-height:18px; text-align:center; border-radius:9px; background:#e2e8f0; color:#475569; font-size:11px; font-weight:600; }
+  .src-list .item .nm { flex:1; min-width:0; word-break:break-all; line-height:1.4; }
+  .src-list .item .ops { flex-shrink:0; display:inline-flex; gap:2px; }
+  .src-list .item .ops .mv { width:20px; height:18px; line-height:1; padding:0; font-size:12px; border:1px solid var(--bd); border-radius:4px; background:#fff; color:#334155; cursor:pointer; }
+  .src-list .item .ops .mv:hover:not(:disabled) { background:#eef1f5; }
+  .src-list .item .ops .mv:disabled { color:#cbd5e1; cursor:default; border-color:#eef1f5; }
+  .src-list .item:hover { background:#eef1f5; }
+  .src-list .item.sel { background:#eff6ff; }
   .src-list .empty { color:var(--mut); font-size:12px; padding:2px 6px; }
   .src-list-head .fold-toggle { display:inline-flex; align-items:center; justify-content:center; width:8px; height:26px; min-width:0; min-height:0; flex:0 0 8px; padding:0; margin:0 4px 0 0; border:none; outline:none; background:transparent; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 8 8'%3E%3Cpath d='M1 1 L7 1 L4 7 z' fill='%2364748b'/%3E%3C/svg%3E"); background-size:8px 8px; background-repeat:no-repeat; background-position:center; cursor:pointer; transition:transform .12s ease; }
   .src-list-head .fold-toggle:hover { background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 8 8'%3E%3Cpath d='M1 1 L7 1 L4 7 z' fill='%23334155'/%3E%3C/svg%3E"); }
@@ -2192,6 +2394,7 @@ HTML = r"""<!doctype html>
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 14a9 9 0 0 1 18 0"/><line x1="12" y1="14" x2="16" y2="9"/><circle cx="12" cy="14" r="1" fill="currentColor"/><line x1="3" y1="20" x2="21" y2="20"/></svg>
       用量统计
     </button>
+    <button class="gear" id="eyeBtn" aria-label="护眼模式" title="护眼模式（柔和豆沙绿，不改动画布图片）">👁 护眼</button>
     <button class="gear" id="gearBtn">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
       设置
@@ -2200,6 +2403,11 @@ HTML = r"""<!doctype html>
 </div>
 <div class="wrap">
   <div class="left">
+      <div id="toolbar" style="display:flex; align-items:center; gap:8px; margin-bottom:8px; padding:6px 8px; background:#f1f5f9; border-radius:8px; font-size:13px;">
+        <span style="color:#475569; font-weight:600;">交互模式：</span>
+        <button id="modeSelect" class="tb-btn" data-mode="select" style="padding:4px 12px; border:1px solid #cbd5e1; border-radius:6px; background:#2563eb; color:#fff; cursor:pointer;">框选</button>
+        <button id="modePan" class="tb-btn" data-mode="pan" style="padding:4px 12px; border:1px solid #cbd5e1; border-radius:6px; background:#fff; color:#334155; cursor:pointer;">拖动(平移)</button>
+      </div>
       <div id="canvasWrap">
       <div id="zoomBar">
         <button id="zoomOut" class="sm sec" title="缩小">−</button>
@@ -2226,7 +2434,7 @@ HTML = r"""<!doctype html>
     <div class="card">
       <h2>① 抽图与归档</h2>
       <div id="sourceBox">
-        <div class="src-list-wrap collapsed">
+        <div class="src-list-wrap">
           <div class="src-list-head">
             <button class="fold-toggle" type="button" title="折叠 / 展开列表"></button>
             <label class="chk"><input type="checkbox" id="sourceSelAll"> <span>全选</span></label>
@@ -2250,7 +2458,7 @@ HTML = r"""<!doctype html>
         <option value="cross">跨页模式：多版按阅读顺序合并为一篇</option>
       </select>
       <label>整版原图（可多选）</label>
-        <div class="src-list-wrap collapsed">
+        <div class="src-list-wrap">
           <div class="src-list-head">
             <button class="fold-toggle" type="button" title="折叠 / 展开列表"></button>
             <label class="chk"><input type="checkbox" id="selAll"> <span>全选</span></label>
@@ -2276,9 +2484,10 @@ HTML = r"""<!doctype html>
         <h3 style="font-size:13px;font-weight:600;margin:0 0 8px;color:var(--ink);">已框选区域（按阅读顺序，序号 = 导出次序）</h3>
         <div id="boxList"><div style="color:var(--mut); font-size:12px;">尚未框选</div></div>
       </div>
-      <div class="btns" style="margin-top:12px;">
+      <div class="btns" style="margin-top:12px; align-items:center;">
         <button id="recogAll">识别全部</button>
         <button class="stop" id="clearBoxes">清空框选</button>
+        <span id="ocrHint" style="font-size:13px; color:var(--ok); display:none;"></span>
       </div>
     </div>
 
@@ -2288,6 +2497,7 @@ HTML = r"""<!doctype html>
       <div id="ctxMenu" style="display:none;"></div>
       <div class="btns" style="margin-top:10px; align-items:center;">
         <button class="run" id="saveEdit">保存修改</button>
+        <span id="saveEditHint" style="font-size:13px; color:var(--ok); display:none;"></span>
       </div>
       <!-- 来源补充：墨痕题录信息默认取自导入文件名。文件名未携带报刊名/日期/版次时，在此按版补充。同一版内多篇共享来源，不同版各自填；留空沿用原逻辑。 -->
       <details class="src-extra" style="margin-top:8px; font-size:12.5px;" open>
@@ -2372,6 +2582,20 @@ HTML = r"""<!doctype html>
       <input id="cfgDsUrl" placeholder="https://api.deepseek.com">
     </div>
     <div class="set-group">
+      <h3>输出格式</h3>
+      <div class="row" style="align-items:center; gap:10px; flex-wrap:nowrap;">
+        <label style="white-space:nowrap;">引用格式</label>
+        <select id="cfgCitationFormat" style="width:auto; min-width:160px;">
+          <option value="gb7714">GB/T 7714-2015</option>
+          <option value="history_research">《历史研究》注释规范</option>
+        </select>
+      </div>
+      <label class="switch-row" style="margin-top:10px;">
+        <input type="checkbox" id="cfgKeepTraditional">
+        <span>保留繁体（默认转简体）</span>
+      </label>
+    </div>
+    <div class="set-group">
       <h3>版本更新</h3>
       <div class="row version-row">
         <span class="sub">当前版本：<span id="curVersion">--</span></span>
@@ -2438,6 +2662,10 @@ HTML = r"""<!doctype html>
       <div class="mode-tabs">
         <label><input type="radio" name="postModeEdit" value="kb"> 知识库模式</label>
         <label><input type="radio" name="postModeEdit" value="plain" checked> 纯文本</label>
+      </div>
+      <div class="mode-tabs" style="margin-top:8px;">
+        <label><input type="radio" name="postFmtEdit" value="gb7714" checked> GB/T 7714-2015</label>
+        <label><input type="radio" name="postFmtEdit" value="history_research"> 《历史研究》</label>
       </div>
       <h3>结构化提示词<span class="reset" id="resetPost">恢复默认</span></h3>
       <p class="sub" id="postHint">知识库模式：用于「结构化」阶段题录抽取，产物为.md格式。</p>
@@ -2519,7 +2747,20 @@ function stashActive(){
   const s = ocrStash[ocrProvider];
   s.api_key=$('cfgApiKey').value.trim(); s.base_url=$('cfgBaseUrl').value.trim(); s.model=$('cfgModel').value.trim();
 }
-function fillCfgInputs(v){ applyProviderFromValues(v); }
+function fillCfgInputs(v){
+  applyProviderFromValues(v);
+  const cfSel=$('cfgCitationFormat'); if(cfSel) cfSel.value = (v.CITATION_FORMAT||'gb7714');
+  const kt=$('cfgKeepTraditional'); if(kt) kt.checked = ((v.KEEP_TRADITIONAL||'false').toLowerCase()==='true');
+  applyEyeCare((v.EYE_CARE||'false').toLowerCase()==='true', false);
+}
+function applyEyeCare(on, save){
+  document.body.classList.toggle('eye-care', !!on);
+  const b=$('eyeBtn'); if(b){ b.classList.toggle('eyecare-on', !!on); b.textContent = on ? '👁 护眼·开' : '👁 护眼'; }
+  if(save){
+    fetch('/api/config/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({EYE_CARE: on?'true':'false'})}).catch(()=>{});
+  }
+}
+const _eye=$('eyeBtn'); if(_eye) _eye.onclick=()=>applyEyeCare(!document.body.classList.contains('eye-care'), true);
 function updateCfgLine(){
   const hasKey = backendCfg && backendCfg.dry_run===false;
   const model = (backendCfg&&backendCfg.model)||'未配置';
@@ -2562,7 +2803,7 @@ function resizeCanvas(){ const wrap=$('canvasWrap'); const availW=Math.max(1,wra
 window.addEventListener('resize',()=>{ userZoom=1; resizeCanvas(); draw(); updateZoomBar(); });
 function setZoom(z){ userZoom=Math.max(ZOOM_MIN,Math.min(ZOOM_MAX,z)); resizeCanvas(); draw(); updateZoomBar(); }
 function updateZoomBar(){ const el=$('zoomPct'); if(el)el.textContent=Math.round(userZoom*100)+'%'; }
-function drawPlaceholder(){ if(img)return; ctx.clearRect(0,0,cv.width,cv.height); ctx.fillStyle='#f8fafc'; ctx.fillRect(0,0,cv.width,cv.height);
+function drawPlaceholder(){ if(img)return; ctx.clearRect(0,0,cv.width,cv.height); ctx.fillStyle=document.body.classList.contains('eye-care')?'#F2F8F1':'#f8fafc'; ctx.fillRect(0,0,cv.width,cv.height);
   ctx.strokeStyle='#cbd5e1'; ctx.setLineDash([8,6]); ctx.strokeRect(PAD,PAD,cv.width-2*PAD,cv.height-2*PAD); ctx.setLineDash([]);
   ctx.fillStyle='#94a3b8'; ctx.textAlign='center'; ctx.font='15px "Microsoft YaHei",sans-serif';
   ctx.fillStyle='#64748b'; ctx.font='13px "Microsoft YaHei",sans-serif';
@@ -2584,7 +2825,7 @@ function draw(){ if(!img){ drawPlaceholder(); return; } ctx.clearRect(0,0,cv.wid
   });
   if(cur){ const X=cur.x*scale+PAD,Y=cur.y*scale+PAD,W=cur.w*scale,H=cur.h*scale; ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([5,3]); ctx.strokeRect(X,Y,W,H); ctx.setLineDash([]); } }
 // commitCanvas 已移除：回退到 #166 同步绘制方案——绘制在图片 onload 同步任务内完成即可随该次渲染上屏，无需点击。
-function drawHandles(b,isSel){ const hs=handlesOf(b); ctx.fillStyle=isSel?'#2563eb':'rgba(37,99,235,0.45)'; ctx.strokeStyle='#fff'; ctx.lineWidth=1;
+function drawHandles(b,isSel){ const hs=handlesOf(b); const act=dragState&&dragState.kind==='resize'&&dragState.id===b.id; ctx.fillStyle=act?'#f59e0b':'#2563eb'; ctx.strokeStyle='#fff'; ctx.lineWidth=1;
   hs.forEach(h=>{ ctx.fillRect(h.x,h.y,HANDLE,HANDLE); ctx.strokeRect(h.x,h.y,HANDLE,HANDLE); }); }
 function handlesOf(b){ const X=b.x*scale+PAD,Y=b.y*scale+PAD,W=b.w*scale,H=b.h*scale; const c=n=>n-HANDLE/2;
   return [{name:'nw',x:c(X),y:c(Y)},{name:'n',x:c(X+W/2),y:c(Y)},{name:'ne',x:c(X+W),y:c(Y)},{name:'w',x:c(X),y:c(Y+H/2)},
@@ -2592,25 +2833,40 @@ function handlesOf(b){ const X=b.x*scale+PAD,Y=b.y*scale+PAD,W=b.w*scale,H=b.h*s
 
 function toNat(e){ const r=cv.getBoundingClientRect(); const px=(e.clientX-r.left)*(cv.width/r.width)-PAD, py=(e.clientY-r.top)*(cv.height/r.height)-PAD; return [px*(natW/(cv.width-2*PAD)),py*(natH/(cv.height-2*PAD))]; }
 function toCanvas(e){ const r=cv.getBoundingClientRect(); return [(e.clientX-r.left)*(cv.width/r.width),(e.clientY-r.top)*(cv.height/r.height)]; }
-function hitHandle(e){ const [cx,cy]=toCanvas(e); for(let i=boxes.length-1;i>=0;i--){ const b=boxes[i]; for(const h of handlesOf(b)){
-  if(cx>=h.x-HIT_PAD&&cx<=h.x+HANDLE+HIT_PAD&&cy>=h.y-HIT_PAD&&cy<=h.y+HANDLE+HIT_PAD) return {box:b,handle:h.name}; } } return null; }
+function hitHandle(e){ if(selectedId==null)return null; const sb=boxes.find(b=>b.id===selectedId); if(!sb)return null; const [cx,cy]=toCanvas(e); for(const h of handlesOf(sb)){
+  if(cx>=h.x-HIT_PAD&&cx<=h.x+HANDLE+HIT_PAD&&cy>=h.y-HIT_PAD&&cy<=h.y+HANDLE+HIT_PAD) return {box:sb,handle:h.name}; } return null; }
 function hitBox(e){ const [cx,cy]=toCanvas(e); for(let i=boxes.length-1;i>=0;i--){ const b=boxes[i];
   const X=b.x*scale+PAD,Y=b.y*scale+PAD,W=b.w*scale,H=b.h*scale; if(cx>=X&&cx<=X+W&&cy>=Y&&cy<=Y+H) return b; } return null; }
 
+let interactionMode = 'select';
+let panState = null;
+const _modeSelect = $('modeSelect'), _modePan = $('modePan');
+function setInteractionMode(m){
+  interactionMode = m;
+  if(_modeSelect){ _modeSelect.style.background = (m==='select') ? '#2563eb' : '#fff'; _modeSelect.style.color = (m==='select') ? '#fff' : '#334155'; }
+  if(_modePan){ _modePan.style.background = (m==='pan') ? '#2563eb' : '#fff'; _modePan.style.color = (m==='pan') ? '#fff' : '#334155'; }
+  cv.style.cursor = (m==='pan') ? 'grab' : 'crosshair';
+}
+if(_modeSelect) _modeSelect.onclick = ()=>setInteractionMode('select');
+if(_modePan) _modePan.onclick = ()=>setInteractionMode('pan');
+
 cv.addEventListener('mousedown',e=>{ if(!img)return;
+  if(interactionMode==='pan'){ panState={x:e.clientX,y:e.clientY}; cv.style.cursor='grabbing'; return; }
   if(!e.altKey){ const hh=hitHandle(e); if(hh){ const [x,y]=toNat(e);
   dragState={kind:'resize',id:hh.box.id,handle:hh.handle,startX:x,startY:y,origBox:{...hh.box}}; selectedId=hh.box.id; renderBoxList(); draw(); return; }
   const hb=hitBox(e); if(hb){ const [x,y]=toNat(e); dragState={kind:'move',id:hb.id,startX:x,startY:y,origBox:{...hb}}; selectedId=hb.id; renderBoxList(); draw(); return; } }
   // Alt+左键：跳过命中检测，强制从空白起画新框（应对排版紧凑/框体重叠场景）
   selectedId=null; renderBoxList(); draw(); const [x,y]=toNat(e); drawing={x,y}; cur=null; });
-cv.addEventListener('mousemove',e=>{ if(drawing){ const [x,y]=toNat(e);
+cv.addEventListener('mousemove',e=>{ if(interactionMode==='pan' && panState){ const w=$('canvasWrap'); if(w){ w.scrollLeft-=(e.clientX-panState.x); w.scrollTop-=(e.clientY-panState.y); } panState={x:e.clientX,y:e.clientY}; return; }
+  if(drawing){ const [x,y]=toNat(e);
   cur={x:Math.min(drawing.x,x),y:Math.min(drawing.y,y),w:Math.abs(x-drawing.x),h:Math.abs(y-drawing.y)}; draw(); return; }
-  if(!dragState){ const hh=hitHandle(e),hb=hitBox(e); cv.style.cursor=hh?'resize':(hb?'move':'crosshair'); return; }
+  if(!dragState){ if(interactionMode==='pan'){ cv.style.cursor='grab'; return; } const hh=hitHandle(e),hb=hitBox(e); cv.style.cursor=hh?'resize':(hb?'move':'crosshair'); return; }
   const [x,y]=toNat(e); const dx=x-dragState.startX,dy=y-dragState.startY; const b=boxes.find(bx=>bx.id===dragState.id); if(!b)return; const o=dragState.origBox;
   if(dragState.kind==='move'){ b.x=o.x+dx; b.y=o.y+dy; } else { let nx=o.x,ny=o.y,nw=o.w,nh=o.h; const h=dragState.handle;
     if(h.includes('w')){ nx+=dx; nw-=dx; } if(h.includes('e')){ nw+=dx; } if(h.includes('n')){ ny+=dy; nh-=dy; } if(h.includes('s')){ nh+=dy; }
     if(nw<5)nw=5; if(nh<5)nh=5; b.x=nx;b.y=ny;b.w=nw;b.h=nh; } draw(); });
-cv.addEventListener('mouseup',e=>{ if(drawing){ const [x,y]=toNat(e); const x0=Math.min(drawing.x,x),y0=Math.min(drawing.y,y);
+cv.addEventListener('mouseup',e=>{ if(interactionMode==='pan'){ panState=null; cv.style.cursor='grab'; return; }
+  if(drawing){ const [x,y]=toNat(e); const x0=Math.min(drawing.x,x),y0=Math.min(drawing.y,y);
   const w=Math.abs(x-drawing.x),h=Math.abs(y-drawing.y); drawing=null;
   if(w>5&&h>5){ const nb={id:uid++,label:$('lblSel').value,x:x0,y:y0,w,h,group:''}; boxes.push(nb); selectedId=nb.id; renderBoxList(); renderResults(); }
   cur=null; draw(); return; } if(dragState){ dragState=null; draw(); } });
@@ -2651,14 +2907,16 @@ function renderBoxList(){ const el=$('boxList');
   const cross = mergeMode==='cross';
   const view = cross ? flattenBoxes() : boxes.map((b,i)=>({box:b, pageName:srcName, localIdx:i, globalIdx:i}));
   if(!view.length){ el.innerHTML='<div style="color:var(--mut); font-size:12px;">尚未框选</div>'; return; } el.innerHTML='';
+  const grpMap=new Map(); view.forEach(v=>{ if(!grpMap.has(v.pageName)) grpMap.set(v.pageName, effectiveGroups(pageArr(v.pageName))); });
   view.forEach((v)=>{ const b=v.box; const d=document.createElement('div'); d.className='box'+(b.id===selectedId?' sel':'');
-    const color=(b.group?groupColor(b.group):LBL_COLOR[b.label])||'#dc2626'; const groupHint=b.group?('组:'+b.group):'无组';
+    const effG = b.group || grpMap.get(v.pageName).get(b.id) || 'auto0';
+    const color=(b.group?groupColor(b.group):LBL_COLOR[b.label])||'#dc2626'; const groupHint=b.group?('组:'+b.group):('自动'+String(effG).replace(/^auto/,''));
     const num = cross ? (v.globalIdx+1) : (v.localIdx+1);
     const pageTag = cross ? `<span class="bx-page" title="所在版">${esc(v.pageName.replace(/\.[^.]+$/,'')||'')}</span>` : '';
     d.innerHTML=`<span class="bx-num" style="background:${color}">${num}</span>${pageTag}
       <div class="bx-main">
         <select data-page="${esc(v.pageName)}" data-idx="${v.localIdx}">${['title','author','text'].map(l=>`<option ${l===b.label?'selected':''}>${l}</option>`).join('')}</select>
-        <input class="grp" data-page="${esc(v.pageName)}" data-idx="${v.localIdx}" value="${esc(b.group||'')}" placeholder="组" title="同一篇文章的多个框填相同组名，将合并识别/导出为一篇">
+        <input class="grp" data-page="${esc(v.pageName)}" data-idx="${v.localIdx}" value="${esc(b.group||'')}" placeholder="自动分组" title="留空=按标题自动分组；填同名手动合并">
         <span class="bx-group" style="color:${color}" title="${groupHint}">${groupHint}</span>
       </div>
       <div class="bx-ops">
@@ -2675,15 +2933,29 @@ function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').repla
 
 // ---------- 识别 ----------
 function labelPriority(l){ return l==='title'?0:l==='author'?1:2; }
-// 无 group 的框默认按框选顺序合并成一篇（key 统一为 grp:__default__）；显式标 group 的框按组各自独立成篇。
-function makeGroupKey(b){ return b.group?'grp:'+b.group:'grp:__default__'; }
+// 生效组计算（单一事实来源）：无 group 的框按"框选顺序"遍历，遇到一个 title 就开新组（auto1/auto2…），
+// 该标题及其之后、下一个标题之前的框都归这一组；首个标题之前的框并入第一组（auto1）；整页无标题则统一 auto0（一篇）。
+// 显式标 group 的框始终优先，按组各自独立成篇。
+function effectiveGroups(arr){
+  const map=new Map(); const pre=[]; let idx=0, cur=null;
+  (arr||[]).forEach(b=>{
+    if(b.group){ map.set(b.id, b.group); return; }
+    if(b.label==='title'){ idx++; cur='auto'+idx; map.set(b.id, cur); }
+    else { if(!cur){ cur='auto0'; pre.push(b.id); } map.set(b.id, cur); }
+  });
+  if(idx>0){ pre.forEach(id=>map.set(id,'auto1')); } // 首个标题前的框并入第一组
+  return map;
+}
 function getOcrTargets(bs){ bs=bs||boxes;
   if(!bs.length){ return []; } // 无框：禁止识别，返回空目标（绝不整版兜底）
-  const groups=new Map(); bs.forEach((b,i)=>{ const k=makeGroupKey(b); if(!groups.has(k))groups.set(k,{key:k,frames:[],group:b.group||''}); groups.get(k).frames.push({b,oi:i}); });
+  const eg=effectiveGroups(bs); const groups=new Map();
+  bs.forEach((b,i)=>{ const g=eg.get(b.id); const isAuto=!b.group; const key=isAuto?('auto:'+g):('grp:'+g);
+    if(!groups.has(key)) groups.set(key,{key,frames:[],group:isAuto?'':g,isAuto});
+    groups.get(key).frames.push({b,oi:i}); });
   return Array.from(groups.values()).map(g=>{ g.frames.sort((a,c)=>(labelPriority(a.b.label)-labelPriority(c.b.label))||(a.oi-c.oi));
     const boxesOf=g.frames.map(f=>f.b);
-    const label = g.group ? ('group:'+g.group) : (boxesOf.length>1 ? ('合并 '+boxesOf.length+' 框') : boxesOf[0].label);
-    return {key:g.key,boxes:boxesOf,group:g.group||'',label}; }); }
+    const label = g.isAuto ? (boxesOf.length>1 ? g.key.replace('auto:','') : boxesOf[0].label) : ('group:'+g.group);
+    return {key:g.key,boxes:boxesOf,group:g.group||'',label,auto:g.isAuto?g.key.replace('auto:',''):''}; }); }
 
 // 跨页聚合：把 pageOrder 中各页的框/识别结果按阅读顺序合并。
 // 同 group 跨页合成一篇；无组框按框选顺序合并成一篇（单页模式不跨页）。
@@ -2698,7 +2970,11 @@ function aggregateCrossTargets(){
       if(mergeMode!=='cross'){
         // 单页模式：每版每框强制独立成篇，key 必带版名，绝不跨页合并文本
         k='page:'+pname+':'+t.key; label=t.group?('group:'+t.group):t.label;
-      } else { k=t.group?'cross:'+t.group:'__cross_default__'; label=t.group?('group:'+t.group):('合并 '+pageOrder.length+' 版'); }
+      } else {
+        if(t.group){ k='cross:'+t.group; label='group:'+t.group; }
+        else if(ts.length===1){ k='__cross_default__'; label='合并 '+pageOrder.length+' 版'; } // 每版仅一文（无标题/单组）→ 跨页合并为一篇
+        else { k='crossauto:'+pname+':'+t.key; label=t.label; } // 每版多文（按标题自动拆分）→ 各版各自成篇，不跨页合并
+      }
       if(!groups.has(k)) groups.set(k,{key:k,label,group:t.group||'',boxes:(t.boxes||[]).slice(),pageTargets:[]});
       else { const g=groups.get(k); if(t.boxes) g.boxes.push(...t.boxes); }
       groups.get(k).pageTargets.push({pname,t});
@@ -2739,15 +3015,18 @@ async function ocrBox(b, im, nW, nH){ const oc=document.createElement('canvas');
 async function recognizeOneBox(b){ return ocrBox(b, img, natW, natH); }
 async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); return; }
   if(!pageOrder.length){ alert('请先在卡片②勾选并「载入」整版原图。'); return; }
-  // 硬拦截：所有载入版都必须有框，无框严禁识别（不整版兜底）
-  const noBoxPages=pageOrder.filter(p=>!(allPageData[p]&&allPageData[p].boxes&&allPageData[p].boxes.length));
-  if(noBoxPages.length){ alert('存在未框选的整版：'+noBoxPages.join('、')+'。\n请先为每版框选区域再识别，无框严禁识别。'); return; }
+  // 仅识别已框选的版；未框选的版跳过（不整版兜底、不阻断其余版），与下方 getOcrTargets 的跳过逻辑一致
+  const boxedPages=pageOrder.filter(p=>allPageData[p]&&allPageData[p].boxes&&allPageData[p].boxes.length);
+  const noBoxPages=pageOrder.filter(p=>!boxedPages.includes(p));
+  if(!boxedPages.length){ alert('没有可识别的整版：请先为至少一版框选区域再识别，无框严禁识别。'); return; }
+  if(noBoxPages.length){ log('[识别全部] 以下整版未框选，已跳过（仅识别已框选的 '+boxedPages.length+' 版）：'+noBoxPages.join('、')); }
+  setOcrHint('识别中…', true);
   // 逐版离线识别：每版重新取图并按页存回 allPageData，最后统一聚合
   let failedPages=[];
   let ocrPt=0,ocrCt=0,ocrTt=0,ocrDur=0;  // 本次识别累计 token / 耗时
   const tStart=performance.now();
   log('[识别全部] 模式='+mode+'，载入 '+pageOrder.length+' 版；各版框数：'+pageOrder.map(p=>(p+'='+(allPageData[p]?allPageData[p].boxes.length:'(无)'))).join('，'));
-  for(const pname of pageOrder){
+  for(const pname of boxedPages){
     const pd=allPageData[pname]; if(!pd){ failedPages.push(pname+'（未载入框选数据）'); continue; }
     try{
       const j=await (await fetch('/api/image?name='+encodeURIComponent(pname)+'&dir=cropped_hi')).json().catch(()=>({error:'响应不是JSON'}));
@@ -2792,12 +3071,14 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
   for(const ct of cts){ crossResults[ct.key]=mergeCrossTarget(ct); }
   renderResults();
   const cross = mergeMode==='cross';
-  const okCount = pageOrder.length - failedPages.length;
+  const okCount = boxedPages.length - failedPages.length;
   const wall = ((performance.now()-tStart)/1000).toFixed(2);
   const _prov=(backendCfg&&backendCfg.values&&backendCfg.values.BOX_OCR_PROVIDER)||'qwen';
   const _pre=_prov.toUpperCase();
   const cfgModel=(backendCfg&&backendCfg.values&&backendCfg.values[_pre+'_MODEL'])||'';
-  log('[识别全部] 已识别 '+okCount+' / '+pageOrder.length+' 版'+(cross?'（跨页模式：按阅读顺序合并为一篇）':'（单页模式：每版独立）')+'。');
+  log('[识别全部] 已识别 '+okCount+' / '+boxedPages.length+' 版（共载入 '+pageOrder.length+' 版，跳过未框选 '+noBoxPages.length+' 版）'+(cross?'（跨页模式：按阅读顺序合并为一篇）':'（单页模式：每版独立）')+'。');
+  if(failedPages.length) setOcrHint('识别完成，'+failedPages.length+' 版失败', false);
+  else setOcrHint('识别完成 ✓（'+okCount+' 版）', true);
   log('[识别全部] 本次 OCR 消耗'+(cfgModel?'（'+cfgModel+'）':'')+' → 输入 '+ocrPt.toLocaleString()+' + 输出 '+ocrCt.toLocaleString()+' = 总 '+ocrTt.toLocaleString()+' tokens；OCR 接口耗时 '+ocrDur.toFixed(2)+'s，总耗时 '+wall+'s。');
   // 记录一次「识别全部」运行；OCR 调用次数按本次识别的「组」数计（每个 group 1 次，含未标 group 自动合并的默认组）
   if(okCount>0){ try{ const callGroups=aggregateCrossTargets(); fetch('/api/ocr_run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:cfgModel,pages:pageOrder.length,boxes:pageOrder.reduce((s,p)=>s+((allPageData[p]&&allPageData[p].boxes)?allPageData[p].boxes.length:0),0),calls:callGroups.length})}).catch(()=>{}); }catch(e){} }
@@ -2894,6 +3175,20 @@ function flushEditsToAll(){
     if(allPageData[pname]) allPageData[pname].results[sub]=itemToStore(crossResults[key]);
   }
 }
+// 识别全部按钮旁提示（与保存 hint 一致：常驻，下次点识别刷新）
+function setOcrHint(txt, ok){
+  const h=$('ocrHint'); if(!h) return;
+  h.textContent=txt||'';
+  h.style.color = ok? 'var(--ok)' : 'var(--err)';
+  h.style.display = txt? 'inline' : 'none';
+}
+// 保存修改按钮旁提示（与配置保存 hint 一致：常驻，下次点保存刷新）
+function setSaveHint(txt, ok){
+  const h=$('saveEditHint'); if(!h) return;
+  h.textContent=txt||'';
+  h.style.color = ok? 'var(--ok)' : 'var(--err)';
+  h.style.display = txt? 'inline' : 'none';
+}
 // 保存修改：把右侧当前编辑结果覆盖写回 output/ 的 txt + json
 async function saveEdit(){
   flushEditsToAll();   // 单页模式：先把手动编辑落回 allPageData，避免后续翻页/重识别丢字
@@ -2906,12 +3201,19 @@ async function saveEdit(){
     const body={source_name:en,mode:mode,boxes:items}; if(od) body.out_dir=od;
     try{
       const j=await fetch('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(r=>r.json());
-      if(!j.ok){ log('保存失败：'+(j.error||'')); return; }
+      if(!j.ok){ setSaveHint('保存失败', false); log('保存失败：'+(j.error||'')); return; }
       log('[保存修改] 已覆盖写回 txt\n'+j.written.map(s=>'  output/'+(od?od+'/':'')+s).join('\n'));
       const b2={source_name:en,mode:mode,boxes:items}; if(od)b2.out_dir=od;
       const j2=await fetch('/api/export_json',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b2)}).then(r=>r.json());
       if(j2.ok) log('[保存修改] 已覆盖写回 json → '+(j2.path||'(未知路径)')); else log('保存 JSON 失败：'+(j2.error||''));
-    }catch(e){ log('保存失败：'+e); }
+      // 引用联动：手改作者/标题/日期后本地重算引用串（不调模型），写回结构化产物
+      try{
+        const br=await fetch('/api/rebuild_ref',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_name:en,mode:mode,out_dir:od,boxes:items})}).then(r=>r.json());
+        if(br&&br.ok) log('[保存修改] 已按手改字段重算引用：'+br.ref);
+        else if(br) log('[保存修改] 引用重算跳过：'+(br.error||'未结构化'));
+      }catch(e){}
+    }catch(e){ setSaveHint('保存失败', false); log('保存失败：'+e); }
+    setSaveHint('已保存 ✓', true);
     return;
   }
   // 单页模式：遍历所有已载入的版，逐版写回各自独立的 output/{版名}.json / .txt
@@ -2930,8 +3232,16 @@ async function saveEdit(){
       const j2=await fetch('/api/export_json',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b2)}).then(r=>r.json());
       if(j2.ok){ log('['+en+'] 已覆盖写回 json → '+(j2.path||'(未知路径)')); done++; }
       else log('['+en+'] 保存 JSON 失败：'+(j2.error||''));
+      // 引用联动：单页模式手改作者/标题/日期后本地重算引用串（不调模型）
+      try{
+        const br=await fetch('/api/rebuild_ref',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_name:en,mode:mode,out_dir:'',boxes:items})}).then(r=>r.json());
+        if(br&&br.ok) log('['+en+'] 已按手改字段重算引用：'+br.ref);
+        else if(br) log('['+en+'] 引用重算跳过：'+(br.error||'未结构化'));
+      }catch(e){}
     }catch(e){ log('['+en+'] 保存失败：'+e); }
   }
+  if(done>0) setSaveHint('已保存 ✓（'+done+' 版）', true);
+  else setSaveHint('保存失败', false);
   if(done>0) log('[保存修改] 完成，共写回 '+done+' 个版的 json/txt。');
   else log('[保存修改] 没有可导出的识别结果，未写入任何文件。');
 }
@@ -2952,9 +3262,9 @@ function refreshImageList(){
 }
 function renderSrcList(){ const box=$('srcList'); if(!box) return; box.innerHTML='';
   if(!pageList.length){ if($('imgCnt')) $('imgCnt').textContent = '共 0 项'; const wrap=box.closest('.src-list-wrap'); if(wrap) wrap.classList.remove('collapsed'); syncSelAll(); return; }
-  pageList.forEach(f=>{ const lab=document.createElement('label'); lab.className='item'; lab.innerHTML=`<input type="checkbox" class="src-chk" value="${esc(f)}"> <span>${esc(f)}</span>`; box.appendChild(lab); });
+  pageList.forEach((f,i)=>{ const lab=document.createElement('div'); lab.className='item'; lab.innerHTML=`<input type="checkbox" class="src-chk" value="${esc(f)}"> <span class="ord">${i+1}</span> <span class="nm">${esc(f)}</span> <span class="ops"><button type="button" class="mv" data-up ${i===0?'disabled':''} title="上移">↑</button><button type="button" class="mv" data-dn ${i===pageList.length-1?'disabled':''} title="下移">↓</button></span>`; box.appendChild(lab); });
   syncSelAll();
-  const wrap=box.closest('.src-list-wrap'); if(wrap) wrap.classList.toggle('collapsed', pageList.length>5);
+  const wrap=box.closest('.src-list-wrap'); if(wrap) wrap.classList.remove('collapsed');
   if($('imgCnt')) $('imgCnt').textContent = '共 '+pageList.length+' 项'; }
 function syncSelAll(){ const sa=$('selAll'); if(!sa) return; const chks=document.querySelectorAll('.src-chk');
   if(!chks.length){ sa.checked=false; sa.indeterminate=false; return; }
@@ -3044,23 +3354,48 @@ async function runPost(){
   // clearPost 统一清空「已载入工作集 + 画布 + 勾选状态 + 整版原图目录列表（pageList）」。
   // 单页与跨页模式均清空 pageList：结构化完成后整轮工作结束，目录列表一并归零，避免出现「残留文件可重新打开」。
   const clearPost = (cleanFiles)=>{
-    // 仅物理删除「本次结构化实际成功产出（ok 且未 skipped）」的版；未完成的版源图保留，可重新载入识别
+    // 仅移除「本次结构化实际成功产出（ok 且未 skipped）」的版；未完成的版保留在列表/工作集，可继续识别
     const cleaned = (cleanFiles && cleanFiles.length) ? cleanFiles.slice() : pageOrder.slice();  // 本次已结构化处理的整版名（cropped_hi 文件名）
     const crossRaw = (mergeMode==='cross' && pageOrder.length>1) ? crossBaseName() : '';  // 跨页 raw 中转目录名（output/{crossRaw}/）
-    pageOrder=[]; crossResults={}; allPageData={}; navList=[]; pageList=[]; pageIdx=-1; srcName=''; img=null; boxes=[]; results={};
-    // 清空来源补充输入：跨页全局框 + 单页按版暂存（_savedSrcByPage 按文件名映射，若不重置，下一轮载入同名文件会复活旧来源），避免结构化后来源残留 / 重填失效
-    const _g=document.getElementById('srcGlobalText'); if(_g) _g.value='';
-    _savedSrcByPage = {};
-    const _pp=document.getElementById('perPageSrc'); if(_pp) _pp.innerHTML='';
-    // 同步复位「当前源」显示，避免 DOM 残留旧文件名
-    const sn=$('srcName'); if(sn) sn.textContent='未载入';
-    updatePageNav(); renderSrcList(); renderBoxList(); renderResults(); draw();
-    const chks=document.querySelectorAll('.src-chk'); chks.forEach(c=>c.checked=false); syncSelAll();
+    // pageOrder/cleaned 存去扩展名版名；pageList/navList/复选框 value 带扩展名。
+    // 统一按去扩展名比较，避免格式不一致导致「已结构化的版从列表/导航移除失败、勾选态被误清」。
+    const _strip = (s)=>String(s||'').replace(/\.[^.]+$/,'');
+    const keepList = (arr)=>arr.filter(p=>!cleaned.some(c=>_strip(c)===_strip(p)));
+    if(cleaned.length < pageOrder.length){
+      // 部分完成：只把已结构化的版从 列表/工作集/导航 中移除，其余原样保留
+      pageList=keepList(pageList); pageOrder=keepList(pageOrder); navList=keepList(navList);
+      for(const p of cleaned){ delete allPageData[p]; delete _savedSrcByPage[p]; }
+      const cts=aggregateCrossTargets(); crossResults={}; for(const ct of cts){ crossResults[ct.key]=mergeCrossTarget(ct); }
+      if(cleaned.includes(srcName)){
+        // 当前画布正显示已结构化的版 → 切到剩余第一版（gotoPage 会重画 画布/框/来源补充行）
+        if(navList.length){ gotoPage(0); }
+        else { pageIdx=-1; srcName=''; img=null; boxes=[]; results={}; const sn=$('srcName'); if(sn) sn.textContent='未载入'; renderBoxList(); renderResults(); draw(); renderPerPageSrc(); }
+      } else {
+        // 当前显示的版未被结构化 → 原地保留，仅校正页码索引与来源补充行
+        pageIdx=navList.findIndex(f=>f.replace(/\.[^.]+$/,'')===srcName);
+        renderPerPageSrc();
+      }
+      updatePageNav(); renderSrcList();
+      // 剩余工作集版在 ② 列表保持勾选（复选框 value 带扩展名，pageOrder 不带，按去扩展名匹配），便于直接继续「识别全部」/ 再次结构化
+      document.querySelectorAll('.src-chk').forEach(c=>{ c.checked = pageOrder.some(p=>p===_strip(c.value)); });
+      syncSelAll();
+    } else {
+      // 全部完成（或跨页整轮）：整轮工作结束，列表一并归零，避免出现「残留文件可重新打开」
+      pageOrder=[]; crossResults={}; allPageData={}; navList=[]; pageList=[]; pageIdx=-1; srcName=''; img=null; boxes=[]; results={};
+      // 清空来源补充输入：跨页全局框 + 单页按版暂存（_savedSrcByPage 按文件名映射，若不重置，下一轮载入同名文件会复活旧来源），避免结构化后来源残留 / 重填失效
+      const _g=document.getElementById('srcGlobalText'); if(_g) _g.value='';
+      _savedSrcByPage = {};
+      const _pp=document.getElementById('perPageSrc'); if(_pp) _pp.innerHTML='';
+      // 同步复位「当前源」显示，避免 DOM 残留旧文件名
+      const sn=$('srcName'); if(sn) sn.textContent='未载入';
+      updatePageNav(); renderSrcList(); renderBoxList(); renderResults(); draw();
+      const chks=document.querySelectorAll('.src-chk'); chks.forEach(c=>c.checked=false); syncSelAll();
+    }
     // 真正删除 cropped_hi/ 下本次已处理的源图：结构化产物（含整版原图副本与 OCR 结果）已落盘到 output/，
     // cropped_hi/ 里的原件成为残留，应物理删除（仅删指定文件、不级联、不碰 output/）。
     if(cleaned.length){
       fetch('/api/cleanup_cropped',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files:cleaned})})
-        .then(r=>r.json()).then(j=>{ if(j.ok){ if(j.removed&&j.removed.length){ log('[清理] 已物理删除 cropped_hi/ 源图 '+j.removed.length+' 个：'+j.removed.join('、')); } else { log('[警告] cropped_hi/ 中应删 '+cleaned.length+' 个源图，但后端未删到任何文件（可能扩展名不匹配或文件已不在，请核查）。'); } } else { log('[清理] cropped_hi/ 源图删除失败：'+(j.error||'')); } })
+        .then(r=>r.json()).then(j=>{ if(j.ok){ if(j.removed&&j.removed.length){ log('[清理] 已物理删除 cropped_hi/ 源图 '+j.removed.length+' 个：'+j.removed.join('、')); } else { log('[警告] cropped_hi/ 中应删 '+cleaned.length+' 个源图，但后端未删到任何文件（可能扩展名不匹配或文件已不在，请核查）。'+(j.diag?'\n[清理诊断] '+j.diag.join(' | '):'')); } } else { log('[清理] cropped_hi/ 源图删除失败：'+(j.error||'')); } })
         .catch(e=>log('[清理] cropped_hi/ 源图删除失败：'+e));
     }
     // 跨页模式：删除 output/{crossRaw}/ 这个 raw 中转目录。saveEdit 自动落盘时把 raw 写到该目录，
@@ -3072,10 +3407,14 @@ async function runPost(){
         .catch(e=>log('[清理] 跨页 raw 目录清理失败：'+e));
     }
   };
+  // 仅结构化「本会话真正识别过」的版：output/ 可能残留上一轮会话的旧 OCR txt，
+  // 不能因磁盘有 txt 就把未识别的版一起结构化/清理（只识别部分时其余版应原样保留）
+  const recPages = pageOrder.filter(p=>allPageData[p]&&allPageData[p].results&&Object.keys(allPageData[p].results).length);
+  if(!recPages.length){ log('[结构化] 没有本会话的识别结果（未识别任何版），已跳过。请先「识别全部」或逐框识别。'); return; }
   if(isCross){
     // 跨页：合并为一篇，单文件夹，打开该合并子文件夹（维持原行为）
     const outDir = crossBaseName().replace(/\.[^.]+$/,'');
-    const pages = pageOrder.slice();
+    const pages = recPages.slice();
     fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:outDir,pages,source_override:globalSO})})
       .then(r=>r.json()).then(j=>{ let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+']\n'+(j.stdout||'')+(j.stderr?'\n'+j.stderr:''); if(j.ok&&j.opened_dir){ const rel=osRel(j.opened_dir); s+='\n↑ 已打开该轮文件夹：'+rel; }
         if(j.ok && !j.skipped){ clearPost(pageOrder.slice()); s+='\n[结构化] 已清空当前工作集与勾选状态。'; } log(s); })
@@ -3084,7 +3423,7 @@ async function runPost(){
   }
   // 单页模式：逐版调用 postprocess，每版独立子文件夹（output/{top}/{整版名}/）；
   // 全部完成后统一打开父目录 output/{top}（多子文件夹，不钻进某一页）
-  const pages = pageOrder.slice();
+  const pages = recPages.slice();
   let done=0, okCount=0, hasRealOutput=false; const logs=[]; const okPages=[];
   pages.forEach(pname=>{
     const od = pname.replace(/\.[^.]+$/,'');
@@ -3094,9 +3433,9 @@ async function runPost(){
         const head=(j.stdout||'').split('\n').slice(0,2).join(' / '); logs.push('[版 '+esc(pname)+'] '+(head||st)); })
       .catch(e=>{ const detail=(e&&e.stack)?e.stack:(''+e); logs.push('[版 '+esc(pname)+'] 后置失败：'+(e&&e.message?e.message:e)); fetch('/api/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({line:'[探针] 版 '+pname+' postprocess fetch 失败: '+detail})}).catch(()=>{}); })
       .finally(()=>{ done++; if(done===pages.length){
-        let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+'] 单页模式：已逐版检查 '+pages.length+' 版，其中可结构化 '+okCount+' 版，每版独立子文件夹（output/'+top+'/整版名/）。';
+        let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+'] 单页模式：本次识别 '+pages.length+' 版，其中可结构化 '+okCount+' 版，每版独立子文件夹（output/'+top+'/整版名/）。';
         if(logs.length) s+='\n'+logs.join('\n');
-        const after = ()=>{ if(hasRealOutput){ const failed = pages.filter(p=>!okPages.includes(p)); clearPost(okPages); s+='\n[结构化] 已清空当前工作集与勾选状态。'; if(failed.length){ s+='\n[清理] 以下版未完成结构化（无产物/失败），源图已保留在 cropped_hi/，可重新载入识别：'+failed.join('、'); } } log(s); };
+        const after = ()=>{ if(hasRealOutput){ const failed = pages.filter(p=>!okPages.includes(p)); clearPost(okPages); s+='\n[结构化] 已完成版已从工作集移除，其余版保留在列表中，可继续框选识别。'; if(failed.length){ s+='\n[提示] 以下版未完成结构化（无产物/失败），仍保留在列表与 cropped_hi/：'+failed.join('、'); } } log(s); };
         // 统一打开父目录 output/{top}（多子文件夹，不钻进某一页）
         fetch('/api/open_folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:top})})
           .then(r=>r.json()).then(j=>{ if(j.ok){ const rel=osRel(j.path); s+='\n↑ 已打开父文件夹：'+rel; } }).catch(()=>{})
@@ -3221,7 +3560,7 @@ function refreshSourceList(){
       box.appendChild(lab);
     });
     syncSourceSelAll();
-    const wrap=box.closest('.src-list-wrap'); if(wrap) wrap.classList.toggle('collapsed', fs.length>5);
+    const wrap=box.closest('.src-list-wrap'); if(wrap) wrap.classList.remove('collapsed');
     if($('sourceCnt')) $('sourceCnt').textContent = '共 '+fs.length+' 项';
     return fs;
   }).catch(()=>{});
@@ -3282,6 +3621,24 @@ $('selAll').onchange=e=>{ // 键盘 / 间接触发时同步子项（点空白区
   if(chks.length){ chks.forEach(c=>c.checked=e.target.checked); syncSelAll(); }
 };
 document.addEventListener('change', e=>{ if(e.target.classList.contains('src-chk')) syncSelAll(); if(e.target.classList.contains('source-chk')) syncSourceSelAll(); });
+// 整版原图列表：↑/↓ 调整顺序（仅改前端 pageList 顺序，载入按此顺序；并持久化到 cropped_hi/.order.json）
+$('srcList').addEventListener('click', e=>{
+  const btn = e.target.closest('.ops .mv'); if(!btn || btn.disabled) return;
+  const items = [...$('srcList').children];
+  const i = items.indexOf(btn.closest('.item')); if(i<0) return;
+  const j = btn.dataset.up!==undefined ? i-1 : i+1;
+  if(j<0 || j>=pageList.length) return;
+  const checked = new Set([...document.querySelectorAll('.src-chk')].filter(c=>c.checked).map(c=>c.value));
+  const t = pageList[i]; pageList[i] = pageList[j]; pageList[j] = t;
+  renderSrcList();
+  document.querySelectorAll('.src-chk').forEach(c=>{ c.checked = checked.has(c.value); });
+  syncSelAll();
+  persistCroppedOrder();
+});
+async function persistCroppedOrder(){
+  try{ await fetch('/api/reorder_cropped',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order:pageList})}); }
+  catch(e){ log('[排序] 持久化失败：'+e); }
+}
 // source 全选 / 取消全选
 $('sourceSelAll').onclick=e=>{
   const chks=document.querySelectorAll('.source-chk');
@@ -3436,44 +3793,56 @@ document.addEventListener('keydown', e=>{ if(e.key==='Escape'&&(drawer.classList
 
 // ---------- 提示词抽屉 ----------
 let revertOcr = false;
-let postPrompts = { kb: '', plain: '' };        // 两套结构化提示词（知识库 / 纯文本）
-let postDef = { kb: '', plain: '' };            // 对应内置默认（「恢复默认」回填用）
-let postEditMode = 'kb';                        // 抽屉当前正在编辑的结构化模式
-let revertPost = { kb: false, plain: false };   // 各模式是否点了「恢复默认」
+let postPrompts = { gb7714: {kb:'', plain:''}, history_research: {kb:'', plain:''} };   // 结构化提示词：引用格式 × 输出模式
+let postDef = { gb7714: {kb:'', plain:''}, history_research: {kb:'', plain:''} };        // 对应内置默认（「恢复默认」回填用）
+let postEditMode = 'plain';                     // 抽屉当前正在编辑的输出模式
+let postEditFmt = 'gb7714';                     // 抽屉当前正在编辑的引用格式
+let revertPost = { gb7714: {kb:false, plain:false}, history_research: {kb:false, plain:false} };  // 各槽是否点了「恢复默认」
 async function loadPrompts(){
   try {
     const c = await (await fetch('/api/config')).json();
     $('prompt_ocr').dataset.def = c.prompt_ocr_default || '';
-    postDef.kb    = c.prompt_post_default || '';
-    postDef.plain = c.prompt_post_plain_default || '';
+    postDef.gb7714.kb    = c.prompt_post_default || '';
+    postDef.gb7714.plain = c.prompt_post_plain_default || '';
+    postDef.history_research.kb    = c.prompt_post_history_default || '';
+    postDef.history_research.plain = c.prompt_post_plain_history_default || '';
     $('prompt_ocr').value = (c.values && c.values.PROMPT_OCR && c.values.PROMPT_OCR.trim()) ? c.values.PROMPT_OCR : (c.prompt_ocr_default || '');
-    postPrompts.kb    = (c.values && c.values.PROMPT_POST       && c.values.PROMPT_POST.trim())       ? c.values.PROMPT_POST       : postDef.kb;
-    postPrompts.plain = (c.values && c.values.PROMPT_POST_PLAIN && c.values.PROMPT_POST_PLAIN.trim()) ? c.values.PROMPT_POST_PLAIN : postDef.plain;
-    postEditMode = 'plain';
+    postPrompts.gb7714.kb    = (c.values && c.values.PROMPT_POST             && c.values.PROMPT_POST.trim())             ? c.values.PROMPT_POST             : postDef.gb7714.kb;
+    postPrompts.gb7714.plain = (c.values && c.values.PROMPT_POST_PLAIN       && c.values.PROMPT_POST_PLAIN.trim())       ? c.values.PROMPT_POST_PLAIN       : postDef.gb7714.plain;
+    postPrompts.history_research.kb    = (c.values && c.values.PROMPT_POST_HISTORY       && c.values.PROMPT_POST_HISTORY.trim())       ? c.values.PROMPT_POST_HISTORY       : postDef.history_research.kb;
+    postPrompts.history_research.plain = (c.values && c.values.PROMPT_POST_PLAIN_HISTORY && c.values.PROMPT_POST_PLAIN_HISTORY.trim()) ? c.values.PROMPT_POST_PLAIN_HISTORY : postDef.history_research.plain;
+    postEditMode = 'plain'; postEditFmt = 'gb7714';
     const rb = document.querySelector('input[name=postModeEdit][value=plain]'); if (rb) rb.checked = true;
-    $('prompt_post').value = postPrompts.plain;
+    const rf = document.querySelector('input[name=postFmtEdit][value=gb7714]'); if (rf) rf.checked = true;
+    $('prompt_post').value = postPrompts[postEditFmt][postEditMode];
     updatePostHint();
   } catch(e){ log('[提示词] 读取配置失败：'+e); }
 }
 function updatePostHint(){
   const h = $('postHint');
-  if (postEditMode === 'plain'){
-    h.innerHTML = '纯文本模式：用于「结构化」阶段题录抽取，产物为.txt格式。';
-  } else {
-    h.innerHTML = '知识库模式：用于「结构化」阶段题录抽取，产物为.md格式。';
-  }
+  const fmt = (postEditFmt === 'history_research') ? '《历史研究》注释规范' : 'GB/T 7714-2015';
+  const mode = (postEditMode === 'plain') ? '纯文本（.txt）' : '知识库（.md）';
+  h.innerHTML = fmt + ' · ' + mode + '：用于「结构化」阶段题录抽取。';
 }
-// 切换抽屉内正在编辑的结构化提示词（知识库 / 纯文本）
+// 切换抽屉内正在编辑的结构化提示词（输出模式 / 引用格式）
 document.querySelectorAll('input[name=postModeEdit]').forEach(r=>{
   r.onchange = () => {
-    postPrompts[postEditMode] = $('prompt_post').value;   // 先保存当前编辑内容
+    postPrompts[postEditFmt][postEditMode] = $('prompt_post').value;   // 先保存当前编辑内容
     postEditMode = r.value;
-    $('prompt_post').value = postPrompts[postEditMode];
+    $('prompt_post').value = postPrompts[postEditFmt][postEditMode];
+    updatePostHint();
+  };
+});
+document.querySelectorAll('input[name=postFmtEdit]').forEach(r=>{
+  r.onchange = () => {
+    postPrompts[postEditFmt][postEditMode] = $('prompt_post').value;   // 先保存当前编辑内容
+    postEditFmt = r.value;
+    $('prompt_post').value = postPrompts[postEditFmt][postEditMode];
     updatePostHint();
   };
 });
 $('resetOcr').onclick  = () => { $('prompt_ocr').value  = $('prompt_ocr').dataset.def  || ''; revertOcr  = true; };
-$('resetPost').onclick = () => { $('prompt_post').value = postDef[postEditMode] || ''; revertPost[postEditMode] = true; };
+$('resetPost').onclick = () => { $('prompt_post').value = postDef[postEditFmt][postEditMode] || ''; revertPost[postEditFmt][postEditMode] = true; };
 $('savePrompt').onclick = async () => {
   const hint = $('promptHint'); hint.textContent = '保存中…'; hint.style.color = 'var(--mut)';
   try {
@@ -3481,9 +3850,11 @@ $('savePrompt').onclick = async () => {
     // 现有磁盘配置（含密钥等环境项），只更新提示词相关键
     const merged = cur.values || {};
     if (revertOcr) merged.PROMPT_OCR = ''; else merged.PROMPT_OCR = $('prompt_ocr').value;
-    if (revertPost.kb)    merged.PROMPT_POST       = ''; else merged.PROMPT_POST       = postPrompts.kb;
-    if (revertPost.plain) merged.PROMPT_POST_PLAIN = ''; else merged.PROMPT_POST_PLAIN = postPrompts.plain;
-    revertOcr = false; revertPost.kb = false; revertPost.plain = false;
+    if (revertPost.gb7714.kb)    merged.PROMPT_POST             = ''; else merged.PROMPT_POST             = postPrompts.gb7714.kb;
+    if (revertPost.gb7714.plain) merged.PROMPT_POST_PLAIN       = ''; else merged.PROMPT_POST_PLAIN       = postPrompts.gb7714.plain;
+    if (revertPost.history_research.kb)    merged.PROMPT_POST_HISTORY       = ''; else merged.PROMPT_POST_HISTORY       = postPrompts.history_research.kb;
+    if (revertPost.history_research.plain) merged.PROMPT_POST_PLAIN_HISTORY = ''; else merged.PROMPT_POST_PLAIN_HISTORY = postPrompts.history_research.plain;
+    revertOcr = false; revertPost = { gb7714: {kb:false, plain:false}, history_research: {kb:false, plain:false} };
     const r = await fetch('/api/config/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(merged)});
     const j = await r.json();
     if (j.ok) { hint.textContent = '已保存 ✓'; hint.style.color = 'var(--ok)'; log('[提示词] 已保存，下次识别 / 结构化即时生效'); }
@@ -3553,6 +3924,9 @@ function collectCfg(){
   for(const p of ['qwen','doubao','other']){ const pre=p.toUpperCase(); const s=ocrStash[p];
     d[pre+'_API_KEY']=s.api_key; d[pre+'_BASE_URL']=s.base_url; d[pre+'_MODEL']=s.model; }
   d.DEEPSEEK_API_KEY=$('cfgDsKey').value.trim(); d.DEEPSEEK_BASE_URL=$('cfgDsUrl').value.trim(); d.DEEPSEEK_MODEL=$('cfgDsModel').value.trim();
+  const cfSel=$('cfgCitationFormat'); if(cfSel) d.CITATION_FORMAT=cfSel.value||'gb7714';
+  const kt=$('cfgKeepTraditional'); if(kt) d.KEEP_TRADITIONAL=kt.checked?'true':'false';
+  d.EYE_CARE = document.body.classList.contains('eye-care')?'true':'false';
   return d;
 }
 function saveCfgToBackend(clear){ const data=collectCfg(); if(clear)for(const k in data)data[k]='';

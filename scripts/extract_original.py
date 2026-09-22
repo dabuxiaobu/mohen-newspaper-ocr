@@ -10,6 +10,17 @@
    用 PyMuPDF render 出来的 A4 灰底图是低分辨率副本，会导致后续 OCR 退化。
    必须用 pypdf 抽 page.images 里的原始 PIL 对象，保留数据库原始扫描分辨率。
 
+   例外（回退）：少数扫描件使用 pypdf 不支持的编码（如 CCITT Group 4 传真压缩，
+   报 "not enough image data"），pypdf 无法枚举内嵌图。此时按 300 DPI 用 pypdfium2
+   （Chrome PDFium 引擎）整页渲染回退，分辨率与原扫描一致，不影响 OCR。
+   正常「图包 PDF」仍走 pypdf 原始内嵌图路径，不被此回退影响。
+
+   另一类例外（视觉编辑）：部分 PDF 经 WPS 等工具裁剪/旋转后得到，但内嵌图像
+   字节未重新编码——表现为 CropBox 小于 MediaBox 或 /Rotate≠0。此时 pypdf 抽出的
+   仍是未裁/未旋转的原始大图，与「保存后看到的样子」不符。对此类页面改用
+   pypdfium2 按 CropBox 可见区（自动应用旋转）渲染，DPI 取内嵌原图原生分辨率，
+   保证清晰度一致、且得到编辑后的正确版式。
+
 autocrop 阈值：diff > 28（与背景色 RGB max 差），margin 相对长边 0.003%
 （原固定 12px 在高分辨率下偏小，按相对比例更稳）
 
@@ -61,6 +72,81 @@ def _elog(msg: str):
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif"}  # 直接放入的图片格式
 
 
+def _src_newer(src_path: str, out_path: str):
+    """源文件是否比产物新（用户改过 PDF/图片）。是则返回 True，调用方应强制重抽覆盖，
+
+    避免「改了 PDF 重新抽仍读旧产物」的困惑。0.5 秒容差防 mtime 精度边界。
+    """
+    try:
+        return (os.path.getmtime(src_path) - os.path.getmtime(out_path)) > 0.5
+    except Exception:
+        return False
+
+
+# pypdfium2 懒加载（仅当 pypdf 抽不出内嵌图时回退用；正常 PDF 不触发，避免无谓的 import 开销）
+_PDFIUM = None
+def _get_pdfium():
+    global _PDFIUM
+    if _PDFIUM is None:
+        import pypdfium2 as _PDFIUM
+    return _PDFIUM
+
+def render_page_pdfium(pdf_path: str, page_num: int, dpi: int = 300):
+    """用 pypdfium2（Chrome PDFium 引擎）把第 page_num 页按 dpi 整页渲染为 RGB 位图。
+
+    仅作为 pypdf 抽内嵌图失败的回退：CCITT G4 等 pypdf 不支持的编码、
+    或页内压根无内嵌图的文字型 PDF。300 DPI 下分辨率与原扫描件一致，不影响 OCR。
+    """
+    pdfium = _get_pdfium()
+    doc = pdfium.PdfDocument(pdf_path)
+    try:
+        page = doc[page_num - 1]
+        bitmap = page.render(scale=dpi / 72.0)
+        return bitmap.to_pil().convert("RGB")
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+
+
+def _page_is_edited(page):
+    """检测页面是否被视觉编辑过（裁剪/CropBox 缩小 或 旋转）。
+
+    此类页面内嵌原图字节未变，pypdf 抽出的仍是未裁/未旋转的原始大图，
+    与用户「保存后看到的样子」不符，需改用 pdfium 按可见区渲染。
+    """
+    try:
+        mb = page.mediabox
+        cb = page.cropbox
+        mw, mh = float(mb.width), float(mb.height)
+        cw, ch = float(cb.width), float(cb.height)
+        rot = int(page.get("/Rotate", 0) or 0)
+        if rot in (90, 270):
+            # 旋转后物理宽高互换，比较时一并互换
+            mw, mh = mh, mw
+        if abs(mw - cw) > 1 or abs(mh - ch) > 1:
+            return True
+        return rot != 0
+    except Exception:
+        return False
+
+
+def _native_dpi(page, base_img):
+    """按内嵌原图像素与 MediaBox 物理尺寸推算原生 DPI（考虑旋转），供 pdfium 等比渲染可见区。"""
+    try:
+        mb = page.mediabox
+        mw, mh = float(mb.width), float(mb.height)
+        rot = int(page.get("/Rotate", 0) or 0)
+        if rot in (90, 270):
+            mw, mh = mh, mw
+        if mw > 0:
+            return max(72, int(round((base_img.width / mw) * 72.0)))
+    except Exception:
+        pass
+    return 300
+
+
 def extract_images_per_page(pdf_path: str):
     """从 PDF 每页抽出面积最大的内嵌图（数据库导出一般是单图全页）。
 
@@ -73,27 +159,81 @@ def extract_images_per_page(pdf_path: str):
     for i, page in enumerate(reader.pages, 1):
         best = None
         best_area = 0
+        enum_err = None
         try:
             images = list(page.images)
         except Exception as e:
-            msg = f"{os.path.basename(pdf_path)} page {i}: 页面图像枚举失败: {type(e).__name__}: {e}"
-            errors.append(msg)
-            _elog(f"  [skip page] {msg}")
-            continue
-        for im in images:
+            enum_err = f"{os.path.basename(pdf_path)} page {i}: 页面图像枚举失败: {type(e).__name__}: {e}"
+            _elog(f"  [warn] {enum_err}（将尝试 pdfium 整页渲染回退）")
+        if not enum_err:
+            for im in images:
+                try:
+                    pil = im.image
+                except Exception as e:
+                    msg = f"{os.path.basename(pdf_path)} page {i} 图 {getattr(im, 'name', '?')}: 解码失败: {type(e).__name__}: {e}"
+                    errors.append(msg)
+                    _elog(f"  [skip image] {msg}")
+                    continue
+                if pil is None:
+                    continue
+                area = pil.width * pil.height
+                if area > best_area:
+                    best_area = area
+                    best = pil.convert("RGB")
+        # pypdf 抽不到内嵌图（枚举失败 或 页内无图）→ 用 pypdfium2 整页渲染回退
+        if best is None:
             try:
-                pil = im.image
+                best = render_page_pdfium(pdf_path, i, dpi=300)
+                if best is not None:
+                    if enum_err:
+                        _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 内嵌图枚举失败，改用整页渲染（{best.width}x{best.height}）")
+                    else:
+                        _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 页内无内嵌图，改用整页渲染（{best.width}x{best.height}）")
             except Exception as e:
-                msg = f"{os.path.basename(pdf_path)} page {i} 图 {getattr(im, 'name', '?')}: 解码失败: {type(e).__name__}: {e}"
-                errors.append(msg)
-                _elog(f"  [skip image] {msg}")
+                if enum_err:
+                    errors.append(enum_err)
+                    _elog(f"  [skip page] {enum_err}")
+                else:
+                    msg = f"{os.path.basename(pdf_path)} page {i}: 无内嵌图且 pdfium 渲染失败: {type(e).__name__}: {e}"
+                    errors.append(msg)
+                    _elog(f"  [skip page] {msg}")
                 continue
-            if pil is None:
+        # 页面被裁剪/旋转（WPS 等编辑后内嵌图未变）→ 内嵌原图不是「保存后的样子」，
+        # 必须按 CropBox 可见区（pdfium 自动应用旋转）渲染，DPI 取内嵌原图原生分辨率。
+        if _page_is_edited(page):
+            try:
+                dpi = _native_dpi(page, best) if best is not None else 300
+                best = render_page_pdfium(pdf_path, i, dpi=dpi)
+                if best is not None:
+                    _elog(f"  [可见区渲染] {os.path.basename(pdf_path)} page {i}: 页面被裁剪/旋转，按原图分辨率渲染可见区（{best.width}x{best.height}）")
+            except Exception as e:
+                if enum_err:
+                    errors.append(enum_err)
+                    _elog(f"  [skip page] {enum_err}")
+                else:
+                    msg = f"{os.path.basename(pdf_path)} page {i}: 页面被裁剪/旋转，可见区渲染失败: {type(e).__name__}: {e}"
+                    errors.append(msg)
+                    _elog(f"  [skip page] {msg}")
                 continue
-            area = pil.width * pil.height
-            if area > best_area:
-                best_area = area
-                best = pil.convert("RGB")
+        else:
+            # 未编辑：走 pypdf 内嵌原图；抽不到（枚举失败/页内无图）→ pdfium 整页渲染回退
+            if best is None:
+                try:
+                    best = render_page_pdfium(pdf_path, i, dpi=300)
+                    if best is not None:
+                        if enum_err:
+                            _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 内嵌图枚举失败，改用整页渲染（{best.width}x{best.height}）")
+                        else:
+                            _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 页内无内嵌图，改用整页渲染（{best.width}x{best.height}）")
+                except Exception as e:
+                    if enum_err:
+                        errors.append(enum_err)
+                        _elog(f"  [skip page] {enum_err}")
+                    else:
+                        msg = f"{os.path.basename(pdf_path)} page {i}: 无内嵌图且 pdfium 渲染失败: {type(e).__name__}: {e}"
+                        errors.append(msg)
+                        _elog(f"  [skip page] {msg}")
+                    continue
         if best:
             out.append((i, best))
     return out, errors
@@ -142,6 +282,18 @@ def main():
             DST_DIR = sys.argv[i + 1]
 
     os.makedirs(DST_DIR, exist_ok=True)
+    # 维护抽图产物顺序索引（按导入/抽图先后），供前端翻页按序展示
+    _ch_order_path = os.path.join(DST_DIR, ".order.json")
+    _ch_order = []
+    if os.path.isfile(_ch_order_path):
+        try:
+            _ch_order = json.load(open(_ch_order_path, encoding="utf-8")).get("order", [])
+        except Exception:
+            _ch_order = []
+    # 若无顺序索引（旧数据首次重抽），用现有 png 文件名序垫底，避免旧文件顺序丢失
+    if not _ch_order:
+        _ch_order = sorted(f for f in os.listdir(DST_DIR)
+                           if os.path.splitext(f)[1].lower() in IMG_EXTS)
     # 每次运行重置日志文件（打包态 stdout 被丢弃，此文件是与启动器/用户对齐的关键通道）
     try:
         with open(LOG_PATH, "w", encoding="utf-8") as _f:
@@ -154,8 +306,17 @@ def main():
         print("请新建该文件夹（或 --src 指定），把要抽图的数据库文章 PDF / 图片放进去，再点「① 抽图」。")
         sys.exit(0)
 
-    files = sorted(f for f in os.listdir(SRC_DIR)
-                   if os.path.splitext(f)[1].lower() in IMG_EXTS | {".pdf"})
+    _cands = [f for f in os.listdir(SRC_DIR)
+              if os.path.splitext(f)[1].lower() in IMG_EXTS | {".pdf"}]
+    # 优先按导入顺序索引（.import_order.json）排序，使抽图/翻页顺序 = 导入先后
+    _io = os.path.join(SRC_DIR, ".import_order.json")
+    _import_order = []
+    if os.path.isfile(_io):
+        try:
+            _import_order = json.load(open(_io, encoding="utf-8")).get("order", [])
+        except Exception:
+            _import_order = []
+    files = sorted(_cands, key=lambda f: (0, _import_order.index(f)) if f in _import_order else (1, f))
     pdfs = [f for f in files if f.lower().endswith(".pdf")]
     imgs = [f for f in files if not f.lower().endswith(".pdf")]
     if not files:
@@ -173,7 +334,7 @@ def main():
         src = os.path.join(SRC_DIR, name)
         ext = os.path.splitext(name)[1].lower()
         out = os.path.join(DST_DIR, os.path.splitext(name)[0] + ".png")
-        if os.path.exists(out):
+        if os.path.exists(out) and not _src_newer(src, out):
             skipped += 1
             print(f"{name[:30]:32} [skip 已存在] {os.path.basename(out)}")
             continue
@@ -187,7 +348,7 @@ def main():
                 kind = "PDF"
                 for pnum, im in pages:
                     out = os.path.join(DST_DIR, f"{os.path.splitext(name)[0]}_p{pnum}.png")
-                    if os.path.exists(out):
+                    if os.path.exists(out) and not _src_newer(src, out):
                         skipped += 1
                         print(f"{name[:30]:32} [{kind}] page {pnum} [skip 已存在] {os.path.basename(out)}")
                         continue
@@ -195,6 +356,9 @@ def main():
                     cropped = autocrop(im)
                     w1, h1 = cropped.size
                     cropped.save(out)
+                    _bn = os.path.basename(out)
+                    if _bn not in _ch_order:
+                        _ch_order.append(_bn)
                     print(f"{name[:30]:32} [{kind}] page {pnum} 原图 {w0}x{h0} -> 裁切 {w1}x{h1} "
                           f"(留 {100*w1*h1/(w0*h0):.0f}%)")
             else:
@@ -205,10 +369,19 @@ def main():
                 w1, h1 = cropped.size
                 out = os.path.join(DST_DIR, os.path.splitext(name)[0] + ".png")
                 cropped.save(out)
+                _bn = os.path.basename(out)
+                if _bn not in _ch_order:
+                    _ch_order.append(_bn)
                 print(f"{name[:30]:32} [{kind}] 原图 {w0}x{h0} -> 裁切 {w1}x{h1} "
                       f"(留 {100*w1*h1/(w0*h0):.0f}%)")
         except Exception as e:
             _elog(f"[skip] {name}: {e!r}")
+    # 写回抽图产物顺序索引（仅追加本次新写出，已存在的保留原序）
+    try:
+        with open(_ch_order_path, "w", encoding="utf-8") as _f:
+            json.dump({"order": _ch_order}, _f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
     if skipped:
         print(f"[info] 已跳过 {skipped} 个已存在")
 
