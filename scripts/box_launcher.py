@@ -2923,7 +2923,7 @@ function renderBoxList(){ const el=$('boxList');
         <button class="mini sec" data-up="${v.localIdx}" data-page="${esc(v.pageName)}">↑ 上移</button><button class="mini sec" data-dn="${v.localIdx}" data-page="${esc(v.pageName)}">↓ 下移</button>
         <button class="mini" data-loc="${b.id}">定位</button><button class="mini stop" data-del="${b.id}">✕ 删除</button>
       </div>`; el.appendChild(d); });
-  el.querySelectorAll('select').forEach(s=>s.onchange=e=>{ const pg=e.target.dataset.page, i=+e.target.dataset.idx; pageArr(pg)[i].label=e.target.value; draw(); renderResults(); });
+  el.querySelectorAll('select').forEach(s=>s.onchange=e=>{ const pg=e.target.dataset.page, i=+e.target.dataset.idx; pageArr(pg)[i].label=e.target.value; draw(); renderResults(); renderBoxList(); });
   el.querySelectorAll('input.grp').forEach(inp=>inp.onchange=e=>{ const pg=e.target.dataset.page, i=+e.target.dataset.idx; pageArr(pg)[i].group=e.target.value.trim(); renderBoxList(); draw(); renderResults(); });
   el.querySelectorAll('[data-del]').forEach(b=>b.onclick=e=>{ deleteBoxById(+e.target.dataset.del); });
   el.querySelectorAll('[data-up]').forEach(b=>b.onclick=e=>{ const i=+e.target.dataset.up, pg=e.target.dataset.page; const arr=pageArr(pg); if(i>0){[arr[i-1],arr[i]]=[arr[i],arr[i-1]];renderBoxList();draw();} });
