@@ -132,7 +132,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -983,16 +983,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"dir": sub, "files": []})
             raw = [f for f in os.listdir(d)
                    if os.path.splitext(f)[1].lower() in IMG_EXTS]
+            # 各文件修改时间（秒，int），供前端「整版排序」抽屉按修改时间排序
+            mtimes = {}
+            for _f in raw:
+                try:
+                    mtimes[_f] = int(os.path.getmtime(os.path.join(d, _f)))
+                except Exception:
+                    mtimes[_f] = 0
             # 优先按抽图产物顺序索引（.order.json）排序，使翻页顺序 = 导入/抽图先后
             _op = os.path.join(d, ".order.json")
             _order = []
             if os.path.isfile(_op):
                 try:
                     _order = json.load(open(_op, encoding="utf-8")).get("order", [])
-                except Exception:
+                except Exception as _e:
                     _order = []
-            fs = sorted(raw, key=lambda f: (0, _order.index(f)) if f in _order else (1, f))
-            return self._json({"dir": sub, "files": fs})
+                    _probe_log("list_images .order.json 解析失败(空/损坏): %r -> 自然排序兜底" % _e)
+
+            # 自然排序 key：`xx_p123.png` 按页码数字比较，避免 p1,p10,p2 字典序乱序
+            def _natk(f):
+                m = re.search(r"_p(\d+)", f)
+                return (0, int(m.group(1)), f) if m else (1, 0, f)
+
+            fs = sorted(raw, key=lambda f: (0, _order.index(f), "") if f in _order else (1,) + _natk(f))
+            return self._json({"dir": sub, "files": fs, "mtimes": mtimes})
         if u.path == "/api/list_source":
             return self._list_source()
         if u.path == "/api/image":
@@ -1013,6 +1027,47 @@ class Handler(BaseHTTPRequestHandler):
                     ".tif": "image/tiff", ".tiff": "image/tiff"}.get(ext, "image/png")
             b = base64.b64encode(open(fp, "rb").read()).decode()
             return self._json({"name": name, "data": f"data:{mime};base64,{b}"})
+        if u.path == "/api/rotate_image":
+            # 物理旋转整版图片（顺时针 deg 度），PNG 无损重编码；旋转后框选坐标失效，前端负责清空
+            try:
+                qs = parse_qs(u.query)
+                name = qs.get("name", [""])[0]
+                sub = qs.get("dir", ["cropped_hi"])[0]
+                try:
+                    deg = int(qs.get("deg", ["90"])[0] or 90)
+                except Exception:
+                    deg = 90
+                if deg not in (90, 180, 270):
+                    deg = 90
+                fp = os.path.join(_img_dir(sub), name)
+                if not os.path.exists(fp):
+                    cand = fp + ".png"
+                    if os.path.exists(cand):
+                        fp = cand
+                    else:
+                        return self._send(404, "not found")
+                from PIL import Image
+                with Image.open(fp) as im:
+                    # 90° 整倍旋转用 transpose（C 层像素重排，远快于逐像素仿射 rotate）
+                    _T = getattr(Image, "Transpose", Image)   # 兼容旧版 Pillow 常量
+                    _rot_map = {90: _T.ROTATE_270, 180: _T.ROTATE_180, 270: _T.ROTATE_90}
+                    rot = im.transpose(_rot_map[deg])
+                    # .tmp 扩展名无法让 PIL 推断格式，须显式指定（沿用原图格式，缺省 PNG）；
+                    # PNG 用低压缩级别（大图高压缩编码是主要耗时之一），JPEG 重编码 quality=95
+                    fmt = (im.format or "PNG").upper()
+                    if fmt == "JPG":
+                        fmt = "JPEG"
+                    tmp = fp + ".rot.tmp"
+                    if fmt == "PNG":
+                        rot.save(tmp, format="PNG", compress_level=1)
+                    elif fmt == "JPEG":
+                        rot.save(tmp, format="JPEG", quality=95)
+                    else:
+                        rot.save(tmp, format=fmt)
+                    os.replace(tmp, fp)
+                return self._json({"ok": True, "name": name, "deg": deg})
+            except Exception as e:
+                return self._json({"ok": False, "error": str(e)[:160]})
         if u.path == "/api/logs":
             # 读取持久化日志文件，供前端启动时恢复历史日志（关闭 exe 不丢失）
             try:
@@ -1100,8 +1155,12 @@ class Handler(BaseHTTPRequestHandler):
                 for x in raw:  # 补齐后端实际存在但前端未传的（按文件名排序追加）
                     if x.lower() not in seen:
                         uniq.append(x); seen.add(x.lower())
-                with open(os.path.join(ch, ".order.json"), "w", encoding="utf-8") as f:
+                # 原子写：先写临时文件再 os.replace，避免写中断留下空/半截 .order.json
+                _op = os.path.join(ch, ".order.json")
+                _tmp = _op + ".tmp"
+                with open(_tmp, "w", encoding="utf-8") as f:
                     json.dump({"order": uniq}, f, ensure_ascii=False, indent=2)
+                os.replace(_tmp, _op)
                 return self._json({"ok": True, "order": uniq})
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)[:200]})
@@ -2275,6 +2334,9 @@ HTML = r"""<!doctype html>
   .src-list .item .ops .mv:hover:not(:disabled) { background:#eef1f5; }
   .src-list .item .ops .mv:disabled { color:#cbd5e1; cursor:default; border-color:#eef1f5; }
   .src-list .item:hover { background:#eef1f5; }
+  .src-list .item { cursor:grab; }
+  .src-list .item:active { cursor:grabbing; }
+  .src-list .item.dragging { opacity:.5; background:#dbeafe; outline:1px dashed var(--pri); }
   .src-list .item.sel { background:#eff6ff; }
   .src-list .empty { color:var(--mut); font-size:12px; padding:2px 6px; }
   .src-list-head .fold-toggle { display:inline-flex; align-items:center; justify-content:center; width:8px; height:26px; min-width:0; min-height:0; flex:0 0 8px; padding:0; margin:0 4px 0 0; border:none; outline:none; background:transparent; background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='8' height='8' viewBox='0 0 8 8'%3E%3Cpath d='M1 1 L7 1 L4 7 z' fill='%2364748b'/%3E%3C/svg%3E"); background-size:8px 8px; background-repeat:no-repeat; background-position:center; cursor:pointer; transition:transform .12s ease; }
@@ -2411,9 +2473,9 @@ HTML = r"""<!doctype html>
       <div id="canvasWrap">
       <div id="zoomBar">
         <button id="zoomOut" class="sm sec" title="缩小">−</button>
-        <span id="zoomPct">100%</span>
+        <span id="zoomPct" title="双击恢复「适应窗口」">100%</span>
         <button id="zoomIn" class="sm sec" title="放大">+</button>
-        <button id="zoomReset" class="sm sec" title="适应窗口">⟲</button>
+        <button id="rotBtn" class="sm sec" title="顺时针旋转 90°（旋转后该版已画框会清空）">⟳</button>
       </div>
       <div id="pageBar">
         <button class="sm sec" id="prevPage" title="上一版">◀</button>
@@ -2464,6 +2526,7 @@ HTML = r"""<!doctype html>
             <label class="chk"><input type="checkbox" id="selAll"> <span>全选</span></label>
           <button class="sm ghost src-head-btn" id="loadCropped" title="将上方勾选的整版载入为工作集">载入</button>
           <button class="sm stop src-head-btn" id="delCropped" title="删除选中的整版原图（含 output 同名产物）">删除</button>
+          <button class="sm ghost src-head-btn" id="sortBtn" title="按依据与方向对整版列表排序并保存">排序</button>
           <span class="cnt" id="imgCnt"></span>
         </div>
         <div class="src-list" id="srcList"></div>
@@ -2678,6 +2741,32 @@ HTML = r"""<!doctype html>
   </div>
 </aside>
 
+<aside class="drawer" id="sortDrawer" role="dialog" aria-labelledby="sortTitle" aria-hidden="true">
+  <div class="drawer-head">
+    <h2 id="sortTitle">整版排序</h2>
+    <button class="drawer-close" id="sortClose" aria-label="关闭" title="关闭（ESC）">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="drawer-body">
+    <div class="set-group">
+      <h3>排序依据</h3>
+      <label class="rdo"><input type="radio" name="sortBy" value="default" checked> 默认顺序（按页码 / 文件名自然序重置）</label>
+      <label class="rdo"><input type="radio" name="sortBy" value="name"> 文件名</label>
+      <label class="rdo"><input type="radio" name="sortBy" value="mtime"> 修改时间</label>
+    </div>
+    <div class="set-group">
+      <h3>排序方向</h3>
+      <label class="rdo"><input type="radio" name="sortDir" value="asc" checked> 升序</label>
+      <label class="rdo"><input type="radio" name="sortDir" value="desc"> 降序</label>
+    </div>
+  </div>
+  <div class="drawer-foot">
+    <button id="applySort" class="sec">排序</button>
+    <button class="ghost" id="sortCancel" type="button">取消</button>
+  </div>
+</aside>
+
 <script>
 const $ = id => document.getElementById(id);
 const cv = $('cv'); const ctx = cv.getContext('2d');
@@ -2691,6 +2780,7 @@ let dragState = null; let uid = 1; let mode = 'auto'; let backendCfg = {};
 // pageOrder 记录工作集（= 阅读顺序，由「载入」批量填充）。
 // mergeMode 决定整版间关系：'single' 每版独立识别/导出；'cross' 多版合并为一篇。
 let allPageData = {}; let pageOrder = []; let pageList = []; let navList = []; let pageIdx = -1; let crossResults = {};
+let fileMtimes = {};   // 整版原图修改时间（秒），来自 /api/list_images 的 mtimes，供排序抽屉使用
 let mergeMode = 'single';
 let off = 0;
 
@@ -3250,7 +3340,7 @@ async function saveEdit(){
 function refreshImageList(){
   return fetch('/api/list_images?dir=cropped_hi').then(r=>r.json()).then(j=>{
     const oldIdx=pageIdx, oldName=srcName;
-    pageList=j.files||[]; renderSrcList();
+    pageList=j.files||[]; fileMtimes=j.mtimes||{}; renderSrcList();
     // navList（当前载入的工作集）只保留仍存在的文件，避免删图后导航指向已消失的页
     navList = navList.filter(f=>pageList.includes(f));
     if(pageIdx>=navList.length) pageIdx = navList.length? navList.length-1 : -1;
@@ -3262,7 +3352,7 @@ function refreshImageList(){
 }
 function renderSrcList(){ const box=$('srcList'); if(!box) return; box.innerHTML='';
   if(!pageList.length){ if($('imgCnt')) $('imgCnt').textContent = '共 0 项'; const wrap=box.closest('.src-list-wrap'); if(wrap) wrap.classList.remove('collapsed'); syncSelAll(); return; }
-  pageList.forEach((f,i)=>{ const lab=document.createElement('div'); lab.className='item'; lab.innerHTML=`<input type="checkbox" class="src-chk" value="${esc(f)}"> <span class="ord">${i+1}</span> <span class="nm">${esc(f)}</span> <span class="ops"><button type="button" class="mv" data-up ${i===0?'disabled':''} title="上移">↑</button><button type="button" class="mv" data-dn ${i===pageList.length-1?'disabled':''} title="下移">↓</button></span>`; box.appendChild(lab); });
+  pageList.forEach((f,i)=>{ const lab=document.createElement('div'); lab.className='item'; lab.draggable=true; lab.innerHTML=`<input type="checkbox" class="src-chk" value="${esc(f)}"> <span class="ord">${i+1}</span> <span class="nm" title="可拖动调整顺序">${esc(f)}</span> <span class="ops"><button type="button" class="mv" data-up ${i===0?'disabled':''} title="上移">↑</button><button type="button" class="mv" data-dn ${i===pageList.length-1?'disabled':''} title="下移">↓</button></span>`; box.appendChild(lab); });
   syncSelAll();
   const wrap=box.closest('.src-list-wrap'); if(wrap) wrap.classList.remove('collapsed');
   if($('imgCnt')) $('imgCnt').textContent = '共 '+pageList.length+' 项'; }
@@ -3463,7 +3553,25 @@ $('logClear').onclick=()=>{ if(confirm('确认清空日志面板？')){ $('log')
 $('recogAll').onclick=recognizeAll;
 $('zoomIn').onclick=()=>setZoom(userZoom*1.2);
 $('zoomOut').onclick=()=>setZoom(userZoom/1.2);
-$('zoomReset').onclick=()=>setZoom(1);
+$('zoomPct').ondblclick=()=>setZoom(1);   // 双击缩放百分比 = 恢复「适应窗口」
+$('rotBtn').onclick=async()=>{
+  if(!srcName){ alert('请先载入整版图片再旋转。'); return; }
+  if(boxes.length && !confirm('旋转后当前整版已画的框会错位，将清空当前页的框。确定旋转？')) return;
+  try{
+    if(!img){ alert('当前没有可旋转的图片。'); return; }
+    const _nm=srcName, _idx=pageIdx;
+    // 1) 客户端即时旋转显示：画布 90° 顺时针，直接把 canvas 当绘制源，避免大图 base64 回传（秒级响应）
+    const c=document.createElement('canvas'); c.width=natH; c.height=natW;
+    const cx=c.getContext('2d'); cx.translate(c.width,0); cx.rotate(Math.PI/2); cx.drawImage(img,0,0);
+    delete allPageData[_nm]; boxes=[]; results={};
+    img=c; natW=c.width; natH=c.height; userZoom=1; resizeCanvas(); draw();
+    const _sn=$('srcName'); if(_sn) _sn.textContent=_nm; renderBoxList();
+    // 2) 后端旋转持久化（后台，不阻塞显示；失败再提示）
+    const j=await fetch('/api/rotate_image?name='+encodeURIComponent(_nm)+'&dir=cropped_hi').then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); });
+    if(!j.ok){ log('[旋转] 服务端保存失败：'+(j.error||'')); alert('旋转已显示，但保存失败：'+(j.error||'')); return; }
+    log('[旋转] 已顺时针旋转 90°：'+_nm+'（已清空该版框选）');
+  }catch(e){ log('[旋转] 异常：'+e); alert('旋转异常：'+e); }
+};
 $('canvasWrap').addEventListener('wheel',e=>{
   // 鼠标滚轮直接控制画布缩放；按住 Shift 仍可做水平滚动兜底
   if(!img)return;
@@ -3635,6 +3743,44 @@ $('srcList').addEventListener('click', e=>{
   syncSelAll();
   persistCroppedOrder();
 });
+// 整版列表：拖拽调整顺序（HTML5 拖放，兼容现有 ↑/↓ 与勾选；拖动后持久化到 .order.json）
+let _dragSrcIdx = -1;
+(function(){
+  const sl = $('srcList');
+  sl.addEventListener('dragstart', e=>{
+    const item = e.target.closest('.item'); if(!item) return;
+    _dragSrcIdx = [...sl.children].indexOf(item);
+    item.classList.add('dragging');
+    e.dataTransfer.effectAllowed = 'move';
+    try { e.dataTransfer.setData('text/plain', String(_dragSrcIdx)); } catch(_) {}
+  });
+  sl.addEventListener('dragover', e=>{
+    e.preventDefault();
+    const item = e.target.closest('.item'); if(!item) return;
+    const overIdx = [...sl.children].indexOf(item);
+    const dragging = sl.querySelector('.dragging');
+    if(overIdx<0 || _dragSrcIdx<0 || !dragging || overIdx===_dragSrcIdx) return;
+    if(overIdx < _dragSrcIdx) sl.insertBefore(dragging, item);
+    else sl.insertBefore(dragging, item.nextSibling);
+    _dragSrcIdx = [...sl.children].indexOf(dragging);
+  });
+  sl.addEventListener('drop', e=>{
+    e.preventDefault();
+    const dragging = sl.querySelector('.dragging'); if(dragging) dragging.classList.remove('dragging');
+    const checked = new Set([...sl.querySelectorAll('.src-chk')].filter(c=>c.checked).map(c=>c.value));
+    pageList = [...sl.children].map(el=>el.querySelector('.src-chk').value);
+    renderSrcList();
+    sl.querySelectorAll('.src-chk').forEach(c=>{ c.checked = checked.has(c.value); });
+    syncSelAll();
+    persistCroppedOrder();
+    _dragSrcIdx = -1;
+    log('[排序] 已通过拖拽调整整版顺序并保存。');
+  });
+  sl.addEventListener('dragend', e=>{
+    const dragging = sl.querySelector('.dragging'); if(dragging) dragging.classList.remove('dragging');
+    _dragSrcIdx = -1;
+  });
+})();
 async function persistCroppedOrder(){
   try{ await fetch('/api/reorder_cropped',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order:pageList})}); }
   catch(e){ log('[排序] 持久化失败：'+e); }
@@ -3687,7 +3833,7 @@ $('loadCropped').onclick=async ()=>{
 };
 
 // ---------- 抽屉（设置 / 用量统计 / 提示词） ----------
-const mask=$('drawerMask'); const drawer=$('drawer'); const usageDrawer=$('usageDrawer'); const promptDrawer=$('promptDrawer');
+const mask=$('drawerMask'); const drawer=$('drawer'); const usageDrawer=$('usageDrawer'); const promptDrawer=$('promptDrawer'); const sortDrawer=$('sortDrawer');
 async function openExternalUrl(url){
   try { await fetch('/api/open_url',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url})}); }
   catch(e){ log('[打开链接] 失败：'+e); }
@@ -3777,10 +3923,43 @@ function showUpdateModal(j){
 function openSettingsDrawer(){ drawer.classList.add('open'); usageDrawer.classList.remove('open'); promptDrawer.classList.remove('open'); mask.classList.add('open'); }
 function openUsageDrawer(){ usageDrawer.classList.add('open'); drawer.classList.remove('open'); promptDrawer.classList.remove('open'); mask.classList.add('open'); loadUsage(); }
 function openPromptDrawer(){ loadPrompts(); promptDrawer.classList.add('open'); drawer.classList.remove('open'); usageDrawer.classList.remove('open'); mask.classList.add('open'); }
-function closeDrawers(){ drawer.classList.remove('open'); usageDrawer.classList.remove('open'); promptDrawer.classList.remove('open'); mask.classList.remove('open'); }
+function openSortDrawer(){ sortDrawer.classList.add('open'); drawer.classList.remove('open'); usageDrawer.classList.remove('open'); promptDrawer.classList.remove('open'); mask.classList.add('open'); }
+function closeDrawers(){ drawer.classList.remove('open'); usageDrawer.classList.remove('open'); promptDrawer.classList.remove('open'); sortDrawer.classList.remove('open'); mask.classList.remove('open'); }
 $('gearBtn').onclick=openSettingsDrawer; $('drawerClose').onclick=closeDrawers;
 $('usageBtn').onclick=openUsageDrawer; $('usageClose').onclick=closeDrawers; mask.onclick=closeDrawers;
 $('promptBtn').onclick=openPromptDrawer; $('promptClose').onclick=closeDrawers;
+// 整版排序抽屉
+$('sortBtn').onclick=openSortDrawer; $('sortClose').onclick=closeDrawers; $('sortCancel').onclick=closeDrawers; $('applySort').onclick=applySort;
+// 自然排序比较：按数字段逐段比较，避免 p1,p10,p2 字典序乱序
+function natCmp(a,b){
+  const tok = s => (s.match(/(\d+)|(\D+)/g)||[]).map(t=>/^\d+$/.test(t)?[0,+t]:[1,t]);
+  const A=tok(a), B=tok(b);
+  for(let i=0;i<Math.min(A.length,B.length);i++){
+    if(A[i][0]!==B[i][0]) return A[i][0]-B[i][0];
+    if(A[i][1]<B[i][1]) return -1;
+    if(A[i][1]>B[i][1]) return 1;
+  }
+  return A.length-B.length;
+}
+// 应用排序：依据（默认/文件名/修改时间）× 方向（升/降），重排 pageList 并持久化到 cropped_hi/.order.json
+function applySort(){
+  const by=(document.querySelector('input[name="sortBy"]:checked')||{}).value||'default';
+  const desc=(document.querySelector('input[name="sortDir"]:checked')||{}).value==='desc';
+  if(!pageList.length){ closeDrawers(); flashHint('整版列表为空，无可排序项。'); return; }
+  const arr=pageList.slice();
+  if(by==='name'){
+    arr.sort(natCmp);
+  } else if(by==='mtime'){
+    const mt=f=>(fileMtimes[f]||0);
+    arr.sort((a,b)=>mt(a)-mt(b));
+  } else { // 默认顺序：重置为页码 / 文件名自然序
+    arr.sort(natCmp);
+  }
+  if(desc) arr.reverse();
+  pageList=arr; renderSrcList(); persistCroppedOrder();
+  closeDrawers();
+  log('[排序] 已按「'+(by==='name'?'文件名':by==='mtime'?'修改时间':'默认顺序')+'·'+(desc?'降序':'升序')+'」重排整版列表并保存。');
+}
 $('checkUpdateBtn').onclick=checkUpdate;
 // 自动更新开关：开启时把开关状态持久化到 box_config.json
 const autoChk=$('autoUpdateChk');
@@ -3789,7 +3968,7 @@ if(autoChk) autoChk.onchange=async ()=>{
   try{ await fetch('/api/auto_update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto_update:v})}); AUTO_UPDATE=v; log('[设置] 自动更新已'+(v?'开启':'关闭')); }
   catch(e){ log('[设置] 自动更新开关保存失败：'+e.message); }
 };
-document.addEventListener('keydown', e=>{ if(e.key==='Escape'&&(drawer.classList.contains('open')||usageDrawer.classList.contains('open')||promptDrawer.classList.contains('open'))) closeDrawers(); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape'&&(drawer.classList.contains('open')||usageDrawer.classList.contains('open')||promptDrawer.classList.contains('open')||sortDrawer.classList.contains('open'))) closeDrawers(); });
 
 // ---------- 提示词抽屉 ----------
 let revertOcr = false;

@@ -32,6 +32,7 @@ import os
 import sys
 import time
 import threading
+import re
 import numpy as np
 from PIL import Image
 from pypdf import PdfReader
@@ -285,21 +286,31 @@ def main():
     # 维护抽图产物顺序索引（按导入/抽图先后），供前端翻页按序展示
     _ch_order_path = os.path.join(DST_DIR, ".order.json")
     _ch_order = []
+    _ch_order_broken = False
     if os.path.isfile(_ch_order_path):
         try:
             _ch_order = json.load(open(_ch_order_path, encoding="utf-8")).get("order", [])
         except Exception:
             _ch_order = []
-    # 若无顺序索引（旧数据首次重抽），用现有 png 文件名序垫底，避免旧文件顺序丢失
+            _ch_order_broken = True
+
+    # 文件名自然排序 key：`xx_p123.png` 按页码数字比较，避免 p1,p10,p2 字典序乱序
+    def _natk(f):
+        m = re.search(r"_p(\d+)", f)
+        return (0, int(m.group(1)), f) if m else (1, 0, f)
+
+    # 若无顺序索引（旧数据首次重抽 / 索引损坏），按自然排序垫底，避免旧文件顺序丢失
     if not _ch_order:
-        _ch_order = sorted(f for f in os.listdir(DST_DIR)
-                           if os.path.splitext(f)[1].lower() in IMG_EXTS)
+        _ch_order = sorted((f for f in os.listdir(DST_DIR)
+                            if os.path.splitext(f)[1].lower() in IMG_EXTS), key=_natk)
     # 每次运行重置日志文件（打包态 stdout 被丢弃，此文件是与启动器/用户对齐的关键通道）
     try:
         with open(LOG_PATH, "w", encoding="utf-8") as _f:
             _f.write(time.strftime("[%Y-%m-%d %H:%M:%S] === 抽图开始 ===\n"))
     except Exception:
         pass
+    if _ch_order_broken:
+        _elog("[warn] 既有 .order.json 解析失败（空文件或损坏），本次按自然排序垫底并重建")
 
     if not os.path.isdir(SRC_DIR):
         print(f"[empty] 来源文件夹不存在：{SRC_DIR}")
@@ -377,9 +388,12 @@ def main():
         except Exception as e:
             _elog(f"[skip] {name}: {e!r}")
     # 写回抽图产物顺序索引（仅追加本次新写出，已存在的保留原序）
+    # 原子写：先写临时文件再 os.replace，避免写中断留下空/半截索引（曾致列表永久字典序乱序）
     try:
-        with open(_ch_order_path, "w", encoding="utf-8") as _f:
+        _tmp = _ch_order_path + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as _f:
             json.dump({"order": _ch_order}, _f, ensure_ascii=False, indent=2)
+        os.replace(_tmp, _ch_order_path)
     except Exception:
         pass
     if skipped:
