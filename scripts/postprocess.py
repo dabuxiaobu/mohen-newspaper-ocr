@@ -465,7 +465,7 @@ def _pop_ocr_time(root, name):
 
 def postprocess(txt_path, client, model, prompt_override=None, rename=True,
                 timing_root=None, mode="kb",
-                src_name=None, src_date=None, src_page=None,
+                src_name=None, src_date=None, src_page=None, src_issue=None, carrier=None,
                 citation_format="gb7714", keep_traditional=False):
     t0 = time.time()
     text = open(txt_path, encoding="utf-8").read()
@@ -484,6 +484,8 @@ def postprocess(txt_path, client, model, prompt_override=None, rename=True,
         src["date"] = src_date
     if src_page:
         src["page"] = src_page
+    if src_issue:
+        src["issue"] = src_issue           # 期刊期号占位符 {issue}；与报纸版次 page 区分，避免「第X期」被误当版次
 
     # 提示词选择：
     #  - plain 模式（纯文本）：模型直接产出含正文的完整条目，走 对应格式 的 PLAIN 提示词；
@@ -548,13 +550,24 @@ def postprocess(txt_path, client, model, prompt_override=None, rename=True,
         "pages": "（请见文件名页码）",
     }
 
+    # 组装 system 提示词：占位符填充后，若用户显式声明载体类型，追加强制指令覆盖模型自判断。
+    sys_content = prompt.format_map(
+        _SafeDict(**{k: (fmt.get(k) or fmt_fallback.get(k, "")) for k in fmt}))
+    if carrier == "journal":
+        sys_content += ("\n\n【强制指令】用户已声明本篇载体类型为「期刊[J]」。请直接按期刊样式著录引用"
+                       "（GB/T 7714：题名[J].刊名,年,卷(期):页码.；《历史研究》：作者：《篇名》，《刊名》年年期。），"
+                       "不要判断为报纸；出处中的「第X期」视为期号，著录为 (X)，不得当作报纸版次；"
+                       "若期号含「/」（如 63/64）表示两期合刊，著录为 (63/64)，不得拆成单期或添加报纸版次；"
+                       "出处含「合刊」即两期合并出版。")
+    elif carrier == "newspaper":
+        sys_content += ("\n\n【强制指令】用户已声明本篇载体类型为「报纸[N]」。请直接按报纸样式著录引用"
+                       "（GB/T 7714：作者.题名[N].报纸名,出版日期(版次).；《历史研究》：作者：《篇名》，《报纸名》出版日期，第X版。），"
+                       "不要判断为期刊。")
     try:
         resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": prompt.format_map(
-                    _SafeDict(**{k: (fmt.get(k) or fmt_fallback.get(k, "")) for k in fmt})),
-                },
+                {"role": "system", "content": sys_content},
                 {"role": "user", "content": text},
             ],
             # DeepSeek 官方端点关闭思考模式：字段为 thinking.type=disabled（非 Ark 私有的 enable_thinking）。
@@ -659,10 +672,14 @@ def postprocess(txt_path, client, model, prompt_override=None, rename=True,
     else:
         # 组装带 YAML frontmatter 的结构化纯文本 md（无图/json，归 Obsidian 知识库）
         # 自适应报纸/期刊：字段统一预留，空的留空；type 按引用串 [N]/[J] 自动判定。
-        if "[J]" in ref:
+        if carrier == "journal":
+            type_tag = "journal_ocr"
+        elif carrier == "newspaper":
+            type_tag = "newspaper_ocr"
+        elif "[J]" in ref:
             type_tag = "journal_ocr"
         else:
-            type_tag = "newspaper_ocr"   # 默认报纸（无 [J] 即按报纸处理）
+            type_tag = "newspaper_ocr"   # 默认报纸（无声明且无 [J] 即按报纸处理）
         yf = [
             "---",
             f'title: "{title}"',
@@ -676,6 +693,7 @@ def postprocess(txt_path, client, model, prompt_override=None, rename=True,
             f'author: "{author}"' if author else 'author: ""',
             f'reference: "{ref}"',
             "tags: [" + ", ".join(tags) + "]",
+            f'carrier_declared: "{carrier or ""}"',
             f"type: {type_tag}",
             "---",
             "",
@@ -768,7 +786,7 @@ def _extract_journal_meta(ref, fmt):
         if mv:
             seg = mv.group(1)
             vm = re.search(r"(\d+)\s*卷", seg)
-            im = re.search(r"(\d+)\s*期", seg)
+            im = re.search(r"([\d/]+)\s*期", seg)
             if vm:
                 res["volume"] = vm.group(1)
             if im:
@@ -787,13 +805,13 @@ def _extract_journal_meta(ref, fmt):
         if mv:
             seg = mv.group(1).strip()
             vm = re.search(r"(\d+)\s*\(", seg)
-            im = re.search(r"\(\s*(\d+)\s*\)", seg)
+            im = re.search(r"\(\s*([\d/]+)\s*\)", seg)
             if vm:
                 res["volume"] = vm.group(1)
             if im:
                 res["issue"] = im.group(1)
-            elif re.search(r"^\s*(\d+)\s*$", seg):
-                res["issue"] = seg.strip()        # 无卷仅期，如 (4) 已含括号被 im 命中；此处兜底纯数字
+            elif re.search(r"^\s*([\d/]+)\s*$", seg):
+                res["issue"] = seg.strip()        # 无卷仅期，如 (4) 已含括号被 im 命中；此处兜底纯数字；合刊 (63/64) 亦兼容
         mp = re.search(r":\s*([\d\-—]+)\.", ref)
         if mp:
             res["pages"] = mp.group(1)
@@ -820,7 +838,7 @@ def _read_kb_struct(path):
     t = open(path, encoding="utf-8").read()
     d = {}
     for key in ("title", "author", "date", "edition", "newspaper",
-                "journal", "volume", "issue", "pages", "type", "reference"):
+                "journal", "volume", "issue", "pages", "type", "carrier_declared", "reference"):
         m = re.search(rf"^{key}:\s*(.*)$", t, re.M)
         if m:
             v = m.group(1).strip()
@@ -948,7 +966,12 @@ def rebuild_ref(txt_path, fmt="gb7714", kt=False):
     #   1) 优先 kb frontmatter 的 type 字段（权威）；
     #   2) 否则从引用串特征判定：gb7714 看 [J]/[N]；《历史研究》无类型标识，期刊含「期」、报纸含「版」。
     ctype = struct.get("type", "")
-    if ctype == "journal_ocr":
+    declared = struct.get("carrier_declared", "")
+    if declared == "journal":
+        carrier_type = "journal"
+    elif declared == "newspaper":
+        carrier_type = "newspaper"
+    elif ctype == "journal_ocr":
         carrier_type = "journal"
     elif ctype == "newspaper_ocr":
         carrier_type = "newspaper"
@@ -1023,6 +1046,10 @@ def main():
                     help="来源补充·出版日期 YYYY-MM-DD；覆盖 date 占位符")
     ap.add_argument("--src-page", default=None,
                     help="来源补充·版次（数字即可）；覆盖 page 占位符（即 frontmatter 的 edition）")
+    ap.add_argument("--src-issue", default=None,
+                    help="来源补充·期刊期号（数字即可）；覆盖 issue 占位符（与报纸版次 page 区分，避免「第X期」被误当版次）")
+    ap.add_argument("--src-carrier", default=None, choices=("journal", "newspaper"),
+                    help="来源补充·显式载体类型声明：journal=期刊[J] / newspaper=报纸[N]；强制覆盖模型自判断")
     ap.add_argument("--citation-format", default="gb7714", choices=("gb7714", "history_research"),
                     help="引用格式：gb7714=GB/T 7714-2015（默认）；history_research=《历史研究》注释规范")
     ap.add_argument("--keep-traditional", action="store_true",
@@ -1086,6 +1113,7 @@ def main():
             postprocess(tp, client, model, prompt_override=args.prompt_post_plain,
                         rename=False, timing_root=args.root, mode="plain",
                         src_name=args.src_name, src_date=args.src_date, src_page=args.src_page,
+                        src_issue=args.src_issue, carrier=args.src_carrier,
                         citation_format=args.citation_format, keep_traditional=args.keep_traditional)
         else:
             md_path = os.path.splitext(tp)[0] + "_题录.md"
@@ -1095,6 +1123,7 @@ def main():
             postprocess(tp, client, model, prompt_override=args.prompt_post,
                         rename=not args.no_rename, timing_root=args.root, mode="kb",
                         src_name=args.src_name, src_date=args.src_date, src_page=args.src_page,
+                        src_issue=args.src_issue, carrier=args.src_carrier,
                         citation_format=args.citation_format, keep_traditional=args.keep_traditional)
 
 

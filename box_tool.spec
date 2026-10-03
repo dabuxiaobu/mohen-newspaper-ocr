@@ -67,6 +67,15 @@ a.hiddenimports += _opencc_hidden
 # webview 子模块（Edge WebView2 后端）运行时动态加载，需递归收集
 a.hiddenimports += collect_submodules('webview')
 
+# pypdfium2 的整页渲染回退依赖原生 pdfium 二进制（pdfium.dll），
+# 仅放 hiddenimports 不足以让 PyInstaller 收集该 dll（曾导致 3.0.1 打包态
+# pdfium 回退静默失败）。照 opencc 写法强制 collect_all 收集 dll + 版本文件。
+_pf_datas, _pf_bins, _pf_hidden = collect_all("pypdfium2")
+a.datas += [(os.path.join(d, os.path.basename(s)), s, "DATA")
+            for s, d in _pf_datas if os.path.isfile(s)]
+a.binaries += _pf_bins
+a.hiddenimports += _pf_hidden
+
 pyz = PYZ(a.pure)
 
 exe = EXE(
