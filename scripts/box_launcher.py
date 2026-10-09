@@ -34,7 +34,7 @@ import webbrowser
 import ctypes
 import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 from functools import partial
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -151,7 +151,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "3.0.2"
+VERSION = "3.1.0"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -426,6 +426,7 @@ SYSTEM_PROMPT = """你是近代文献（图书、期刊、报纸等）OCR 与转
 SINGLE_INSTRUCTION = """这是民国竖排报纸中的一篇文章（出处：{src}）。
 请你完成该篇文章的转录：
 1. 图中文字多为竖排繁体，按「从右到左逐列、每列从上到下」的顺序读取；若遇横排（左起或右起）按实际阅读方向读，严禁按图像像素行机械拼接。
+   **必须完整读满全图**：竖排的阅读起点即图像最右侧的第一列，即使该列紧贴图像边缘、或字形被裁切得不完整，也必须逐字转录，严禁漏掉最右一列；横排起始端（左起为最左列、右起为最右列）同理不得漏读。宁可多读可疑字，不可整列跳过。
 2. 输出结构必须严格为三行，不要写其他前缀、分篇标记或说明：
    标题：
    作者：
@@ -671,6 +672,41 @@ def _translate_api_error(detail, status_code=None):
     return detail or "未知错误（未返回任何信息）"
 
 
+def _translate_net_error(e, base_url=""):
+    """把网络层异常（连接被远端中断 / 超时 / 域名解析失败）翻成可自行处置的中文提示。
+
+    典型场景：OCR Base URL 经图书馆 WebVPN 等代理网关转发时，单张整版裁切图
+    base64 后常达数 MB，中间节点往往直接掐断连接（WinError 10054 等）。此类
+    失败程序侧无从重试成功，只能给用户可执行的自救指引。
+
+    绝不吞掉原始报错，一律原样附在末尾。
+    """
+    raw = "%s: %s" % (type(e).__name__, e)
+    s = raw.lower()
+    if isinstance(e, (socket.timeout, TimeoutError)) or "timed out" in s or "10060" in s:
+        head = "连接超时"
+    elif (isinstance(e, ConnectionResetError) or "10054" in s or "reset" in s
+          or "aborted" in s or "refused" in s or "10061" in s):
+        head = "连接被远端中断"
+    elif "nodename" in s or "11004" in s or "dns" in s or "name resolution" in s:
+        head = "域名解析失败"
+    else:
+        head = "网络请求失败"
+    msg = (f"{head}（属网络链路问题，不是识别出错）：{raw}\n"
+           "常见原因：\n"
+           "  1. 网络 / 代理节点不稳定（多位用户反馈切换节点后即恢复正常）；\n"
+           "  2. OCR Base URL 经图书馆 WebVPN 等代理网关转发时，"
+           "单张整版裁切图 base64 后可达数 MB，中间节点会直接掐断连接。\n"
+           "解决办法（任选其一）：\n"
+           "  1. 切换网络节点、换 Wi-Fi 或重新联网后重试；\n"
+           "  2. 把 OCR Base URL 改回官方直连 https://dashscope.aliyuncs.com/compatible-mode/v1 测试；\n"
+           "  3. 仍失败请把这段提示反馈给开发者。")
+    bu = (base_url or "").lower()
+    if "vpn" in bu or "/https/" in bu or "webvpn" in bu:
+        msg += "\n提示：当前 OCR Base URL 填的是代理网关地址，建议先按第 2 条改用官方直连，以确认是否网关限制所致。"
+    return msg
+
+
 def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=None):
     import urllib.request
     import urllib.error
@@ -752,6 +788,10 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:600]
         raise RuntimeError(_translate_api_error(detail, e.code))
+    except OSError as e:
+        # URLError / 超时 / ConnectionResetError / RemoteDisconnected 均为 OSError 子类，
+        # 统一翻成可行动提示（详见 _translate_net_error）
+        raise RuntimeError(_translate_net_error(e, base_url))
     except KeyError:
         raise RuntimeError("响应缺少 choices[0].message.content，返回体：" +
                           json.dumps(j, ensure_ascii=False)[:400])
@@ -858,6 +898,171 @@ def _open_folder(path):
         return False
 
 
+# —— 轮次目录别名索引（配合「产物按标题改名」）——
+# 结构化完成后本轮目录会被改名为「文章标题」（单篇）或「来源名」（多篇），
+# 但前端与 rebuild_ref 仍按轮次基名（如 先驱第十五期(19230115)1_跨页）拼路径。
+# 这里在 output/{top}/ 下维护 .rounds.json：{轮次基名: 实际目录名}，
+# 供 _resolve_round_dir 反查。改名与索引写入由 postprocess.py 完成（见 _write_round_alias）。
+_ROUNDS_MAP = ".rounds.json"
+
+
+def _read_rounds(top_dir):
+    p = os.path.join(top_dir, _ROUNDS_MAP)
+    try:
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    return {}
+
+
+def _resolve_round_dir(parent_dir, round_base):
+    """把轮次基名解析为该轮的真实目录路径。
+
+    优先命中改名后的目录（.rounds.json 别名索引），其次回退到未改名的同名目录。
+    """
+    real = _read_rounds(parent_dir).get(round_base)
+    if real:
+        cand = os.path.join(parent_dir, real)
+        if os.path.isdir(cand):
+            return cand
+    plain = os.path.join(parent_dir, round_base)
+    return plain if os.path.isdir(plain) else plain
+
+
+def _find_renamed_ocr(round_dir, ocr_base):
+    """在轮次目录里按 .rename_map.json 反查改名后的 OCR txt（ocr_{标题}.txt）路径。"""
+    try:
+        mp = os.path.join(round_dir, ".rename_map.json")
+        if not os.path.isfile(mp):
+            return None
+        with open(mp, encoding="utf-8") as f:
+            m = json.load(f)
+        stem = m.get(ocr_base) if isinstance(m, dict) else None
+        if not stem:
+            return None
+        for fn in os.listdir(round_dir):
+            if fn == ("ocr_" + stem + ".txt"):
+                return os.path.join(round_dir, fn)
+    except Exception:
+        pass
+    return None
+
+
+def _find_round_dir_by_map(top_dir, round_base):
+    """按各目录下的 .rename_map.json 是否登记了本轮基名，反查本轮被改名后的真实目录。
+
+    .rounds.json 缺失或写入失败时的兜底：.rename_map.json 的键就是 OCR 基名（跨页单篇即轮次基名）。
+    只在 top_dir 的直接子目录里找，且要求该映射表登记的标题与目录名一致（改名已完成）。
+    """
+    if not os.path.isdir(top_dir):
+        return None
+    try:
+        for fn in os.listdir(top_dir):
+            d = os.path.join(top_dir, fn)
+            if not os.path.isdir(d):
+                continue
+            mp = os.path.join(d, ".rename_map.json")
+            if not os.path.isfile(mp):
+                continue
+            with open(mp, encoding="utf-8") as f:
+                m = json.load(f)
+            if not isinstance(m, dict):
+                continue
+            for k, v in m.items():
+                if k == round_base and isinstance(v, str) and v and v == fn:
+                    return d
+    except Exception:
+        pass
+    return None
+
+
+def _locate_ocr_txt(out_root, top_root, out_dir, ocr_base):
+    """定位某篇的 OCR txt 路径（兼容结构化产物/目录已按标题改名的情况）。
+
+    查找顺序：
+      1. output/{out_dir}/{基名}.txt                —— 未改名的原始布局
+      2. output/{out_dir}/ocr_{标题}.txt             —— 同目录已改名
+      3. output/{top}/[.rounds.json 映射到的目录]/…  —— 目录已改名（先按别名索引，再全扫）
+    找不到返回 None。
+    """
+    names = [ocr_base + ".txt"]
+    def _try(d):
+        for n in names:
+            p = os.path.join(d, n)
+            if os.path.isfile(p):
+                return p
+        alt = _find_renamed_ocr(d, ocr_base)
+        return alt or None
+    # 1/2：out_dir 指定的目录（原始布局或同目录改名）
+    cands = []
+    if out_dir:
+        cands.append(os.path.join(out_root, out_dir))
+    else:
+        cands.append(out_root)
+    # 3：output/{top}/ 下按轮次别名索引定位改名后的目录
+    rb = os.path.splitext(os.path.basename(out_dir or ocr_base))[0]
+    real = _read_rounds(top_root).get(rb)
+    if real:
+        cands.append(os.path.join(top_root, real))
+    # 兜底：扫 output/{top}/ 下所有目录（别名索引缺失时仍能找到改名后的目录）
+    if os.path.isdir(top_root):
+        for fn in sorted(os.listdir(top_root)):
+            p = os.path.join(top_root, fn)
+            if os.path.isdir(p) and p not in cands:
+                cands.append(p)
+    seen = set()
+    for d in cands:
+        ap = os.path.abspath(d)
+        if ap in seen:
+            continue
+        seen.add(ap)
+        r = _try(d)
+        if r:
+            return r
+    return None
+
+
+def _clean_renamed_stale(work):
+    """删除 work 目录里上一轮「按标题改名」留下的旧 OCR txt/json，避免与新一轮并存。
+
+    依据 .rename_map.json 的 {旧基名: 标题} 反查出 ocr_{标题}.txt / {标题}.json（含加序号的
+    (2)(3) 变体）。映射表本身保留（重建时覆盖）。返回被删文件名列表。
+    """
+    removed = []
+    mp = os.path.join(work, ".rename_map.json")
+    if not os.path.isfile(mp):
+        return removed
+    try:
+        with open(mp, encoding="utf-8") as f:
+            m = json.load(f)
+        if not isinstance(m, dict):
+            return removed
+        stems = set(v for v in m.values() if isinstance(v, str) and v)
+        for fn in os.listdir(work):
+            hit = False
+            for s in stems:
+                for pat in ("ocr_" + s, s):
+                    if fn == pat + ".txt" or fn == pat + ".json" or \
+                       (fn.startswith(pat + "(") and fn.endswith((".txt", ".json"))):
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                try:
+                    os.remove(os.path.join(work, fn))
+                    removed.append(fn)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return removed
+
+
 def _gather_round(out_root, work, pages, old_cross_dir):
     """结构化前把该轮 OCR 产物（整版原图 + .txt + .json）从 output/ 根或旧跨页目录
     收拢进 work（output/{top}/{轮次基名}/）。目标已存在则跳过，避免覆盖。
@@ -896,8 +1101,8 @@ def _gather_round(out_root, work, pages, old_cross_dir):
                            and ext in (".txt", ".json")
                 if (base not in bases) and not is_split:
                     continue
-                # 只收拢该轮的原图/ocr txt/ocr json（排除已结构化的 _题录.md 与 结构化_*.txt）
-                if fn.endswith("_题录.md") or fn.startswith("结构化_"):
+                # 只收拢该轮的原图/ocr txt/ocr json（排除已结构化的 _题录.md / 题录_*.md 与 结构化_*.txt）
+                if fn.endswith("_题录.md") or fn.startswith("结构化_") or fn.startswith("题录_"):
                     continue
                 if ext not in IMG_EXTS and ext != ".txt" and ext != ".json":
                     continue
@@ -1065,11 +1270,14 @@ class Handler(BaseHTTPRequestHandler):
             sub = qs.get("dir", ["cropped_hi"])[0]
             fp = os.path.join(_img_dir(sub), name)
             if not os.path.exists(fp):
-                # 前端 pname 已去扩展名，自动补 .png 兜底
-                cand = fp + ".png"
-                if os.path.exists(cand):
-                    fp = cand
-                else:
+                # 前端 pname 已去扩展名，自动补扩展名兜底（新版整版图为 .jpg，旧版为 .png）
+                fp = None
+                for _e in (".jpg", ".jpeg", ".png"):
+                    cand = os.path.join(_img_dir(sub), name + _e)
+                    if os.path.exists(cand):
+                        fp = cand
+                        break
+                if fp is None:
                     return self._send(404, "not found")
             ext = os.path.splitext(fp)[1].lower()
             mime = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -1091,10 +1299,13 @@ class Handler(BaseHTTPRequestHandler):
                     deg = 90
                 fp = os.path.join(_img_dir(sub), name)
                 if not os.path.exists(fp):
-                    cand = fp + ".png"
-                    if os.path.exists(cand):
-                        fp = cand
-                    else:
+                    fp = None
+                    for _e in (".jpg", ".jpeg", ".png"):
+                        cand = os.path.join(_img_dir(sub), name + _e)
+                        if os.path.exists(cand):
+                            fp = cand
+                            break
+                    if fp is None:
                         return self._send(404, "not found")
                 from PIL import Image
                 with Image.open(fp) as im:
@@ -1111,7 +1322,7 @@ class Handler(BaseHTTPRequestHandler):
                     if fmt == "PNG":
                         rot.save(tmp, format="PNG", compress_level=1)
                     elif fmt == "JPEG":
-                        rot.save(tmp, format="JPEG", quality=95)
+                        rot.save(tmp, format="JPEG", quality=95, subsampling=0)
                     else:
                         rot.save(tmp, format=fmt)
                     os.replace(tmp, fp)
@@ -1148,6 +1359,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         u = urlparse(self.path)
+        # 大文件分块上传走原始二进制（不经 base64/JSON），必须在读 body 之前分流，
+        # 否则下面 json.loads 会把整块二进制当文本解析导致失败+内存暴涨。
+        if u.path == "/api/import_chunk":
+            return self._import_source_chunk()
         try:
             ln = int(self.headers.get("Content-Length", 0))
             raw = self.rfile.read(ln) if ln else b""
@@ -1223,9 +1438,14 @@ class Handler(BaseHTTPRequestHandler):
                 if not src:
                     return self._json({"ok": False, "error": "缺少 source_name"})
                 out_root = _img_dir("output")
-                if out_dir:
-                    out_root = os.path.join(out_root, out_dir)
-                txt_path = os.path.join(out_root, src + ".txt")
+                pm = (data.get("mode") or "plain").strip() or "plain"
+                top_root = os.path.join(out_root, KB_DIR if pm != "plain" else PLAIN_DIR)
+                # 目录已按标题/来源名改名（见 postprocess.py finalize_round），
+                # 原轮次名路径已不存在 —— 按 .rounds.json 别名索引与 .rename_map.json 双层反查。
+                txt_path = _locate_ocr_txt(out_root, top_root, out_dir, src)
+                if not txt_path:
+                    return self._json({"ok": False,
+                                       "error": "未找到该篇的 OCR 文本（目录已改名且映射表缺失，请重新结构化一次）"})
                 cfg, _ = _load_cfg()
                 fmt = cfg.get("CITATION_FORMAT", "gb7714")
                 kt = bool(cfg.get("KEEP_TRADITIONAL", False))
@@ -1258,7 +1478,10 @@ class Handler(BaseHTTPRequestHandler):
                 res = do_ocr(data.get("image_b64", ""), data.get("src", ""),
                              ov_prompt, data.get("overrides") or {}, label=data.get("label") or None)
             except Exception as e:
-                return self._json({"ok": False, "error": f"{type(e).__name__}: {e}"})
+                _err = f"{type(e).__name__}: {e}"
+                if _err.startswith("RuntimeError: "):
+                    _err = _err[len("RuntimeError: "):]   # 友好提示自带前缀，去掉冗余类型名
+                return self._json({"ok": False, "error": _err})
             if isinstance(res, dict):
                 return self._json({"ok": True, "text": res.get("text", ""), "usage": res.get("usage", {})})
             return self._json({"ok": True, "text": res, "usage": {}})
@@ -1464,6 +1687,90 @@ class Handler(BaseHTTPRequestHandler):
         ok = _open_folder(path)
         return self._json({"ok": ok, "path": path})
 
+    def _import_source_chunk(self):
+        """大文件分块上传：请求体是原始二进制块，逐块追加到 source/.upload/<name>.part，
+        收齐后原子改名到 source/<name> 并登记导入顺序。
+
+        为什么不用 base64+JSON：178MB 文件走那条路时，浏览器侧要同时持有
+        ArrayBuffer + 二进制字符串 + base64 字符串 + JSON 文本（峰值约 1GB），
+        服务端再解码一遍（峰值约 0.9GB），两端都会 Out of Memory。
+        分块二进制直传把峰值压到单块大小（8MB），2GB 级 PDF 也能导。
+        """
+        try:
+            name = unquote(self.headers.get("X-Mh-Name") or "").strip()
+            idx = int(self.headers.get("X-Mh-Chunk") or "0")
+            total = int(self.headers.get("X-Mh-Total") or "0")
+            size = int(self.headers.get("X-Mh-Size") or "0")
+            ln = int(self.headers.get("Content-Length", 0))
+        except Exception:
+            return self._json({"ok": False, "error": "分块头无效"})
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            return self._json({"ok": False, "error": "文件名非法"})
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff", ".gif", ".pdf"}:
+            return self._json({"ok": False, "error": "不支持的文件类型：" + ext})
+        if total <= 0 or idx < 0 or idx >= total:
+            return self._json({"ok": False, "error": "分块序号非法"})
+        src_dir = _img_dir("source")
+        tmp_dir = os.path.join(src_dir, ".upload")
+        os.makedirs(tmp_dir, exist_ok=True)
+        part = os.path.join(tmp_dir, name + ".part")
+        dst = os.path.join(src_dir, name)
+        try:
+            mode = "wb" if idx == 0 else "ab"
+            got = 0
+            with open(part, mode) as f:
+                # 流式落盘：读一块写一块，不把整个 body 读进内存
+                while got < ln:
+                    chunk = self.rfile.read(min(1 << 20, ln - got))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+            last = (idx == total - 1)
+            if last:
+                # 校验实际落盘字节数与前端声明一致（防传输截断产出半个文件）
+                real = os.path.getsize(part)
+                if size and real != size:
+                    os.remove(part)
+                    return self._json({"ok": False,
+                                       "error": "上传不完整（收到 %d / 声明 %d 字节），已丢弃临时文件，请重试。" % (real, size)})
+                os.replace(part, dst)
+        except Exception as e:
+            try:
+                if os.path.isfile(part) and idx != total - 1:
+                    os.remove(part)
+            except Exception:
+                pass
+            return self._json({"ok": False, "error": "写入失败：" + str(e)})
+        if not last:
+            return self._json({"ok": True, "done": False, "received": idx + 1, "total": total})
+        # 登记导入顺序（与 _import_source 共用 .import_order.json）
+        try:
+            op = os.path.join(src_dir, ".import_order.json")
+            od = []
+            if os.path.isfile(op):
+                try:
+                    od = json.load(open(op, encoding="utf-8")).get("order", [])
+                except Exception:
+                    od = []
+            _exist = set(os.listdir(src_dir))
+            od = [n for n in od if n in _exist]
+            if name not in od:
+                od.append(name)
+            with open(op, "w", encoding="utf-8") as _f:
+                json.dump({"order": od}, _f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+        # 临时目录清空（只回收本次遗留的 .part，忽略其他并发上传）
+        try:
+            if not os.listdir(tmp_dir):
+                os.rmdir(tmp_dir)
+        except Exception:
+            pass
+        return self._json({"ok": True, "done": True, "written": [name], "skipped": [],
+                           "source_dir": src_dir, "count": 1, "bytes": size})
+
     def _import_source(self, data):
         files = data.get("files", [])
         if not files:
@@ -1624,6 +1931,22 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
         except FileNotFoundError:
+            pass
+        # 回收大文件分块上传的中断残留：.upload/ 下超过 1 小时未改动的 .part
+        # （上传中途关窗/断网会留下半个大文件）。刚写入的块 mtime 是新的，不会被误删。
+        try:
+            up = os.path.join(d, ".upload")
+            now = time.time()
+            for fn in os.listdir(up):
+                fp = os.path.join(up, fn)
+                if os.path.isfile(fp) and fn.endswith(".part") and (now - os.path.getmtime(fp)) > 3600:
+                    try:
+                        os.remove(fp)
+                    except Exception:
+                        pass
+            if not os.listdir(up):
+                os.rmdir(up)
+        except Exception:
             pass
         return self._json({"ok": True, "removed": removed, "count": len(removed)})
 
@@ -2057,23 +2380,34 @@ class Handler(BaseHTTPRequestHandler):
             # 该轮单独子文件夹：跨页=跨页基名，单页=整版名（均置于 output/{top}/ 下）
             round_dir = (data.get("out_dir") or "").strip() or (
                 os.path.splitext(pages[0])[0] or "未命名")
-            work = os.path.join(_img_dir("output"), top, round_dir)
+            top_root = os.path.join(_img_dir("output"), top)
+            # 上一轮结构化后目录已按标题/来源名改名，此处按别名索引解析回真实目录，
+            # 保证「隔天重识别同一批图」再次结构化时写回同一目录、而不是新建一个。
+            work = _resolve_round_dir(top_root, round_dir)
             # 把该轮 OCR 产物（整版原图 + .txt + .json）从 output/ 根 / 旧跨页目录收拢进 work
             moved, skipped = _gather_round(_img_dir("output"), work, pages, data.get("out_dir") or "")
             if not moved and not skipped:
                 # 没有任何可结构化产物，不创建空目录、不调用 postprocess.py
                 return self._json({"ok": True, "stdout": "该工作集没有可结构化的 OCR 产物（未生成 .txt / .json / 原图），未创建输出文件夹。", "skipped": True})
             # 重新结构化（如隔天重识别同一批图）：先清掉 work 里上一轮已生成的产品
-            # （_题录.md / 结构化_*.txt）。否则 postprocess.py 检测到产物已存在会 skip，
+            # （_题录.md / 题录_*.md / 结构化_*.txt）。否则 postprocess.py 检测到产物已存在会 skip，
             # 导致重识别后的新 OCR 无法重新生成题录，产物内容停留在旧版——one-click 导出
             # 复制到的仍是旧内容。清理后 postprocess 必重新调用模型生成最新产物。
+            # 改名后产物前缀变为 题录_{标题}.md（纯文本仍是 结构化_{标题}.txt），两者都要清。
             if os.path.isdir(work):
                 for _fn in os.listdir(work):
-                    if _fn.endswith("_题录.md") or _fn.startswith("结构化_"):
+                    if (_fn.endswith("_题录.md") or _fn.startswith("结构化_")
+                            or _fn.startswith("题录_")):
                         try:
                             os.remove(os.path.join(work, _fn))
                         except OSError:
                             pass
+            # 清理上一轮改名产物：postprocess 会把 OCR txt/json 改成 ocr_{标题}.txt / {标题}.json，
+            # 重新结构化时这些旧文件若不清，新一轮的 {轮次名}.txt / {轮次名}__{N}.txt 会与之并存，
+            # 导致同名标题产出「结构化_xxx(2).txt」这类重复文件。按 .rename_map.json 精确清理。
+            _stale = _clean_renamed_stale(work)
+            if _stale:
+                print("[清理] 上一轮改名产物 %d 个：%s" % (len(_stale), "、".join(_stale[:6])))
             extra = ["--root", work, "--post-mode", pmode]   # 串联断点修复：指向本工具 OCR 产物
             # 引用格式切换（GB/T 7714 ↔ 《历史研究》）与繁简转换开关：透传给 postprocess 子进程
             cf = (cfg.get("CITATION_FORMAT") or "gb7714").strip() or "gb7714"
@@ -2120,7 +2454,8 @@ class Handler(BaseHTTPRequestHandler):
                         for _fn in os.listdir(work):
                             if not _fn.endswith(".txt"):
                                 continue
-                            if _fn.startswith("结构化_") or _fn.endswith("_题录.md"):
+                            if _fn.startswith("结构化_") or _fn.endswith("_题录.md") \
+                                    or _fn.startswith("题录_") or _fn.startswith("ocr_"):
                                 continue
                             _fp = os.path.join(work, _fn)
                             try:
@@ -2150,9 +2485,23 @@ class Handler(BaseHTTPRequestHandler):
                 # 打开文件夹策略：
                 #  - no_open=True（单页逐版调用）：后端不打开，交由前端统一打开父目录 output/{top}（避免多子文件夹冲突）
                 #  - open_parent=True：打开 output/{top} 父目录（多子文件夹场景）
-                #  - 否则（跨页合并）：打开该轮合并子文件夹 work（维持原行为）
+                #  - 否则（跨页合并）：打开该轮子文件夹 work（维持原行为）
                 if not data.get("no_open"):
-                    open_target = os.path.dirname(work) if data.get("open_parent") else work
+                    if data.get("open_parent"):
+                        open_target = top_root
+                    else:
+                        # 目录改名回归修复：postprocess 在流程末尾把 work 改名为文章标题/来源名，
+                        # 上面解析出的 work 是改名前路径，os.path.isdir 判定必然为 False → 静默不弹窗。
+                        # 此处重新走一次别名索引（.rounds.json 此刻已写好）解析出改后的真实目录。
+                        open_target = _resolve_round_dir(top_root, round_dir)
+                        if not os.path.isdir(open_target):
+                            # 兜底一：.rounds.json 缺失/写失败时，按 .rename_map.json 里是否登记了本轮基名反查目录
+                            alt = _find_round_dir_by_map(top_root, round_dir)
+                            if alt:
+                                open_target = alt
+                    if not os.path.isdir(open_target):
+                        # 兜底二：仍定位不到就退回父目录，保证结构化后一定能看到产物（总比静默不弹窗好）
+                        open_target = top_root
                     if _open_folder(open_target):
                         res["opened_dir"] = open_target
             return self._json(res)
@@ -2217,7 +2566,7 @@ class Handler(BaseHTTPRequestHandler):
                 os.makedirs(out_root, exist_ok=True)
                 os.makedirs(cropped, exist_ok=True)   # 防御：子进程若因异常未创建，则本进程兜底
                 pngs = sorted(f for f in os.listdir(cropped)
-                              if f.lower().endswith(".png"))
+                              if f.lower().endswith((".png", ".jpg", ".jpeg")))
                 archived = 0; skipped = 0
                 for png in pngs:
                     dst_png = os.path.join(out_root, png)
@@ -2973,6 +3322,7 @@ let dragState = null; let uid = 1; let mode = 'auto'; let backendCfg = {};
 let allPageData = {}; let pageOrder = []; let pageList = []; let navList = []; let pageIdx = -1; let crossResults = {};
 let fileMtimes = {};   // 整版原图修改时间（秒），来自 /api/list_images 的 mtimes，供排序抽屉使用
 let mergeMode = 'single';
+// 跨页分篇策略由后端按「全工作集 title 框总数」自动判定，无前端开关：1 个 title → 合并续页；≥2 → 每版独立成篇
 let off = 0;
 
 const LBL_COLOR = { title:'#2563eb', text:'#16a34a', author:'#9333ea' };
@@ -3150,7 +3500,7 @@ cv.addEventListener('mousemove',e=>{ if(interactionMode==='pan' && panState){ co
 cv.addEventListener('mouseup',e=>{ if(interactionMode==='pan'){ panState=null; cv.style.cursor='grab'; return; }
   if(drawing){ const [x,y]=toNat(e); const x0=Math.min(drawing.x,x),y0=Math.min(drawing.y,y);
   const w=Math.abs(x-drawing.x),h=Math.abs(y-drawing.y); drawing=null;
-  if(w>5&&h>5){ const nb={id:uid++,label:$('lblSel').value,x:x0,y:y0,w,h,group:''}; boxes.push(nb); selectedId=nb.id; renderBoxList(); renderResults(); }
+  if(w>5&&h>5){ const nb={id:uid++,label:$('lblSel').value,x:x0,y:y0,w,h,group:''}; boxes.push(nb); selectedId=nb.id; recomputeCross(); renderBoxList(); renderResults(); }
   cur=null; draw(); return; } if(dragState){ dragState=null; draw(); } });
 // 右键点击框 / 控制点直接删除该框（无需去侧边栏点删除）
 cv.addEventListener('contextmenu',e=>{
@@ -3171,10 +3521,13 @@ document.addEventListener('keydown',e=>{
   if(e.key==='ArrowLeft'){ cw.scrollLeft-=120; e.preventDefault(); }
   else if(e.key==='ArrowRight'){ cw.scrollLeft+=120; e.preventDefault(); }
 });
+// 分篇判定依赖 title 框数量：框增删/改标签后必须重算跨页视图，否则判定用的是旧快照
+function recomputeCross(){ if(mergeMode!=='cross') return;
+  const cts=aggregateCrossTargets(); crossResults={}; for(const ct of cts){ crossResults[ct.key]=mergeCrossTarget(ct); } }
 function deleteBoxById(id){ let found=false;
   for(const pname in allPageData){ const arr=allPageData[pname].boxes; const i=arr.findIndex(b=>b.id===id); if(i>=0){ arr.splice(i,1); found=true; break; } }
   if(!found){ const i=boxes.findIndex(b=>b.id===id); if(i>=0) boxes.splice(i,1); }
-  if(selectedId===id)selectedId=null; renderBoxList(); renderResults(); draw(); }
+  if(selectedId===id)selectedId=null; recomputeCross(); renderBoxList(); renderResults(); draw(); }
 // 跨页展平：按 pageOrder 阅读顺序列出各页框，连续编号；返回每项含 box / pageName / localIdx / globalIdx
 function flattenBoxes(){ const list=[]; let g=0;
   for(const pname of pageOrder){ const arr=(allPageData[pname]&&allPageData[pname].boxes)||[];
@@ -3205,11 +3558,11 @@ function renderBoxList(){ const el=$('boxList');
         <button class="mini sec" data-up="${v.localIdx}" data-page="${esc(v.pageName)}">↑ 上移</button><button class="mini sec" data-dn="${v.localIdx}" data-page="${esc(v.pageName)}">↓ 下移</button>
         <button class="mini" data-loc="${b.id}">定位</button><button class="mini stop" data-del="${b.id}">✕ 删除</button>
       </div>`; el.appendChild(d); });
-  el.querySelectorAll('select').forEach(s=>s.onchange=e=>{ const pg=e.target.dataset.page, i=+e.target.dataset.idx; pageArr(pg)[i].label=e.target.value; draw(); renderResults(); renderBoxList(); });
-  el.querySelectorAll('input.grp').forEach(inp=>inp.onchange=e=>{ const pg=e.target.dataset.page, i=+e.target.dataset.idx; pageArr(pg)[i].group=e.target.value.trim(); renderBoxList(); draw(); renderResults(); });
+  el.querySelectorAll('select').forEach(s=>s.onchange=e=>{ const pg=e.target.dataset.page, i=+e.target.dataset.idx; pageArr(pg)[i].label=e.target.value; recomputeCross(); draw(); renderResults(); renderBoxList(); });
+  el.querySelectorAll('input.grp').forEach(inp=>inp.onchange=e=>{ const pg=e.target.dataset.page, i=+e.target.dataset.idx; pageArr(pg)[i].group=e.target.value.trim(); recomputeCross(); renderBoxList(); draw(); renderResults(); });
   el.querySelectorAll('[data-del]').forEach(b=>b.onclick=e=>{ deleteBoxById(+e.target.dataset.del); });
-  el.querySelectorAll('[data-up]').forEach(b=>b.onclick=e=>{ const i=+e.target.dataset.up, pg=e.target.dataset.page; const arr=pageArr(pg); if(i>0){[arr[i-1],arr[i]]=[arr[i],arr[i-1]];renderBoxList();draw();} });
-  el.querySelectorAll('[data-dn]').forEach(b=>b.onclick=e=>{ const i=+e.target.dataset.dn, pg=e.target.dataset.page; const arr=pageArr(pg); if(i<arr.length-1){[arr[i],arr[i+1]]=[arr[i+1],arr[i]];renderBoxList();draw();} });
+  el.querySelectorAll('[data-up]').forEach(b=>b.onclick=e=>{ const i=+e.target.dataset.up, pg=e.target.dataset.page; const arr=pageArr(pg); if(i>0){[arr[i-1],arr[i]]=[arr[i],arr[i-1]];recomputeCross();renderBoxList();draw();} });
+  el.querySelectorAll('[data-dn]').forEach(b=>b.onclick=e=>{ const i=+e.target.dataset.dn, pg=e.target.dataset.page; const arr=pageArr(pg); if(i<arr.length-1){[arr[i],arr[i+1]]=[arr[i+1],arr[i]];recomputeCross();renderBoxList();draw();} });
   el.querySelectorAll('[data-loc]').forEach(b=>b.onclick=e=>{ locateBox(+e.target.dataset.loc); }); }
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
@@ -3239,17 +3592,31 @@ function getOcrTargets(bs){ bs=bs||boxes;
     const label = g.isAuto ? (boxesOf.length>1 ? g.key.replace('auto:','') : boxesOf[0].label) : ('group:'+g.group);
     return {key:g.key,boxes:boxesOf,group:g.group||'',label,auto:g.isAuto?g.key.replace('auto:',''):''}; }); }
 
+// 跨页拆分策略（后端自动判定，无需用户选择）：
+//   「单框无 title」在数据上无法区分「续页」与「独立文章」，故改用「全工作集 title 框总数」判定——
+//   标题是分篇的唯一语义信号：只有 1 个 title 说明整组版本讲的是同一篇文章（跨页续页），
+//   此时全部并入该篇；有 ≥2 个 title 说明是多篇独立文章，此时每版各自成篇。
+function countTitleBoxes(){
+  let n=0;
+  for(const pname of pageOrder){ const pd=allPageData[pname]; if(!pd) continue;
+    for(const b of (pd.boxes||[])) if(b.label==='title') n++; }
+  return n; }
+// 判定结果缓存：仅在框集合变化时重算，避免每次聚合重复遍历
+let _splitCache={n:-1,mode:'auto'};
+function autoCrossSplitMode(){
+  const n=countTitleBoxes();
+  if(n!==_splitCache.n){ _splitCache={n, mode:(n>=2?'perpage':'auto')}; }
+  return _splitCache.mode; }
 // 跨页聚合：把 pageOrder 中各页的框/识别结果按阅读顺序合并。
-// 同 group 跨页合成一篇；单页模式每版独立成篇。
-// 跨页拆分规则（方案 A）：
-//   ① 显式组 group → 跨页合成一篇（cross:group）；
+// 单页模式每版独立成篇；跨页模式按下列规则：
+//   ① 显式组 group → 跨页合成一篇（cross:group，优先级最高）；
 //   ② 某版 ≥2 组（多标题）→ 按版各自成篇（crossauto，逐版拆分，不互并）；
-//   ③ 某版仅 1 组且含 title 框 → 该版独立成一篇（crossauto，每版一篇新文章）；
-//   ④ 某版仅 1 组且无 title 框（续页）→ 并入阅读顺序中前一篇（prevArticleKey），
-//      实现"一篇文章跨版续页"而不是所有续页互相合并；开头即无标题则落到 __cross_default__ 兜底。
+//   ③ 全工作集仅 1 个 title（一篇文章跨多版）→ 无 title 的版并入阅读顺序中前一篇（prevArticleKey）；
+//   ④ 全工作集 ≥2 个 title（多篇独立文章）→ 每版独立成篇。
 function aggregateCrossTargets(){
   if(!pageOrder.length) return getOcrTargets().map(t=>({...t,pageTargets:[{pname:srcName,t}]}));
   const groups=new Map();
+  const splitPerPage=(autoCrossSplitMode()==='perpage');
   let prevArticleKey=null; // 最近一个"已成篇"文章的 key，续页并入它
   for(const pname of pageOrder){
     const pd=allPageData[pname]; if(!pd) continue;
@@ -3257,16 +3624,16 @@ function aggregateCrossTargets(){
     for(const t of ts){
       let k,label,isArticle=false;
       if(mergeMode!=='cross'){
-        // 单页模式：每版每框强制独立成篇，key 必带版名，绝不跨页合并文本
+        // 单页模式：分篇边界落在版内（按 group / 标题切分成若干篇），key 必带版名，绝不跨页合并
         k='page:'+pname+':'+t.key; label=t.group?('group:'+t.group):t.label; isArticle=true;
       } else {
         if(t.group){ k='cross:'+t.group; label='group:'+t.group; isArticle=true; }
-        else if(ts.length>1){ k='crossauto:'+pname+':'+t.key; label=t.label; isArticle=true; } // 每版多文：按标题拆分，各版各自成篇
+        else if(ts.length>1||splitPerPage){ k='crossauto:'+pname+':'+t.key; label=t.label; isArticle=true; } // 每版多文 / 多篇独立文章→逐版独立成篇
         else {
           const hasTitle=(t.boxes||[]).some(b=>b.label==='title');
-          if(hasTitle){ k='crossauto:'+pname+':'+t.key; label=t.label; isArticle=true; } // 每版一篇且有标题→独立成篇
+          if(hasTitle){ k='crossauto:'+pname+':'+t.key; label=t.label; isArticle=true; } // 唯一的 title 所在版→独立成篇
           else {
-            // 无标题续页：并入阅读顺序中前一篇；无前文则落 __cross_default__ 兜底
+            // 无标题续页：并入阅读顺序中前一篇；无前文则落__cross_default__ 兜底
             if(prevArticleKey){ k=prevArticleKey; label=groups.get(prevArticleKey).label; }
             else { k='__cross_default__'; label='跨页·续页（开头无标题）'; }
             isArticle=false;
@@ -3286,8 +3653,14 @@ function mergeCrossTarget(ct){
   for(const {pname,t} of ct.pageTargets){
     const pd=allPageData[pname]; if(!pd) continue;
     const item=resultToItem(pd.results[t.key]);
-    if(item.title && !title) title=item.title;
-    if(item.author && !author) author=item.author;
+    if(item.title){
+      if(!title) title=item.title;               // 首个非空作为标题
+      else bodies.push(item.title);              // 后续非空：绝不能丢，并入正文（跨页续页的题头即在此）
+    }
+    if(item.author){
+      if(!author) author=item.author;            // 首个非空作为作者
+      else bodies.push(item.author);             // 后续非空：并入正文，不静默丢弃
+    }
     if(item.body) bodies.push(item.body);
   }
   // 跨页拼接：若上一段末句未收尾（无句号/问号/叹号/引号收尾），说明是跨页续句，直接衔接不分段
@@ -3307,8 +3680,14 @@ function crossBaseName(){ return (pageOrder.length?pageOrder[0]:srcName).replace
 // 把后端返回的绝对路径转成相对运行时目录的简短显示（用于日志中「已打开…」）
 function osRel(p){ if(!p) return p; try{ const base=((window.__RUNTIME_DIR)||''); if(base && p.startsWith(base)) return 'output/'+p.slice(base.length).replace(/^[\\/]/,''); }catch(e){} return p; }
 
-async function ocrBox(b, im, nW, nH){ const oc=document.createElement('canvas'); oc.width=b.w; oc.height=b.h;
-  oc.getContext('2d').drawImage(im,b.x,b.y,b.w,b.h,0,0,b.w,b.h); const b64=oc.toDataURL('image/png').split(',')[1];
+// 裁切图四周补纯白缓冲边：竖排阅读起点永远贴右边缘，模型对紧贴图像边界的文字召回率偏低，
+// 常整列漏读（表现为「开头必丢一列」）。补边后贴边列离开图像边界，恢复正常识别。
+// 边距自适应：min(48, max(16, 4% × 长边))；纯白无内容，不引入噪声，源框坐标不变。
+function ocrPad(w,h){ return Math.min(48, Math.max(16, Math.round(0.04*Math.max(w,h)))); }
+async function ocrBox(b, im, nW, nH){ const P=ocrPad(b.w,b.h);
+  const oc=document.createElement('canvas'); oc.width=b.w+2*P; oc.height=b.h+2*P;
+  const octx=oc.getContext('2d'); octx.fillStyle='#fff'; octx.fillRect(0,0,oc.width,oc.height);
+  octx.drawImage(im,b.x,b.y,b.w,b.h,P,P,b.w,b.h); const b64=oc.toDataURL('image/png').split(',')[1];
   const r=await fetch('/api/ocr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_b64:b64,src:srcName,label:(b.label||''),overrides:getOverrides()})});
   const j=await r.json(); if(!j.ok) return {text:'[OCR_ERROR] '+(j.error||''), usage:{}}; return {text:j.text||'', usage:j.usage||{}}; }
 async function recognizeOneBox(b){ return ocrBox(b, img, natW, natH); }
@@ -3376,6 +3755,18 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
   const _pre=_prov.toUpperCase();
   const cfgModel=(backendCfg&&backendCfg.values&&backendCfg.values[_pre+'_MODEL'])||'';
   log('[识别全部] 已识别 '+okCount+' / '+boxedPages.length+' 版（共载入 '+pageOrder.length+' 版，跳过未框选 '+noBoxPages.length+' 版）'+(cross?'（跨页模式：按阅读顺序合并为一篇）':'（单页模式：每版独立）')+'。');
+  // 分篇清单：明确「每版是否都识别到了、内容归到哪一篇」，避免只看结果面板的文本框数量而误判漏识别
+  try{
+    const _cts=aggregateCrossTargets();
+    const _tn=countTitleBoxes();
+    log('[识别全部] 分篇结果：共 '+_cts.length+' 篇'+(cross&&_cts.length?('（工作集标题框 '+_tn+' 个 → '+(autoCrossSplitMode()==='perpage'?'判定为多篇独立文章，每版各自成篇':'判定为一篇文章跨多版，无标题的版并入前一篇')+'）'):''));
+    _cts.forEach((ct,i)=>{
+      const names=ct.pageTargets.map(pt=>pt.pname.replace(/\.[^.]+$/,''));
+      const nbox=ct.pageTargets.reduce((s,pt)=>s+((pt.t&&pt.t.boxes)?pt.t.boxes.length:0),0);
+      log('  第 '+(i+1)+' 篇 · '+(ct.label||'-')+' ← '+names.length+' 版 / '+nbox+' 框：'+names.join(' + '));
+    });
+    if(cross&&_cts.length===1&&boxedPages.length>1) log('[识别全部] 提示：7 版内容已合并成 1 篇。若每版其实是不同文章，请把「跨页分篇策略」改为「每版独立成篇」，或给各版框在「自动分组」里填不同组号。');
+  }catch(_e){ log('[识别全部] 分篇清单打印失败：'+_e); }
   if(failedPages.length) setOcrHint('识别完成，'+failedPages.length+' 版失败', false);
   else setOcrHint('识别完成 ✓（'+okCount+' 版）', true);
   log('[识别全部] 本次 OCR 消耗'+(cfgModel?'（'+cfgModel+'）':'')+' → 输入 '+ocrPt.toLocaleString()+' + 输出 '+ocrCt.toLocaleString()+' = 总 '+ocrTt.toLocaleString()+' tokens；OCR 接口耗时 '+ocrDur.toFixed(2)+'s，总耗时 '+wall+'s。');
@@ -3618,17 +4009,25 @@ function renderPerPageSrc(){
     _savedCarrierByPage[pg] = cs ? cs.value : 'newspaper';
   });
   if(!pageOrder.length){ box.innerHTML = '<p class="sub" style="margin:2px 0; color:var(--sub);">尚未载入工作集。载入后将按版显示来源输入框。</p>'; return; }
+  // 每版一行分两层：上层「第N版 + 完整版名」，下层「来源输入框 + 载体下拉」。
+  // 版名不再锁宽截断（多版同名 clipboard-* 时也能分辨）；输入框用单行 input，
+  // 避免 textarea 在窄栏里被压成竖缝、露出原生滚动条与缩放角。
   let html = '';
   pageOrder.forEach((pg, idx)=>{
     const s = _savedSrcByPage[pg] || '';
     const cv = _savedCarrierByPage[pg] || 'newspaper';
-    html += '<div class="pp-row" data-idx="'+idx+'" style="display:flex; align-items:flex-start; gap:8px; margin-bottom:6px;">'
-          + '<span style="flex:0 0 130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding-top:4px;" title="'+attrEsc(pg)+'">'+esc(pg)+'</span>'
-          + '<textarea class="pp-text" rows="2" placeholder="如：大公报 1943-01-17 第2版" style="flex:1; min-width:0; resize:vertical; box-sizing:border-box; font-family:inherit; font-size:13px; padding:4px 6px;">'+attrEsc(s)+'</textarea>'
-          + '<select class="pp-carrier" style="flex:0 0 auto; font-family:inherit; font-size:12.5px; padding:3px 4px;">'
-          +   '<option value="newspaper"'+(cv==='newspaper'?' selected':'')+'>报纸[N]</option>'
-          +   '<option value="journal"'+(cv==='journal'?' selected':'')+'>期刊[J]</option>'
-          + '</select>'
+    html += '<div class="pp-row" data-idx="'+idx+'" style="margin-bottom:8px;">'
+          + '<div style="display:flex; align-items:center; gap:6px; margin-bottom:3px;">'
+          +   '<span style="flex:0 0 auto; font-size:11px; color:var(--mut); background:#eef1f4; border:1px solid var(--bd); border-radius:4px; padding:0 5px; line-height:16px;">第'+(idx+1)+'版</span>'
+          +   '<span style="flex:1 1 auto; min-width:0; font-size:11.5px; color:var(--sub); overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="'+attrEsc(pg)+'">'+esc(pg)+'</span>'
+          + '</div>'
+          + '<div style="display:flex; align-items:center; gap:8px;">'
+          +   '<input class="pp-text" type="text" placeholder="如：大公报 1943-01-17 第2版" value="'+attrEsc(s)+'" style="flex:1 1 auto; min-width:0; font-family:inherit; font-size:13px; padding:4px 6px;">'
+          +   '<select class="pp-carrier" style="flex:0 0 104px; width:104px; font-family:inherit; font-size:12.5px; padding:3px 4px;">'
+          +     '<option value="newspaper"'+(cv==='newspaper'?' selected':'')+'>报纸[N]</option>'
+          +     '<option value="journal"'+(cv==='journal'?' selected':'')+'>期刊[J]</option>'
+          +   '</select>'
+          + '</div>'
           + '</div>';
   });
   box.innerHTML = html;
@@ -3823,27 +4222,63 @@ $('exportAll').onclick=()=>{
 $('prevPage').onclick=()=>gotoPage(pageIdx-1);
 $('nextPage').onclick=()=>gotoPage(pageIdx+1);
 $('importSource').onclick=()=>$('importSourceIn').click();
-const IMPORT_BATCH = 20;
+// 小文件走原来的 base64+JSON 批量通道（快、无兼容风险）；大文件必须走分块二进制直传。
+// 阈值 24MB：base64 通道的浏览器峰值约为文件的 5.7 倍，24MB≈137MB，仍在安全范围；
+// 超过则改用 /api/import_chunk，峰值仅单块 8MB，178MB / 2GB 都不会撑爆渲染进程。
+const IMPORT_SMALL_MAX = 24*1024*1024;
+const IMPORT_CHUNK = 8*1024*1024;
+// 超过此体积直接拒绝并给出处置建议（抽图阶段还要整页渲染进内存，过大易失败）
+const IMPORT_HARD_MAX = 2*1024*1024*1024;
+async function uploadBigFile(f){
+  const total=Math.ceil(f.size/IMPORT_CHUNK);
+  let last=0;
+  for(let i=0;i<total;i++){
+    const blob=f.slice(i*IMPORT_CHUNK, Math.min(f.size,(i+1)*IMPORT_CHUNK));
+    const buf=await blob.arrayBuffer();
+    const j=await (await fetch('/api/import_chunk',{method:'POST',
+      headers:{'Content-Type':'application/octet-stream','X-Mh-Name':encodeURIComponent(f.name),
+               'X-Mh-Chunk':String(i),'X-Mh-Total':String(total),'X-Mh-Size':String(f.size)},
+      body:buf})).json();
+    if(!j.ok) throw new Error(j.error||('第 '+(i+1)+' 块失败'));
+    last=i+1;
+    // 每完成约 10% 或最后一块报一次进度，避免逐块刷屏
+    if(last===total || last%Math.max(1,Math.ceil(total/10))===0){
+      const pct=Math.round(last/total*100);
+      log('[导入文件] '+esc(f.name)+' 分块上传 '+last+'/'+total+'（'+pct+'%）');
+    }
+    await new Promise(res=>setTimeout(res,0));   // 让出主线程，保持界面可响应
+  }
+  return last===total;
+}
 $('importSourceIn').onchange=async e=>{
   const files=Array.from(e.target.files||[]);
   if(!files.length)return;
   try{
+    // 体积预检：先拦下必然撑爆内存 / 抽图必失败的超大文件，给出可处置的提示
+    const tooBig=files.filter(f=>f.size>IMPORT_HARD_MAX);
+    const okFiles=files.filter(f=>f.size<=IMPORT_HARD_MAX);
+    if(tooBig.length){
+      log('[导入文件] 已跳过 '+tooBig.length+' 个超大文件（单个 > 2GB）：'+tooBig.map(f=>esc(f.name)).join('、'));
+      alert('以下文件超过 2GB，已跳过：\n\n'+tooBig.map(f=>'· '+f.name+'（'+(f.size/1073741824).toFixed(2)+' GB）').join('\n')+
+            '\n\n单个 PDF 的合理上限约 1GB（报纸单页合订本）。超过此体量请先用 PDF 工具拆分后再导入。');
+    }
     let okCount=0;
-    for(let s=0;s<files.length;s+=IMPORT_BATCH){
-      const slice=files.slice(s,s+IMPORT_BATCH);
-      const payload=[];
-      for(const f of slice){
-        const buf=await f.arrayBuffer();
-        const bytes=new Uint8Array(buf); const CH=0x8000; let bin='';
-        for(let i=0;i<bytes.length;i+=CH){ bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+CH)); }
-        payload.push({name:f.name,data:btoa(bin)});
+    // 大文件逐个分块上传（同一时刻内存里只有一个8MB 块）
+    for(const f of okFiles){
+      if(f.size>IMPORT_SMALL_MAX){
+        const mb=(f.size/1048576).toFixed(1);
+        log('[导入文件] '+esc(f.name)+'（'+mb+' MB）走分块上传通道，共 '+Math.ceil(f.size/IMPORT_CHUNK)+' 块…');
+        try{ if(await uploadBigFile(f)){ okCount++; log('[导入文件] 已写入 source/：'+esc(f.name)+'（'+mb+' MB）'); } }
+        catch(err){ log('[导入文件] 失败（'+esc(f.name)+'）：'+(err&&err.message||err)); }
+        continue;
       }
-      const segStart=s+1, segEnd=Math.min(s+IMPORT_BATCH,files.length);
-      log('[导入文件] 正在写入第 '+segStart+'–'+segEnd+' / '+files.length+' 个文件…');
-      const j=await (await fetch('/api/import_source',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({files:payload})})).json();
-      if(j.ok){ okCount+=j.count; log('[导入文件] 已写入 '+j.count+' 个文件到 source/：'+(j.written.join(', ')||'(无)')); if(j.skipped&&j.skipped.length)log('[导入文件] 跳过：'+j.skipped.join(', ')); }
-      else log('[导入文件] 失败：'+(j.error||''));
-      // 让出主线程：大批量导入时分批释放，避免 UI 假死与单包过大
+      const buf=await f.arrayBuffer();
+      const bytes=new Uint8Array(buf); const CH=0x8000; let bin='';
+      for(let i=0;i<bytes.length;i+=CH){ bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+CH)); }
+      const j=await (await fetch('/api/import_source',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({files:[{name:f.name,data:btoa(bin)}]})})).json();
+      if(j.ok){ okCount+=j.count; log('[导入文件] 已写入 '+j.count+' 个文件到 source/：'+(j.written.join(', ')||'(无)')); }
+      else log('[导入文件] 失败（'+esc(f.name)+'）：'+(j.error||''));
       await new Promise(res=>setTimeout(res,0));
     }
     log('[导入文件] 全部完成，共导入 '+okCount+' 个文件');

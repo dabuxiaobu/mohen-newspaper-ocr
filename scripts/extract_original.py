@@ -30,6 +30,8 @@ autocrop 阈值：diff > 28（与背景色 RGB max 差），margin 相对长边 
 """
 import os
 import sys
+import io
+import json
 import time
 import threading
 import re
@@ -148,6 +150,91 @@ def _native_dpi(page, base_img):
     return 300
 
 
+def _used_image_names(page):
+    """解析页面内容流，返回实际绘制的图像 XObject 名集合（Do 指令引用）。
+
+    背景：某些数据库导出的 PDF（如爱如生近代报刊库）所有页共享同一个全局
+    /Resources 字典，pypdf 的 page.images 会把整个资源池都算进每一页，
+    按「面积最大」取图就会每页取到同一张。必须以内容流实际引用为准。
+    """
+    try:
+        import re as _re
+        content = page.get_contents()
+        if content is None:
+            return None
+        data = content.get_data()
+        names = {m.decode("latin-1") for m in _re.findall(rb"/([^\s/>]+)\s+Do\b", data)}
+        return names or None
+    except Exception:
+        return None
+
+
+def _filter_images_by_content(page, images):
+    """共享资源字典的 PDF：把候选图限定为内容流实际绘制的那几张。
+
+    返回过滤后的列表；无法判定（解析失败/无 Do/一个都没对上）时原样返回。
+    """
+    if len(images) <= 1:
+        return images
+    used = _used_image_names(page)
+    if not used:
+        return images
+    # pypdf 的 ImageFile.name 是资源键 + 自动补的扩展名（如 "Ixxx.jpg"），需去掉后缀再比对
+    kept = [im for im in images if getattr(im, "name", "").rsplit(".", 1)[0] in used]
+    return kept if kept else images
+
+
+def _fast_embedded_image(page, used):
+    """快路径：按内容流 Do 引用直接取 XObject 流，绕开 pypdf page.images 的急切解码。
+
+    背景：pypdf 枚举 page.images 会把资源池里全部图解码一遍（共享资源池的
+    数据库 PDF 上实测 8.8s/页，74 页 × 74 张 = 5476 次无谓解码 ≈ 10 分钟）；
+    而本页真正绘制的那张，直接取流字节是毫秒级。本函数只处理最常见、可
+    无损直取的情形（纯 DCTDecode 的 JPEG、无 SMask/Mask、无 /Decode 特殊
+    反演）；条件不满足返回 None，调用方回退原 pypdf 慢路径，正确性不变。
+    """
+    try:
+        res = page.get("/Resources")
+        if res is None:
+            return None
+        xobjs = res.get_object().get("/XObject")
+        if xobjs is None:
+            return None
+        xobjs = xobjs.get_object()
+        best = None
+        best_area = 0
+        for n in used:
+            ref = xobjs.get("/" + n)
+            if ref is None:
+                continue
+            obj = ref.get_object()
+            filt = obj.get("/Filter")
+            if filt is None:
+                continue
+            fl = filt.get_object() if hasattr(filt, "get_object") else filt
+            # /Filter 可能是单个 NameObject（str 子类，逐字符迭代是陷阱）或数组
+            if isinstance(fl, (list, tuple)):
+                names = [str(x) for x in fl]
+            else:
+                names = [str(fl)]
+            if any(x != "/DCTDecode" for x in names):
+                continue
+            if obj.get("/Decode") is not None:      # CMYK 反演等特殊解码 → 慢路径
+                continue
+            if obj.get("/SMask") is not None or obj.get("/Mask") is not None:
+                continue
+            raw = obj._data if hasattr(obj, "_data") else obj.get_data()
+            pil = Image.open(io.BytesIO(raw))
+            pil.load()
+            area = pil.width * pil.height
+            if area > best_area:
+                best_area = area
+                best = pil.convert("RGB")
+        return best
+    except Exception:
+        return None
+
+
 def extract_images_per_page(pdf_path: str):
     """从 PDF 每页抽出面积最大的内嵌图（数据库导出一般是单图全页）。
 
@@ -161,26 +248,38 @@ def extract_images_per_page(pdf_path: str):
         best = None
         best_area = 0
         enum_err = None
-        try:
-            images = list(page.images)
-        except Exception as e:
-            enum_err = f"{os.path.basename(pdf_path)} page {i}: 页面图像枚举失败: {type(e).__name__}: {e}"
-            _elog(f"  [warn] {enum_err}（将尝试 pdfium 整页渲染回退）")
-        if not enum_err:
-            for im in images:
-                try:
-                    pil = im.image
-                except Exception as e:
-                    msg = f"{os.path.basename(pdf_path)} page {i} 图 {getattr(im, 'name', '?')}: 解码失败: {type(e).__name__}: {e}"
-                    errors.append(msg)
-                    _elog(f"  [skip image] {msg}")
-                    continue
-                if pil is None:
-                    continue
-                area = pil.width * pil.height
-                if area > best_area:
-                    best_area = area
-                    best = pil.convert("RGB")
+        # 快路径：内容流实际引用 → 直取 DCTDecode 原始字节（毫秒级）。
+        # 成功则完全跳过 page.images 枚举；失败/不适用再走慢路径兜底。
+        used = _used_image_names(page)
+        if used:
+            best = _fast_embedded_image(page, used)
+            if best is not None:
+                best_area = best.width * best.height
+        if best is None:
+            try:
+                images = list(page.images)
+                # 共享资源字典的 PDF：pypdf 会把整个资源池列进每页（如 27 页各自
+                # 枚举出全部 27 张图），按最大取图必然每页同一张 → 按内容流实际
+                # 引用先过滤，只在本页真正绘制的图里挑最大。
+                images = _filter_images_by_content(page, images)
+            except Exception as e:
+                enum_err = f"{os.path.basename(pdf_path)} page {i}: 页面图像枚举失败: {type(e).__name__}: {e}"
+                _elog(f"  [warn] {enum_err}（将尝试 pdfium 整页渲染回退）")
+            if not enum_err:
+                for im in images:
+                    try:
+                        pil = im.image
+                    except Exception as e:
+                        msg = f"{os.path.basename(pdf_path)} page {i} 图 {getattr(im, 'name', '?')}: 解码失败: {type(e).__name__}: {e}"
+                        errors.append(msg)
+                        _elog(f"  [skip image] {msg}")
+                        continue
+                    if pil is None:
+                        continue
+                    area = pil.width * pil.height
+                    if area > best_area:
+                        best_area = area
+                        best = pil.convert("RGB")
         # pypdf 抽不到内嵌图（枚举失败 或 页内无图）→ 用 pypdfium2 整页渲染回退
         if best is None:
             try:
@@ -338,16 +437,22 @@ def main():
     print(f"来源：{SRC_DIR}（{len(pdfs)} 个 PDF + {len(imgs)} 张图片）-> 输出：{DST_DIR}（已存在则跳过）")
     _elog(f"来源：{SRC_DIR}（{len(pdfs)} 个 PDF + {len(imgs)} 张图片）")
     skipped = 0
+    def _page_out(stem, pnum=None):
+        # 整版原图存 JPEG（源图本就是 DCTDecode/JPEG，PNG 无损重编码体积大 3 倍、编码慢 20 倍
+        # 而不增加任何信息）。q95 + 关闭色度抽样，OCR 与肉眼均无可感知差异。
+        # 若旧版产出的同名 .png 已存在，沿用旧 PNG（避免同页出现 png/jpg 两份重复）。
+        stem = stem + ("" if pnum is None else f"_p{pnum}")
+        return os.path.join(DST_DIR, stem + ".jpg"), os.path.join(DST_DIR, stem + ".png")
     for name in files:
         if STOP_EVENT.is_set():
             print("!! 已请求停止，抽图中止")
             break
         src = os.path.join(SRC_DIR, name)
         ext = os.path.splitext(name)[1].lower()
-        out = os.path.join(DST_DIR, os.path.splitext(name)[0] + ".png")
-        if os.path.exists(out) and not _src_newer(src, out):
+        out, out_legacy = _page_out(os.path.splitext(name)[0])
+        if (os.path.exists(out) or os.path.exists(out_legacy)) and not _src_newer(src, out if os.path.exists(out) else out_legacy):
             skipped += 1
-            print(f"{name[:30]:32} [skip 已存在] {os.path.basename(out)}")
+            print(f"{name[:30]:32} [skip 已存在] {os.path.basename(out if os.path.exists(out) else out_legacy)}")
             continue
         try:
             if ext == ".pdf":
@@ -358,15 +463,15 @@ def main():
                     continue
                 kind = "PDF"
                 for pnum, im in pages:
-                    out = os.path.join(DST_DIR, f"{os.path.splitext(name)[0]}_p{pnum}.png")
-                    if os.path.exists(out) and not _src_newer(src, out):
+                    out, out_legacy = _page_out(os.path.splitext(name)[0], pnum)
+                    if (os.path.exists(out) or os.path.exists(out_legacy)) and not _src_newer(src, out if os.path.exists(out) else out_legacy):
                         skipped += 1
-                        print(f"{name[:30]:32} [{kind}] page {pnum} [skip 已存在] {os.path.basename(out)}")
+                        print(f"{name[:30]:32} [{kind}] page {pnum} [skip 已存在] {os.path.basename(out if os.path.exists(out) else out_legacy)}")
                         continue
                     w0, h0 = im.size
                     cropped = autocrop(im)
                     w1, h1 = cropped.size
-                    cropped.save(out)
+                    cropped.save(out, "JPEG", quality=95, subsampling=0)
                     _bn = os.path.basename(out)
                     if _bn not in _ch_order:
                         _ch_order.append(_bn)
@@ -378,8 +483,7 @@ def main():
                 w0, h0 = im.size
                 cropped = autocrop(im)
                 w1, h1 = cropped.size
-                out = os.path.join(DST_DIR, os.path.splitext(name)[0] + ".png")
-                cropped.save(out)
+                cropped.save(out, "JPEG", quality=95, subsampling=0)
                 _bn = os.path.basename(out)
                 if _bn not in _ch_order:
                     _ch_order.append(_bn)

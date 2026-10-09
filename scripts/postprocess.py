@@ -171,18 +171,18 @@ SYSTEM_PROMPT_SHORT = """你负责对近代文献 OCR 转录文本抽取题录�
 要求：
 严格按以下字段顺序输出，字段名各占一行，不要附加任何说明、前言或结尾：
 标题：<文章/篇名，尽量照原文提取>
-日期：<YYYY-MM-DD 或 出版年 YYYY>
+日期：<YYYY-MM-DD；仅当确无月日时写 YYYY，有月份可写 YYYY-MM>
 作者：<署名；无署名则留空>
 引用：<按下方规则生成的 GB/T 7714 引用串>
 标签：<3-6 个主题词，逗号分隔，涵盖人物/事件/组织/地点>
 
 字段取值规则：
    - 标题：取文章正式题名（即引用著录所用题名；尽量照原文，保留原标题用字，繁简均可，转换后会统一）。
-   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书优先从「出处：」行或文件名提取出版年 {pubyear}（格式化为 YYYY，有月份可写 YYYY-MM）。
+   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书：若「出处：」行或文件名已给出完整日期（如 1926-01-16），一律按 YYYY-MM-DD 完整著录，不得只写年份；仅当只有年份时写 YYYY（有月份可写 YYYY-MM）。
    - 作者：取正文署名；无署名则留空（不要写「佚名」等占位）。
    - 引用：先判断文献类型，再严格按 GB/T 7714-2015 著录（末尾句号）：
        · 报纸（出处含「第X版」「报纸名」等）：样式「作者.题名[N].报纸名,出版日期(版次).」（无作者署名时省略「作者.」前缀）。报纸名取「出处：」行中的报纸名；出版日期已知为 {date}；版次取自文件名「第X版」，已知为第 {page} 版，著录为圆括号括起的版次，如 (4)。
-       · 期刊（出处含「刊名」「卷」「期」等）：样式「题名[J].刊名,年,卷(期):页码.」。刊名取「出处：」行中的期刊名，已知为 {journal}；年从上述日期取；卷(期)从文件名或版权页提取，已知卷 {volume}、期 {issue}，无卷则只写期如 (4)；页码已知为 {pages}，著录起讫页如 :45-58。
+       · 期刊（出处含「刊名」「卷」「期」等）：样式「题名[J].刊名,年,卷(期):页码.」；无卷时不得留空卷位或补逗号，直接作「题名[J].刊名,年(期):页码.」（如 题名[J].中国青年,1926(110):45-58.；期号含「/」为合刊则 (63/64)）。刊名取「出处：」行中的期刊名，已知为 {journal}；年从上述日期取；卷(期)从文件名或版权页提取，已知卷 {volume}、期 {issue}，无卷则只写期如 (4)；页码已知为 {pages}，著录起讫页如 :45-58。
        题名必须与上方「标题：」字段完全一致（即同一题名，不得改写、扩写或另取所谓“核心主题”），以契合史学研究对题名一致性的要求。
    - 标签：提炼 3-6 个主题词（人物、事件、组织、地点等），逗号分隔，用于知识库检索与聚合。
 
@@ -196,14 +196,14 @@ SYSTEM_PROMPT_SHORT_HISTORY = """你负责对近代文献 OCR 转录文本抽取
 要求：
 严格按以下字段顺序输出，字段名各占一行，不要附加任何说明、前言或结尾：
 标题：<文章/篇名，尽量照原文提取>
-日期：<YYYY-MM-DD 或 出版年 YYYY>
+日期：<YYYY-MM-DD；仅当确无月日时写 YYYY，有月份可写 YYYY-MM>
 作者：<署名；无署名则留空>
 引用：<按下方《历史研究》规范生成的引用串>
 标签：<3-6 个主题词，逗号分隔，涵盖人物/事件/组织/地点>
 
 字段取值规则：
    - 标题：取文章正式题名（即引用著录所用题名；尽量照原文，保留原标题用字，繁简均可，转换后会统一）。
-   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书优先从「出处：」行或文件名提取出版年 {pubyear}（格式化为 YYYY，有月份可写 YYYY-MM）。
+   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书：若「出处：」行或文件名已给出完整日期（如 1926-01-16），一律按 YYYY-MM-DD 完整著录，不得只写年份；仅当只有年份时写 YYYY（有月份可写 YYYY-MM）。
    - 作者：取正文署名；无署名则留空（不要写「佚名」等占位）。
    - 引用：先判断文献类型，再严格按《历史研究》注释规范著录（末尾句号，不标 [N]/[J] 类型标识、不标 DOI）：
        · 报纸（出处含「第X版」「报纸名」等）：样式「作者：《篇名》，《报纸名》出版日期，第X版。」。报纸名取「出处：」行中的报纸名；出版日期已知为 {date}；版次取自文件名「第X版」，已知为第 {page} 版。
@@ -221,7 +221,7 @@ SYSTEM_PROMPT_FULL_HISTORY = """你负责对近代文献 OCR 转录文本做后�
 1. 将全部内容的繁体转为简体中文；仅做繁→简字符转换，不增删改任何字词、标点与段落结构（保真优先）。
 2. 严格按以下字段顺序输出，字段名各占一行，不要附加任何说明、前言或结尾：
 标题：<文章/篇名，简体>
-日期：<YYYY-MM-DD 或 出版年 YYYY>
+日期：<YYYY-MM-DD；仅当确无月日时写 YYYY，有月份可写 YYYY-MM>
 作者：<署名；无署名则留空>
 引用：<按下方《历史研究》规范生成的引用串>
 标签：<3-6 个主题词，逗号分隔，涵盖人物/事件/机构/地点>
@@ -229,7 +229,7 @@ SYSTEM_PROMPT_FULL_HISTORY = """你负责对近代文献 OCR 转录文本做后�
 <将原文「正文：」后的内容繁转简后的简体文本，保真连贯>
 3. 字段取值规则：
    - 标题：取文章正式题名（即引用著录所用题名，简体）。
-   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书优先从「出处：」行或文件名提取出版年 {pubyear}（格式化为 YYYY，有月份可写 YYYY-MM）。
+   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书：若「出处：」行或文件名已给出完整日期（如 1926-01-16），一律按 YYYY-MM-DD 完整著录，不得只写年份；仅当只有年份时写 YYYY（有月份可写 YYYY-MM）。
    - 作者：取正文署名；无署名则留空。
    - 引用：先判断文献类型，再严格按《历史研究》注释规范著录（末尾句号，不标 [N]/[J] 类型标识、不标 DOI）：
        · 报纸（出处含「第X版」「报纸名」等）：样式「作者：《篇名》，《报纸名》出版日期，第X版。」。报纸名取「出处：」行中的报纸名；出版日期已知为 {date}；版次取自文件名「第X版」，已知为第 {page} 版。
@@ -248,14 +248,14 @@ SYSTEM_PROMPT_SHORT_PLAIN_HISTORY = """你负责对近代文献 OCR 转录文本
 2. 严格按以下格式输出，字段名各占一行，顺序固定，不要附加任何说明、前言、代码围栏或结尾：
 
 标题：<文章/篇名，尽量照原文提取>
-日期：<YYYY-MM-DD 或 出版年 YYYY>
+日期：<YYYY-MM-DD；仅当确无月日时写 YYYY，有月份可写 YYYY-MM>
 作者：<署名；无署名则留空>
 引用：<按下方《历史研究》规范生成的引用串>
 <正文：将原文「正文：」后的内容原样转录为简体中文，保真连贯，不增删改；保留原文空行分段（段落之间空一行），仅合并同一段落内、行尾无句末标点的逐行断行；□ 占位无法识别的字>
 
 3. 字段取值规则：
    - 标题：取文章正式题名（即引用著录所用题名，繁简均可，转换后会统一）。
-   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书优先从「出处：」行或文件名提取出版年 {pubyear}（格式化为 YYYY，有月份可写 YYYY-MM）。
+   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书：若「出处：」行或文件名已给出完整日期（如 1926-01-16），一律按 YYYY-MM-DD 完整著录，不得只写年份；仅当只有年份时写 YYYY（有月份可写 YYYY-MM）。
    - 作者：取正文署名；无署名则留空（不要写「佚名」等占位）。
    - 引用：先判断文献类型，再严格按《历史研究》注释规范著录（末尾句号，不标 [N]/[J] 类型标识、不标 DOI）：
        · 报纸（出处含「第X版」「报纸名」等）：样式「作者：《篇名》，《报纸名》出版日期，第X版。」。报纸名取「出处：」行中的报纸名；出版日期已知为 {date}；版次取自文件名「第X版」，已知为第 {page} 版。
@@ -279,7 +279,7 @@ SYSTEM_PROMPT_FULL = """你负责对近代文献 OCR 转录文本做后置处理
 1. 将全部内容的繁体转为简体中文；仅做繁→简字符转换，不增删改任何字词、标点与段落结构（保真优先）。
 2. 严格按以下字段顺序输出，字段名各占一行，不要附加任何说明、前言或结尾：
 标题：<文章/篇名，简体>
-日期：<YYYY-MM-DD 或 出版年 YYYY>
+日期：<YYYY-MM-DD；仅当确无月日时写 YYYY，有月份可写 YYYY-MM>
 作者：<署名；无署名则留空>
 引用：<按下方规则生成的 GB/T 7714 引用串>
 标签：<3-6 个主题词，逗号分隔，涵盖人物/事件/机构/地点>
@@ -287,11 +287,11 @@ SYSTEM_PROMPT_FULL = """你负责对近代文献 OCR 转录文本做后置处理
 <将原文「正文：」后的内容繁转简后的简体文本，保真连贯>
 3. 字段取值规则：
    - 标题：取文章正式题名（即引用著录所用题名，简体）。
-   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书优先从「出处：」行或文件名提取出版年 {pubyear}（格式化为 YYYY，有月份可写 YYYY-MM）。
+   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书：若「出处：」行或文件名已给出完整日期（如 1926-01-16），一律按 YYYY-MM-DD 完整著录，不得只写年份；仅当只有年份时写 YYYY（有月份可写 YYYY-MM）。
    - 作者：取正文署名；无署名则留空。
    - 引用：先判断文献类型，再严格按 GB/T 7714-2015 著录（末尾句号）：
        · 报纸（出处含「第X版」「报纸名」等）：样式「作者.题名[N].报纸名,出版日期(版次).」（无作者署名时省略「作者.」前缀）。报纸名取「出处：」行中的报纸名；出版日期已知为 {date}；版次取自文件名「第X版」，已知为第 {page} 版，著录为圆括号括起的版次，如 (4)。
-       · 期刊（出处含「刊名」「卷」「期」等）：样式「题名[J].刊名,年,卷(期):页码.」。刊名取「出处：」行中的期刊名，已知为 {journal}；年从上述日期取；卷(期)从文件名或版权页提取，已知卷 {volume}、期 {issue}，无卷则只写期如 (4)；页码已知为 {pages}，著录起讫页如 :45-58。
+       · 期刊（出处含「刊名」「卷」「期」等）：样式「题名[J].刊名,年,卷(期):页码.」；无卷时不得留空卷位或补逗号，直接作「题名[J].刊名,年(期):页码.」（如 题名[J].中国青年,1926(110):45-58.；期号含「/」为合刊则 (63/64)）。刊名取「出处：」行中的期刊名，已知为 {journal}；年从上述日期取；卷(期)从文件名或版权页提取，已知卷 {volume}、期 {issue}，无卷则只写期如 (4)；页码已知为 {pages}，著录起讫页如 :45-58。
        题名必须与上方「标题：」字段完全一致（即同一题名，不得改写、扩写或另取所谓“核心主题”），以契合史学研究对题名一致性的要求。
    - 标签：提炼 3-6 个主题词（人物、事件、机构、地点等），逗号分隔。
    - 正文：照抄原文「正文：」后内容，仅繁转简，其余不改。
@@ -310,18 +310,18 @@ SYSTEM_PROMPT_SHORT_PLAIN = """你负责对近代文献 OCR 转录文本做后�
 2. 严格按以下格式输出，字段名各占一行，顺序固定，不要附加任何说明、前言、代码围栏或结尾：
 
 标题：<文章/篇名，尽量照原文提取>
-日期：<YYYY-MM-DD 或 出版年 YYYY>
+日期：<YYYY-MM-DD；仅当确无月日时写 YYYY，有月份可写 YYYY-MM>
 作者：<署名；无署名则留空>
 引用：<按下方规则生成的 GB/T 7714 引用串>
 <正文：将原文「正文：」后的内容原样转录为简体中文，保真连贯，不增删改；保留原文空行分段（段落之间空一行），仅合并同一段落内、行尾无句末标点的逐行断行；□ 占位无法识别的字>
 
 3. 字段取值规则：
    - 标题：取文章正式题名（即引用著录所用题名，繁简均可，转换后会统一）。
-   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书优先从「出处：」行或文件名提取出版年 {pubyear}（格式化为 YYYY，有月份可写 YYYY-MM）。
+   - 日期：出版日期。报纸已知为 {date}（YYYY-MM-DD）；期刊/图书：若「出处：」行或文件名已给出完整日期（如 1926-01-16），一律按 YYYY-MM-DD 完整著录，不得只写年份；仅当只有年份时写 YYYY（有月份可写 YYYY-MM）。
    - 作者：取正文署名；无署名则留空（不要写「佚名」等占位）。
    - 引用：先判断文献类型，再严格按 GB/T 7714-2015 著录（末尾句号）：
        · 报纸（出处含「第X版」「报纸名」等）：样式「作者.题名[N].报纸名,出版日期(版次).」（无作者署名时省略「作者.」前缀）。报纸名取「出处：」行中的报纸名；出版日期已知为 {date}；版次取自文件名「第X版」，已知为第 {page} 版，著录为圆括号括起的版次，如 (4)。
-       · 期刊（出处含「刊名」「卷」「期」等）：样式「题名[J].刊名,年,卷(期):页码.」。刊名已知为 {journal}；年从上述日期取；卷(期)已知卷 {volume}、期 {issue}；页码已知为 {pages}，著录起讫页如 :45-58。
+       · 期刊（出处含「刊名」「卷」「期」等）：样式「题名[J].刊名,年,卷(期):页码.」；无卷时不得留空卷位或补逗号，直接作「题名[J].刊名,年(期):页码.」（如 题名[J].中国青年,1926(110):45-58.；期号含「/」为合刊则 (63/64)）。刊名已知为 {journal}；年从上述日期取；卷(期)已知卷 {volume}、期 {issue}；页码已知为 {pages}，著录起讫页如 :45-58。
        题名必须与上方「标题：」字段完全一致（同一题名，不得改写、扩写或另取所谓“核心主题”）。
    - 正文：照抄原文「正文：」后内容，仅做繁→简字符转换，其余不改。
 
@@ -371,6 +371,8 @@ MAX_NAME_LEN = 80                             # 标题片段最大长度
 
 # 纯文本模式：结构化输出 txt 的前缀，用于与同目录 OCR 的 <名>.txt 区分
 PLAIN_PREFIX = "结构化_"
+OCR_PREFIX = "ocr_"                   # 改名后的 OCR txt 前缀
+KB_PREFIX = "题录_"                    # 改名后的知识库产物前缀
 
 
 def clean_title(t):
@@ -379,6 +381,99 @@ def clean_title(t):
     t = "".join(ch for ch in t if ch not in BANNED_CHARS)
     t = re.sub(r"\s+", " ", t).strip(" .。·")
     return t[:MAX_NAME_LEN]
+
+
+# —— 产物按文章标题重命名（纯文本/知识库两种模式统一）——
+# 命名规则（用户 2026-10-08 定）：
+#   目录      单篇 → 文章标题；多篇 → 来源名（如 《先驱》1923年第15期）
+#   图片      {序号}{标题}.png（序号在前，如 1四个死者，一个精神！….png）
+#   OCR txt   ocr_{标题}.txt      json {标题}.json
+#   纯文本产物 结构化_{标题}.txt   知识库产物 题录_{标题}.md
+# 标题超长时保留 ocr_/结构化_/题录_ 前缀，只截断标题部分（MAX_STEM）。
+MAX_STEM = 60                      # 标题部分最大长度（字符）
+_WIN_RESERVED = {"CON", "PRN", "AUX", "NUL",
+                 *("COM%d" % i for i in range(1, 10)),
+                 *("LPT%d" % i for i in range(1, 10))}
+# 半角 → 全角：Windows 只禁这 9 个半角字符，中文标点（！——、，：「」等）本身合法、一字不丢，
+# 仅当模型吐了半角时才转全角，避免「A/B」被删成「AB」这类题名失真。
+_HALF2FULL = {"/": "／", "\\": "＼", ":": "：", "*": "＊",
+              "?": "？", '"': "＂", "<": "＜", ">": "＞", "|": "｜"}
+# Windows 路径总长 260：固定前缀约 48 字节 + 目录(≤MAX_STEM) + 前缀(≤11) + 后缀，
+# 截到 60 时总长约 48+60+11+8=127，余量充足。
+_MAP_NAME = ".rename_map.json"     # {OCR 基名: 文章标题}，供引用重算在改名后定位产物
+_ROUNDS_MAP = ".rounds.json"      # {轮次基名: 实际目录名}，目录改名后供前端/rebuild_ref 反查
+
+
+def safe_stem(title, maxlen=MAX_STEM):
+    """把文章标题转成可安全用作文件名的片段。
+
+    中文标点原样保留；半角禁用字符转全角（不丢字符）；去掉 Windows 保留设备名冲突；
+    超长按 maxlen 截断并抹掉尾部悬空标点。返回 (片段, 是否发生了改写)。
+    """
+    raw = (title or "").strip()
+    t = "".join(_HALF2FULL.get(ch, ch) for ch in raw)
+    t = "".join(ch for ch in t if ch not in BANNED_CHARS)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = t.strip(" .。·")              # Windows 会静默剥离结尾的空格与点
+    if not t:
+        return "", bool(raw.strip())
+    if t.upper() in _WIN_RESERVED or t.split(".")[0].upper() in _WIN_RESERVED:
+        t = t + "_"                # 结构化_CON 与 CON 同理不可用，加下划线逃生
+    if len(t) > maxlen:
+        t = t[:maxlen]
+        t = re.sub(r"[\s，,、；;：:！!。·…—\-]+$", "", t)   # 截断后抹掉尾部悬空标点
+    return t, (t != raw.strip())
+
+
+def load_rename_map(d):
+    """读 {OCR 基名: 标题} 映射（产物改名后，引用重算靠它定位）。"""
+    p = os.path.join(d, _MAP_NAME)
+    try:
+        if os.path.isfile(p):
+            m = json.load(open(p, encoding="utf-8"))
+            if isinstance(m, dict):
+                return m
+    except Exception:
+        pass
+    return {}
+
+
+def save_rename_map(d, m):
+    try:
+        with open(os.path.join(d, _MAP_NAME), "w", encoding="utf-8") as f:
+            json.dump(m, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"[warn] 写映射表失败：{e}")
+
+
+def unique_path(d, name):
+    """同目录内避免重名：存在则加 (2)/(3) 序号。返回完整路径或 None（源已存在同名且不可改名）。"""
+    p = os.path.join(d, name)
+    if not os.path.exists(p):
+        return p
+    stem, ext = os.path.splitext(name)
+    i = 2
+    while True:
+        q = os.path.join(d, f"{stem}({i}){ext}")
+        if not os.path.exists(q):
+            return q
+        i += 1
+
+
+def rename_to(d, src_name, dst_name):
+    """把 d 下的 src_name 改名为 dst_name（目标已存在则加序号）。返回最终文件名或 None。"""
+    src = os.path.join(d, src_name)
+    if not os.path.isfile(src):
+        return None
+    dst = unique_path(d, dst_name)
+    if dst is None:
+        return None
+    try:
+        os.replace(src, dst)
+        return os.path.basename(dst)
+    except OSError as e:
+        print(f"[warn] 重命名失败 {src_name} → {dst_name}：{e}")
+        return None
 
 
 def title_from_ref(ref):
@@ -398,6 +493,255 @@ def title_from_ref(ref):
     if t and t[0] in OPEN and t[-1] in CLOSE and OPEN.index(t[0]) == CLOSE.index(t[-1]):
         t = t[1:-1].strip()
     return t
+
+
+def rename_article_products(txt_path, title, mode):
+    """把本篇产物按文章标题改名（用户 2026-10-08 定的命名规则）：
+
+        OCR txt→ ocr_{标题}.txt      json    → {标题}.json
+        纯文本产物  → 结构化_{标题}.txt      知识库产物 → 题录_{标题}.md
+
+    并把 {OCR 基名: 标题} 写入 .rename_map.json，供引用重算（rebuild_ref）在改名后定位产物。
+    标题为空 → 保持原名不改。返回 (新 OCR 基名, 标题片段)。
+    """
+    d = os.path.dirname(txt_path)
+    base = os.path.splitext(os.path.basename(txt_path))[0]
+    stem, changed = safe_stem(title)
+    if not stem:
+        return base, ""
+    # 记录映射（旧基名 → 标题片段），无论是否真的改名都要记
+    m = load_rename_map(d)
+    m[base] = stem
+    save_rename_map(d, m)
+    # OCR txt
+    new_base = "ocr_" + stem
+    got = rename_to(d, base + ".txt", new_base + ".txt")
+    if got:
+        new_base = os.path.splitext(got)[0]
+    # json（可能不存在，缺省跳过）
+    rename_to(d, base + ".json", new_base[len("ocr_"):] + ".json")
+    # 结构化产物
+    if mode == "plain":
+        rename_to(d, PLAIN_PREFIX + base + ".txt", PLAIN_PREFIX + new_base[len("ocr_"):] + ".txt")
+    else:
+        rename_to(d, base + "_题录.md", "题录_" + new_base[len("ocr_"):] + ".md")
+    if changed:
+        print(f"  ↳ 文件名已按标题整理（清洗字符/截断）：{new_base}")
+    return new_base, stem
+
+
+_CN_NUM = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def cn_to_int(s):
+    """中文数字转阿拉伯数字（支持 一~九十九、百、千、万，如 十五→15、二十→20、一百零八→108）。
+    无法解析返回 None。"""
+    s = (s or "").strip()
+    if not s:
+        return None
+    if s.isdigit():
+        return int(s)
+    total = 0          # 已结算的大位（万/千/百）
+    section = 0        # 当前节内累计
+    last = None        # 上一位的数值（0~9 或 十/百/千）
+    for ch in s:
+        if ch in _CN_NUM:
+            last = _CN_NUM[ch]
+        elif ch in ("十", "拾", "百", "佰", "千", "仟"):
+            # 「十X」= 10+X（如 十五=15）；「X十」= X*10（如 二十=20）；
+            # 无前数时「十」本身 = 10（如 十期 = 第10期）
+            unit = {"十": 10, "拾": 10, "百": 100, "佰": 100, "千": 1000, "仟": 1000}[ch]
+            section += (last or 1) * unit
+            last = None
+        elif ch == "万":
+            total += (section + (last or 0)) * 10000
+            section, last = 0, None
+        else:
+            return None
+    return total + section + (last or 0)
+
+
+_NUMPAT = r"(\d+|[零〇一两三四五六七八九十拾百千万]+)"
+
+
+def source_label(txt_path, carrier_hint=""):
+    """从 OCR txt 的「出处：」行 + 文件名线索拼出来源名，用于多篇时的目录名。
+
+    目标格式：期刊《先驱》1923年第15期；报纸《申报》1923-01-15 第4版。
+    载体名取出处行/文件名的首个中文片段；期号/版次同时认阿拉伯与中文数字
+    （「第十五期」「第15期」「十五期」都能解析）；日期优先出处行的 YYYY-MM-DD，
+    其次文件名的 YYYYMMDD。全部解析失败返回空串，调用方回退到原目录名。
+    """
+    base = os.path.splitext(os.path.basename(txt_path))[0]
+    text = ""
+    try:
+        with open(txt_path, encoding="utf-8") as f:
+            for ln in f:
+                if ln.startswith("出处：") or ln.startswith("出处:"):
+                    text = ln.split("：", 1)[-1].split(":", 1)[-1].strip()
+                    break
+    except OSError:
+        pass
+    src = (text or carrier_hint or "").strip()
+    # 载体名：切到第一个数字/日期/括号/「第X版期卷」之前的那段中文，再剥掉书名号
+    carrier = ""
+    if src:
+        carrier = re.split(r"[\s,，:：]*(?:\d{4}|\(|（|第\s*" + _NUMPAT + r"\s*[版期卷])", src)[0]
+        carrier = carrier.strip("《》()（）,，。、 ")
+    if not carrier:
+        # 文件名兜底：取开头的连续汉字（排除书名号内的内容与数字）
+        m = re.match(r"^([^0-9()（）第\s《》]+)", base)
+        carrier = (m.group(1) if m else "").strip("《》()（）,，。、 ")
+    if not carrier:
+        return ""
+    # 日期：出处行优先（1923-01-15 / 1923年1月15日），其次文件名 YYYYMMDD，再退到年份
+    date = year = ""
+    m = re.search(r"(\d{4})[-年](\d{1,2})[-月](\d{1,2})", src)
+    if m:
+        date = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    else:
+        m = re.search(r"(\d{4})(\d{2})(\d{2})", base)
+        if m:
+            date = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    y = re.search(r"(\d{4})", src) or re.search(r"(\d{4})", base)
+    if y:
+        year = y.group(1)
+    # 期 / 卷 / 版：出处行优先，其次文件名；数字与中文数字通吃
+    def _num(texts):
+        for t in texts:
+            m = re.search(r"第?\s*" + _NUMPAT + r"\s*[期]", t or "")
+            if m:
+                v = cn_to_int(m.group(1))
+                if v is not None:
+                    return str(v)
+        return ""
+    iss = _num([src, base])
+    vol = ""
+    for t in (src, base):
+        m = re.search(r"第\s*" + _NUMPAT + r"\s*卷", t or "")
+        if m:
+            v = cn_to_int(m.group(1))
+            if v is not None:
+                vol = str(v)
+                break
+    pg = ""
+    for t in (src, base):
+        m = re.search(r"第\s*" + _NUMPAT + r"\s*版", t or "")
+        if m:
+            v = cn_to_int(m.group(1))
+            if v is not None:
+                pg = str(v)
+                break
+    if iss or vol:
+        tail = f"{vol}卷{iss}期" if (vol and iss) else (f"{iss}期" if iss else f"{vol}卷")
+        return f"《{carrier}》{year}年第{tail}" if year else f"《{carrier}》第{tail}"
+    if date and pg:
+        return f"《{carrier}》{date} 第{pg}版"
+    if date:
+        return f"《{carrier}》{date}"
+    return f"《{carrier}》" if carrier else ""
+
+
+def _round_key(items, titles, multi):
+    """推断本轮的「轮次基名」（= 后端建目录时用的名字，前端也按它传 out_dir）。
+
+    跨页多篇：OCR 基名形如 {跨页基名}__{i} → 取前缀 {跨页基名}。
+    单篇 / 单页：OCR 基名就是整版名（原名），直接用。
+    """
+    for k, _ in items:
+        b = os.path.splitext(os.path.basename(k))[0]
+        if "__" in b:
+            return b.rsplit("__", 1)[0]
+    for k, _ in items:
+        b = os.path.splitext(os.path.basename(k))[0]
+        if b:
+            return b
+    return ""
+
+
+def finalize_round(root, mode):
+    """全部篇结构化完成后统一整理本轮的目录名与图片名。
+
+    目录名：单篇 → 文章标题；多篇 → 来源名（如 《先驱》1923年第15期）。
+    图片名：{序号}{标题}.png，序号在前（如 1四个死者，一个精神！….png）；
+    多篇时各篇产物已各自按标题改名，图片无法逐篇归属，退回用首篇标题 + 序号。
+    """
+    if not os.path.isdir(root):
+        return
+    parent = os.path.dirname(os.path.abspath(root))
+    cur = os.path.basename(os.path.abspath(root))
+    m = load_rename_map(root)
+    if not m:
+        return
+    # 标题片段按 OCR 基名排序（篇序= {base}__{i}），保证与识别顺序一致
+    items = sorted(m.items(), key=lambda kv: (len(kv[0]), kv[0]))
+    titles = [v for _, v in items if v]
+    if not titles:
+        return
+    # 轮次别名索引的键必须与前端传入的 round_dir 一致（跨页=跨页基名、单页=整版名），
+    # 而不是当前目录名 work —— 后端建目录时用的就是这个基名，键错了 rebuild_ref/再次结构化都定位不到。
+    multi = len(items) > 1
+    round_key = _round_key(items, titles, multi)
+    if multi:
+        # 多篇：用来源名（同一轮各篇同源，取任一篇的出处行即可）
+        src = ""
+        for k, _ in items:
+            for cand in (os.path.join(root, "ocr_" + _ + ".txt"),
+                         os.path.join(root, "ocr_" + k + ".txt"),
+                         os.path.join(root, k + ".txt")):
+                if os.path.isfile(cand):
+                    src = source_label(cand)
+                    if src:
+                        break
+            if src:
+                break
+        newname, _ = safe_stem(src if src else cur, maxlen=MAX_STEM)
+    else:
+        newname = titles[0]
+    if not newname or newname == cur:
+        return
+    # 轮次基名为空时无法写别名索引（前端定位不到），此时不跳命名以外的操作，直接返回
+    if not round_key:
+        print("[warn] 无法推断轮次基名，跳过目录改名（避免前端定位不到产物目录）")
+        return
+    # 图片改名：{序号}{标题}.png（仅本轮 work 目录直属的图片，按文件名排序编号）
+    imgs = sorted([fn for fn in os.listdir(root)
+                   if fn.lower().endswith((".png", ".jpg", ".jpeg"))])
+    base_title = titles[0] if multi else newname
+    for i, fn in enumerate(imgs, 1):
+        ext = os.path.splitext(fn)[1]
+        rename_to(root, fn, f"{i}{base_title}{ext}")
+    # 改目录名（父目录下加序号防冲突）
+    dst = unique_path(parent, newname)
+    if dst is None:
+        return
+    try:
+        os.replace(root, dst)
+        print(f"[整理] 目录已按{'来源名' if multi else '文章标题'}重命名：{cur} → {os.path.basename(dst)}")
+        # 同目录映射表随目录一起走
+        newmap = load_rename_map(dst)
+        save_rename_map(dst, newmap)
+        # 在 output/{top}/ 下登记「轮次基名 → 实际目录名」别名索引：
+        # 前端与 rebuild_ref 仍按轮次名拼路径，改名后靠这张表反查，否则引用联动会断。
+        rp = os.path.join(parent, _ROUNDS_MAP)
+        rounds = {}
+        try:
+            if os.path.isfile(rp):
+                with open(rp, encoding="utf-8") as f:
+                    rounds = json.load(f)
+                if not isinstance(rounds, dict):
+                    rounds = {}
+        except Exception:
+            rounds = {}
+        rounds[round_key] = os.path.basename(dst)
+        try:
+            with open(rp, "w", encoding="utf-8") as f:
+                json.dump(rounds, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[warn] 写轮次别名索引失败：{e}")
+    except OSError as e:
+        print(f"[warn] 目录重命名失败：{e}")
 
 
 def rename_by_title(txt_path, md_path, title):
@@ -556,9 +900,11 @@ def postprocess(txt_path, client, model, prompt_override=None, rename=True,
     if carrier == "journal":
         sys_content += ("\n\n【强制指令】用户已声明本篇载体类型为「期刊[J]」。请直接按期刊样式著录引用"
                        "（GB/T 7714：题名[J].刊名,年,卷(期):页码.；《历史研究》：作者：《篇名》，《刊名》年年期。），"
+                       "无卷时不得留空卷位或补逗号，直接作「题名[J].刊名,年(期):页码.」，不得出现「,年,(期)」这类空卷位逗号，"
                        "不要判断为报纸；出处中的「第X期」视为期号，著录为 (X)，不得当作报纸版次；"
                        "若期号含「/」（如 63/64）表示两期合刊，著录为 (63/64)，不得拆成单期或添加报纸版次；"
-                       "出处含「合刊」即两期合并出版。")
+                       "出处含「合刊」即两期合并出版；"
+                       "「日期」字段：出处行已知完整日期时按 YYYY-MM-DD 完整填写，不得只写年份。")
     elif carrier == "newspaper":
         sys_content += ("\n\n【强制指令】用户已声明本篇载体类型为「报纸[N]」。请直接按报纸样式著录引用"
                        "（GB/T 7714：作者.题名[N].报纸名,出版日期(版次).；《历史研究》：作者：《篇名》，《报纸名》出版日期，第X版。），"
@@ -606,6 +952,9 @@ def postprocess(txt_path, client, model, prompt_override=None, rename=True,
     title = to_simp(title, keep_traditional)
     author = to_simp(author, keep_traditional)
     ref = to_simp(ref, keep_traditional)
+    # 期刊引用去空卷位冗余逗号：「…,1926,(110)」→「…,1926(110)」（无卷时卷位置空所致，仅对 [J] 生效，不动报纸）
+    if "[J]" in ref:
+        ref = re.sub(r"(?<=\d{4}),\s*(?=\()", "", ref)
     tags = [to_simp(t, keep_traditional) for t in tags]
     body = merge_broken_lines(body)   # 纯文本模式模型输出正文兜底合并框缘断行
     body = to_simp(body, keep_traditional)
@@ -713,6 +1062,10 @@ def postprocess(txt_path, client, model, prompt_override=None, rename=True,
                 print(f"  ↳ {_msg}")
         print(f"done: {os.path.basename(out_path)}{tok}")
 
+    # 产物按文章标题改名（本篇）：OCR txt → ocr_{标题}.txt，json → {标题}.json，
+    # 结构化产物 → 结构化_{标题}.txt / 题录_{标题}.md。目录名在 main() 里等全部篇完成后统一改。
+    rename_article_products(txt_path, title, mode)
+
     # —— 每篇总耗时计时：OCR 秒数（来自 <root>/.timing.json）+ 本篇结构化秒数 ——
     if timing_root:
         _name = os.path.splitext(os.path.basename(txt_path))[0]
@@ -798,20 +1151,26 @@ def _extract_journal_meta(ref, fmt):
         mj = re.search(r"\[J\]\.\s*([^,]+),", ref)
         if mj:
             res["journal"] = mj.group(1).strip()
-        my = re.search(r",\s*(\d{4}),", ref)
+        # 年 + 其后至页码前的「卷(期)」片段：兼容无卷写法「…,1926(110):45-58.」与有卷「…,1926,3(110):45-58.」
+        my = re.search(r",\s*(\d{4})(.*?)(?::\s*([\d\-—]+)\.|$)", ref)
         if my:
             res["year"] = my.group(1)
-        mv = re.search(r",\s*\d{4},\s*([^:]+?):", ref)   # 卷(期) 片段
-        if mv:
-            seg = mv.group(1).strip()
-            vm = re.search(r"(\d+)\s*\(", seg)
-            im = re.search(r"\(\s*([\d/]+)\s*\)", seg)
+            # 去句末句号/逗号残留（无页码时片段直抵串尾），否则「,3.」无法匹配卷位
+            seg = re.sub(r"[.。,，\s]+$", "", (my.group(2) or "").strip())
+            vm = re.search(r"^,\s*(\d+)\s*\(", seg)      # 有卷：,卷(期)
+            im = re.search(r"\(\s*([\d/]+)\s*\)", seg)   # 期号（含合刊 63/64）
             if vm:
                 res["volume"] = vm.group(1)
             if im:
                 res["issue"] = im.group(1)
+            elif re.fullmatch(r"\([\d/]+\)", seg):
+                res["issue"] = seg[1:-1]
+            elif re.fullmatch(r"\d+", seg):
+                res["issue"] = seg                      # 裸数字视为期（兼容旧式无括号）
+            elif re.fullmatch(r",\s*\d+", seg):
+                res["volume"] = seg.strip(", ").strip()  # 有卷无期
             elif re.search(r"^\s*([\d/]+)\s*$", seg):
-                res["issue"] = seg.strip()        # 无卷仅期，如 (4) 已含括号被 im 命中；此处兜底纯数字；合刊 (63/64) 亦兼容
+                res["issue"] = seg.strip()             # 兜底：无卷仅期；合刊 (63/64) 亦兼容
         mp = re.search(r":\s*([\d\-—]+)\.", ref)
         if mp:
             res["pages"] = mp.group(1)
@@ -900,7 +1259,10 @@ def _build_journal_ref(title, author, journal, date, volume, issue, pages, fmt, 
     elif volume:
         vi = f"{volume}"
     pg = (":" + pages) if pages else ""
-    return f"{au}{title}[J].{journal},{year},{vi}{pg}."
+    # 无卷时去空卷位逗号：直接「刊名,年(期):页码.」（如 题名[J].中国青年,1926(110):45-58.)
+    # 有卷才补「年,卷(期)」的逗号；只有期则「年(期)」；卷期全无则只留年。
+    yvi = f"{year}{',' + vi if volume else vi}"
+    return f"{au}{title}[J].{journal},{yvi}{pg}."
 
 
 def _write_plain_ref(path, title, author, date, ref):
@@ -944,6 +1306,23 @@ def rebuild_ref(txt_path, fmt="gb7714", kt=False):
                 plain_path = os.path.join(dp, fn)
             elif fn == (name + "_题录.md"):
                 kb_path = os.path.join(dp, fn)
+    # 产物已按文章标题改名（2026-10-08 起）→ 按原名找不到时，改用 .rename_map.json 定位：
+    #   {旧 OCR 基名: 标题片段}，产物名分别为结构化_{标题}.txt / 题录_{标题}.md。
+    renamed_path = None
+    if not plain_path and not kb_path:
+        for dp, _, fns in os.walk(out_root):
+            mm = load_rename_map(dp)
+            stem = mm.get(name)
+            if not stem:
+                continue
+            for fn in fns:
+                if fn == PLAIN_PREFIX + stem + ".txt":
+                    plain_path = os.path.join(dp, fn)
+                elif fn == KB_PREFIX + stem + ".md":
+                    kb_path = os.path.join(dp, fn)
+            if plain_path or kb_path:
+                break
+        renamed_path = plain_path or kb_path
     if plain_path and not kb_path:
         mode = "plain"
     elif kb_path and not plain_path:
@@ -1023,6 +1402,26 @@ def rebuild_ref(txt_path, fmt="gb7714", kt=False):
     else:
         _write_kb_ref(kb_path, title, author, date, edition, newspaper_for_write, ref)
         target = kb_path
+    # 手改题名后，若产物是改名过的，同步把文件名也改成新标题（保持「产物名=标题」不变式）
+    if renamed_path:
+        d = os.path.dirname(renamed_path)
+        stem, changed = safe_stem(title)
+        if stem:
+            mm = load_rename_map(d)
+            old_stem = mm.get(name)
+            if old_stem and old_stem != stem:
+                mm[name] = stem
+                save_rename_map(d, mm)
+                if mode == "plain":
+                    got = rename_to(d, os.path.basename(target), PLAIN_PREFIX + stem + ".txt")
+                    rename_to(d, OCR_PREFIX + old_stem + ".txt", OCR_PREFIX + stem + ".txt")
+                    rename_to(d, old_stem + ".json", stem + ".json")
+                    if got:
+                        target = os.path.join(d, got)
+                else:
+                    got = rename_to(d, os.path.basename(target), KB_PREFIX + stem + ".md")
+                    if got:
+                        target = os.path.join(d, got)
     return {"ok": True, "ref": ref, "mode": mode, "path": target}
 
 
@@ -1077,13 +1476,14 @@ def main():
 
     # 递归收集待处理 OCR txt；排除已生成的「结构化_<名>.txt」（前置前缀）与隐藏文件、
     # _题录.md，避免纯文本模式产物被二次处理。
+    # ocr_ 前缀是改名后的 OCR 产物（postprocess 自己改名），同样排除，否则重跑会把它当新输入再处理一遍。
     def _collect(name=None):
         out = []
         for dp, _, fns in os.walk(args.root):
             for fn in fns:
                 if not fn.endswith(".txt"):
                     continue
-                if fn.startswith(".") or fn.startswith(PLAIN_PREFIX):
+                if fn.startswith(".") or fn.startswith(PLAIN_PREFIX) or fn.startswith(OCR_PREFIX):
                     continue
                 if fn.endswith("_题录.md"):
                     continue
@@ -1125,6 +1525,10 @@ def main():
                         src_name=args.src_name, src_date=args.src_date, src_page=args.src_page,
                         src_issue=args.src_issue, carrier=args.src_carrier,
                         citation_format=args.citation_format, keep_traditional=args.keep_traditional)
+
+    # 全部篇完成后统一改目录名 + 图片名（多篇用来源名，单篇用文章标题）
+    if not args.no_rename:
+        finalize_round(args.root, args.post_mode)
 
 
 if __name__ == "__main__":
