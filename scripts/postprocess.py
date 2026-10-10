@@ -374,6 +374,37 @@ PLAIN_PREFIX = "结构化_"
 OCR_PREFIX = "ocr_"                   # 改名后的 OCR txt 前缀
 KB_PREFIX = "题录_"                    # 改名后的知识库产物前缀
 
+# 改名策略（--rename-policy 传入）：auto=自动识别来源文件名——截图/相机/聊天工具/纯数字日期等
+# 「无意义自动命名」才按标题改名，用户已命名的文件保留原名；always=总是改名；never=从不改名。
+RENAME_POLICY = "auto"
+_AUTO_NAME_PAT = re.compile(r"""
+    ^clipboard-\d{8}-\d{6}          # 本工具粘贴截图
+  | ^(screen)?screenshot[\s_-]?\d*  # Screenshot / screenshot(12)
+  | ^snip[_-]?                      # Snip & Sketch
+  | ^capture
+  | ^(屏幕)?截图                    # Windows「屏幕截图」/「截图(1)」
+  | ^(微信|QQ)图片
+  | ^wechat[\s_-]?image
+  | ^wx\d{14}                       # 微信 WX20261009…
+  | ^img([_-]\d+)*$                 # IMG_1234 / IMG_20261009_1234
+  | ^dsc[fhn]?[\s_-]?\d+$           # DSC_1234 / DSCN1234
+  | ^p[ab]?[\s_-]?\d{6,}$           # P1010001
+  | ^scan                           # Scan / Scan001
+  | ^扫描
+  | ^\d+$                           # 纯数字
+  | ^\d{4}[-_.]?\d{2}[-_.]?\d{2}([ _-]\d{4,6})?$  # 纯日期（可带时间）
+  | ^\d{3,4}[-_]p\d+$               # 1927_p228（数字年+页码）
+""", re.I | re.X)
+
+def _looks_auto_generated(base):
+    """判定来源文件名是否为「无意义自动命名」。命中 → 允许按标题改名；
+    否则视为用户已命名，保留原名。base 可带跨页篇序后缀 {基名}__{i}。"""
+    b = re.sub(r"__\d+$", "", (base or "").strip())
+    b = os.path.splitext(b)[0]
+    if not b:
+        return True
+    return bool(_AUTO_NAME_PAT.match(b))
+
 
 def clean_title(t):
     """清洗模型抽出的标题，使其可安全用作文件名片段。"""
@@ -503,9 +534,15 @@ def rename_article_products(txt_path, title, mode):
 
     并把 {OCR 基名: 标题} 写入 .rename_map.json，供引用重算（rebuild_ref）在改名后定位产物。
     标题为空 → 保持原名不改。返回 (新 OCR 基名, 标题片段)。
+    改名策略（RENAME_POLICY）：never → 不改；auto 且来源名为用户命名（非自动命名）→ 不改。
     """
     d = os.path.dirname(txt_path)
     base = os.path.splitext(os.path.basename(txt_path))[0]
+    if RENAME_POLICY == "never":
+        return base, ""
+    if RENAME_POLICY == "auto" and not _looks_auto_generated(base):
+        print(f"[改名] 跳过本篇产物改名：来源名「{re.sub(r'__\\d+$', '', base)}」为用户命名，保留原名")
+        return base, ""
     stem, changed = safe_stem(title)
     if not stem:
         return base, ""
@@ -704,6 +741,27 @@ def finalize_round(root, mode):
     # 轮次基名为空时无法写别名索引（前端定位不到），此时不跳命名以外的操作，直接返回
     if not round_key:
         print("[warn] 无法推断轮次基名，跳过目录改名（避免前端定位不到产物目录）")
+        return
+    # 改名策略：never=从不改名；auto 且来源名为用户命名 → 保留原名（仅登记别名索引）
+    if RENAME_POLICY == "never" or (RENAME_POLICY == "auto" and not _looks_auto_generated(round_key)):
+        if RENAME_POLICY == "auto" and not _looks_auto_generated(round_key):
+            print(f"[改名] 跳过目录改名：来源名「{round_key}」为用户命名，保留原名")
+        rp = os.path.join(parent, _ROUNDS_MAP)
+        rounds = {}
+        try:
+            if os.path.isfile(rp):
+                with open(rp, encoding="utf-8") as f:
+                    rounds = json.load(f)
+                if not isinstance(rounds, dict):
+                    rounds = {}
+        except Exception:
+            rounds = {}
+        rounds[round_key] = cur   # 未改名：轮次基名 → 当前目录名（原样登记，保证前端定位稳定）
+        try:
+            with open(rp, "w", encoding="utf-8") as f:
+                json.dump(rounds, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"[warn] 写轮次别名索引失败：{e}")
         return
     # 图片改名：{序号}{标题}.png（仅本轮 work 目录直属的图片，按文件名排序编号）
     imgs = sorted([fn for fn in os.listdir(root)
@@ -1437,6 +1495,9 @@ def main():
                     help="覆盖内置纯文本提示词（plain 模式）；留空用内置默认")
     ap.add_argument("--no-rename", action="store_true",
                     help="关闭「按题录标题重命名 _框N 子目录 + 回写出处」（仅 kb 模式生效）")
+    ap.add_argument("--rename-policy", default="auto", choices=("auto", "always", "never"),
+                    help="产物改名策略：auto=自动识别（截图等无意义名改标题、用户命名保留原名，默认）；"
+                         "always=总是按标题改名；never=从不改名")
     # 来源补充：用户在文件名未携带题录信息时手动补充（载体名称/出版日期/版次）。
     # 仅在非空时覆盖 parse_source 从文件名抽取的结果，不填则完全走原逻辑（向后兼容）。
     ap.add_argument("--src-name", default=None,
@@ -1457,6 +1518,9 @@ def main():
     ap.add_argument("--rebuild-ref", default=None,
                     help="指定 OCR txt 路径，本地重算其引用串并写回结构化产物后退出")
     args = ap.parse_args()
+
+    global RENAME_POLICY
+    RENAME_POLICY = args.rename_policy
 
     if args.rebuild_ref:
         # 本地计算，无需 DEEPSEEK_API_KEY；直接复用 rebuild_ref 并打印 JSON 结果

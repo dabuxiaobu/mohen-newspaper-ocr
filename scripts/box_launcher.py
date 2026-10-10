@@ -151,7 +151,7 @@ except ImportError as _e:
         pass
     os._exit(1)
 
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 
 # ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -542,7 +542,7 @@ def _load_cfg():
                  "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
                  "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                  "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
-                 "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE")
+                 "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE", "RENAME_POLICY")
     if os.path.exists(p):
         try:
             data = json.load(open(p, encoding="utf-8"))
@@ -579,7 +579,7 @@ def _ensure_blank_config():
                              "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
                              "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                              "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
-                             "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE")}
+                             "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE", "RENAME_POLICY")}
     blank["BOX_OCR_PROVIDER"] = "qwen"
     blank["AUTO_UPDATE"] = False
     try:
@@ -595,7 +595,7 @@ def _cfg_status(cfg, explicit):
             "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
             "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
             "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
-            "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE")
+            "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE", "RENAME_POLICY")
     return {k: (k in explicit) for k in keys}
 
 
@@ -2424,6 +2424,10 @@ class Handler(BaseHTTPRequestHandler):
                 extra = extra + ["--citation-format", "history_research"]
             if (cfg.get("KEEP_TRADITIONAL") or "").strip().lower() == "true":
                 extra = extra + ["--keep-traditional"]
+            # 重命名规则：auto=自动识别（截图改名、用户命名保留）/ always=总是改 / never=从不改
+            _rp = (cfg.get("RENAME_POLICY") or "auto").strip() or "auto"
+            if _rp in ("auto", "always", "never"):
+                extra = extra + ["--rename-policy", _rp]
             # 来源补充：当导入文件名未携带题录信息时，用户在 ④ 面板手动补充来源串（如"大公报 1943-01-17 第2版"），
             # 结构化前注入 OCR 转录 txt 首行的「出处：」行（载体名由模型从此行读取）并覆盖提示词占位符，
             # 使 DeepSeek 生成完整 GB/T 7714 引用。仅非空字段生效，未填则完全走原逻辑。
@@ -2481,6 +2485,11 @@ class Handler(BaseHTTPRequestHandler):
                                capture_output=True, text=True, env=env, timeout=900)
             res = {"ok": r.returncode == 0, "returncode": r.returncode,
                    "stdout": r.stdout[-4000:], "stderr": r.stderr[-2000:]}
+            if r.returncode != 0:
+                # 失败原因要给前端能显示的字段：取 stderr/stdout 末几行，否则用户只看到空的「失败:」
+                tail = "\n".join((r.stderr or "").strip().split("\n")[-3:]) \
+                    or "\n".join((r.stdout or "").strip().split("\n")[-3:])
+                res["error"] = tail or ("子进程退出码 %d，无输出" % r.returncode)
             if name == "postprocess" and r.returncode == 0:
                 # 打开文件夹策略：
                 #  - no_open=True（单页逐版调用）：后端不打开，交由前端统一打开父目录 output/{top}（避免多子文件夹冲突）
@@ -2611,7 +2620,7 @@ class Handler(BaseHTTPRequestHandler):
                    "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                    "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
                    "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE",
-                   "DATA_DIR")
+                   "DATA_DIR", "RENAME_POLICY")
         p = os.path.join(CONFIG_DIR, "box_config.json")
         merged = {}
         if os.path.exists(p):
@@ -2893,6 +2902,9 @@ HTML = r"""<!doctype html>
   .set-group input, .set-group select { padding:6px 10px; font-size:13px; line-height:1.4; }
   .set-group .row { margin-bottom:8px; }
   .set-group .row:last-child { margin-bottom:0; }
+  /* 字号统一：抽屉内说明/标签/复选框行一律 12px（全局 .switch-row 是 13.5px，在设置抽屉里偏大） */
+  .set-group .switch-row { font-size:12px; color:var(--mut); }
+  .set-group label.sub { font-size:12px; }
   .key-field { display:flex; flex-direction:column; }
   .key-field .input-wrap { position:relative; }
   .key-field input { padding-right:38px !important; }
@@ -3176,6 +3188,15 @@ HTML = r"""<!doctype html>
           <option value="history_research">《历史研究》注释规范</option>
         </select>
       </div>
+      <div class="row" style="align-items:center; gap:10px; flex-wrap:nowrap; margin-top:10px;">
+        <label style="white-space:nowrap;">重命名规则</label>
+        <select id="cfgRenamePolicy" style="width:auto; min-width:160px;">
+          <option value="auto">自动识别（推荐）</option>
+          <option value="always">总是按文章标题改名</option>
+          <option value="never">从不改名</option>
+        </select>
+      </div>
+      <label class="sub" style="display:block; margin-top:6px;">自动识别：截图/相机/聊天图片等无意义文件名会按文章标题改名；你自己命名的文件保留原名。</label>
       <label class="switch-row" style="margin-top:10px;">
         <input type="checkbox" id="cfgKeepTraditional">
         <span>保留繁体（默认转简体）</span>
@@ -3381,6 +3402,7 @@ function stashActive(){
 function fillCfgInputs(v){
   applyProviderFromValues(v);
   const cfSel=$('cfgCitationFormat'); if(cfSel) cfSel.value = (v.CITATION_FORMAT||'gb7714');
+  const rp=$('cfgRenamePolicy'); if(rp) rp.value = (v.RENAME_POLICY||'auto');
   const kt=$('cfgKeepTraditional'); if(kt) kt.checked = ((v.KEEP_TRADITIONAL||'false').toLowerCase()==='true');
   const dd=$('cfgDataDir'); if(dd) dd.value = (v.DATA_DIR||'');
   applyEyeCare((v.EYE_CARE||'false').toLowerCase()==='true', false);
@@ -3678,7 +3700,7 @@ function mergeCrossTarget(ct){
 }
 function crossBaseName(){ return (pageOrder.length?pageOrder[0]:srcName).replace(/\.[^.]+$/,'')+'_跨页'; }
 // 把后端返回的绝对路径转成相对运行时目录的简短显示（用于日志中「已打开…」）
-function osRel(p){ if(!p) return p; try{ const base=((window.__RUNTIME_DIR)||''); if(base && p.startsWith(base)) return 'output/'+p.slice(base.length).replace(/^[\\/]/,''); }catch(e){} return p; }
+function osRel(p){ if(!p) return p; try{ const base=((window.__RUNTIME_DIR)||''); if(base && p.startsWith(base)){ const rel=p.slice(base.length).replace(/^[\\/]/,''); return /^output[\\/]/.test(rel) ? rel : 'output/'+rel; } }catch(e){} return p; }
 
 // 裁切图四周补纯白缓冲边：竖排阅读起点永远贴右边缘，模型对紧贴图像边界的文字召回率偏低，
 // 常整列漏读（表现为「开头必丢一列」）。补边后贴边列离开图像边界，恢复正常识别。
@@ -4035,15 +4057,17 @@ function renderPerPageSrc(){
 async function runPost(){
   const mode = $('postMode') ? $('postMode').value : 'plain';
   // 来源补充：区分单页/跨页。跨页合并一篇→一份全局自由文本；单页一次多版→每版各自自由文本。
-  const isCross = mergeMode==='cross' && pageOrder.length>1;
+  // 判定口径必须与 renderPerPageSrc 一致（只看 mergeMode）：跨页模式下每版行不渲染，
+  // 若这里再用「版数>1」判定，跨页模式只载入 1 版时会错去读不存在的每版行 → 来源补充静默丢失。
+  const uiCross = mergeMode==='cross';
   let globalSO = null;
-  if(isCross){
+  if(uiCross){
     const t = (document.getElementById('srcGlobalText')||{}).value||'';
     const c = (document.getElementById('srcGlobalCarrier')||{}).value||'newspaper';
     if(t.trim()) globalSO = {text: t.trim(), carrier: c};
   }
   const perPageSO = {};
-  if(!isCross){
+  if(!uiCross){
     document.querySelectorAll('#perPageSrc .pp-row').forEach(row=>{
       const idx = parseInt(row.dataset.idx, 10);
       const pg = pageOrder[idx];
@@ -4054,6 +4078,9 @@ async function runPost(){
     });
   }
   const top = (mode==='plain' ? 'plain_text' : 'knowledge_base');
+  // 结构化路径分支维持原判定（跨页且多版 → 合并单文件夹路径）；
+  // 来源补充的收集口径已在上面与 UI 对齐，单页路径用 globalSO 兜底（跨页模式只载 1 版时生效）。
+  const isCross = mergeMode==='cross' && pageOrder.length>1;
   // 统一空状态守卫：未载入任何版时直接提示，不调用后端，避免生成「未命名」空文件夹
   if(!pageOrder.length){ alert('请先载入工作集（勾选整版原图并点「载入所选」），再点结构化。'); return; }
   // 自动先落盘：结构化（postprocess.py 子进程）只读取磁盘上的 raw 产物，不接触浏览器内存中的
@@ -4125,25 +4152,40 @@ async function runPost(){
   }
   // 单页模式：逐版调用 postprocess，每版独立子文件夹（output/{top}/{整版名}/）；
   // 全部完成后统一打开父目录 output/{top}（多子文件夹，不钻进某一页）
+  // 注意：必须逐版串行。此前 forEach 并发全发，几十版同时调 DeepSeek 会触发限流/超时大面积失败；
+  // 且失败时前端只打 j.error，而后端对「子进程退出码非 0」的返回没有 error 字段（真实原因在
+  // stdout/stderr），用户只看到「失败:」空提示。现改为串行 + 失败时打印 stderr/stdout 末尾。
   const pages = recPages.slice();
-  let done=0, okCount=0, hasRealOutput=false; const logs=[]; const okPages=[];
-  pages.forEach(pname=>{
+  let okCount=0, hasRealOutput=false; const okPages=[]; const failedPages=[];
+  for(const pname of pages){
     const od = pname.replace(/\.[^.]+$/,'');
-    fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:od,pages:[pname],no_open:true,source_override:(perPageSO[pname]||null)})})
-      .then(r=>r.json())      .then(j=>{ if(j.ok && !j.skipped){ okCount++; hasRealOutput=true; okPages.push(pname); }
-        let st = j.ok ? (j.skipped?'无产物':'成功') : ('失败: '+(j.error||''));
-        const head=(j.stdout||'').split('\n').slice(0,2).join(' / '); logs.push('[版 '+esc(pname)+'] '+(head||st)); })
-      .catch(e=>{ const detail=(e&&e.stack)?e.stack:(''+e); logs.push('[版 '+esc(pname)+'] 后置失败：'+(e&&e.message?e.message:e)); fetch('/api/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({line:'[探针] 版 '+pname+' postprocess fetch 失败: '+detail})}).catch(()=>{}); })
-      .finally(()=>{ done++; if(done===pages.length){
-        let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+'] 单页模式：本次识别 '+pages.length+' 版，其中可结构化 '+okCount+' 版，每版独立子文件夹（output/'+top+'/整版名/）。';
-        if(logs.length) s+='\n'+logs.join('\n');
-        const after = ()=>{ if(hasRealOutput){ const failed = pages.filter(p=>!okPages.includes(p)); clearPost(okPages); s+='\n[结构化] 已完成版已从工作集移除，其余版保留在列表中，可继续框选识别。'; if(failed.length){ s+='\n[提示] 以下版未完成结构化（无产物/失败），仍保留在列表与 cropped_hi/：'+failed.join('、'); } } log(s); };
-        // 统一打开父目录 output/{top}（多子文件夹，不钻进某一页）
-        fetch('/api/open_folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:top})})
-          .then(r=>r.json()).then(j=>{ if(j.ok){ const rel=osRel(j.path); s+='\n↑ 已打开父文件夹：'+rel; } }).catch(()=>{})
-          .finally(after);
-      } });
-  });
+    try{
+      const r = await fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:od,pages:[pname],no_open:true,source_override:(perPageSO[pname]||globalSO||null)})});
+      const j = await r.json();
+      if(j.ok && !j.skipped){ okCount++; hasRealOutput=true; okPages.push(pname); }
+      if(j.ok){
+        const head=(j.stdout||'').split('\n').slice(0,2).join(' / ');
+        log('[版 '+esc(pname)+'] '+(head||(j.skipped?'无产物':'成功')));
+      }else{
+        failedPages.push(pname);
+        const errTail=String(j.error||j.stderr||j.stdout||'').trim().split('\n').filter(Boolean).slice(-3).join(' ／ ');
+        log('[版 '+esc(pname)+'] 失败: '+(errTail||'原因未知（后端未返回错误信息），请复制完整日志反馈'));
+      }
+    }catch(e){
+      failedPages.push(pname);
+      const detail=(e&&e.stack)?e.stack:(''+e);
+      log('[版 '+esc(pname)+'] 后置失败：'+(e&&e.message?e.message:e));
+      fetch('/api/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({line:'[探针] 版 '+pname+' postprocess fetch 失败: '+detail})}).catch(()=>{});
+    }
+  }
+  {
+    let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+'] 单页模式：本次识别 '+pages.length+' 版，其中可结构化 '+okCount+' 版，每版独立子文件夹（output/'+top+'/整版名/）。';
+    const after = ()=>{ if(hasRealOutput){ clearPost(okPages); s+='\n[结构化] 已完成版已从工作集移除，其余版保留在列表中，可继续框选识别。'; if(failedPages.length){ s+='\n[提示] 以下版未完成结构化（无产物/失败），仍保留在列表与 cropped_hi/：'+failedPages.join('、'); } } log(s); };
+    // 统一打开父目录 output/{top}（多子文件夹，不钻进某一页）
+    fetch('/api/open_folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:top})})
+      .then(r=>r.json()).then(j=>{ if(j.ok){ const rel=osRel(j.path); s+='\n↑ 已打开父文件夹：'+rel; } }).catch(()=>{})
+      .finally(after);
+  }
 }
 
 // ---------- 日志面板（彩色、轮询、搜索、复制、清空） ----------
@@ -4752,6 +4794,7 @@ function collectCfg(){
     d[pre+'_API_KEY']=s.api_key; d[pre+'_BASE_URL']=s.base_url; d[pre+'_MODEL']=s.model; }
   d.DEEPSEEK_API_KEY=$('cfgDsKey').value.trim(); d.DEEPSEEK_BASE_URL=$('cfgDsUrl').value.trim(); d.DEEPSEEK_MODEL=$('cfgDsModel').value.trim();
   const cfSel=$('cfgCitationFormat'); if(cfSel) d.CITATION_FORMAT=cfSel.value||'gb7714';
+  const rp=$('cfgRenamePolicy'); if(rp) d.RENAME_POLICY=rp.value||'auto';
   const kt=$('cfgKeepTraditional'); if(kt) d.KEEP_TRADITIONAL=kt.checked?'true':'false';
   d.EYE_CARE = document.body.classList.contains('eye-care')?'true':'false';
   const dd=$('cfgDataDir'); if(dd) d.DATA_DIR=dd.value.trim();
