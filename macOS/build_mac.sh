@@ -26,7 +26,7 @@ cd "$SKILL_DIR"
 APP_NAME="墨痕"
 
 # 版本（去 v 前缀）
-VERSION_RAW="${MH_VERSION:-3.1.1}"
+VERSION_RAW="${MH_VERSION:-4.0.0}"
 VERSION="${VERSION_RAW#v}"
 
 # 架构后缀
@@ -100,8 +100,22 @@ hdiutil create -volname "$APP_NAME" -srcfolder "$APP_PATH" -ov -format UDZO "$DM
 ditto -c -k --keepParent "$APP_PATH" "$ZIP"
 
 # sha256 校验文件（文件名只保留 basename，方便朋友核对）
-shasum -a 256 "$DMG" | awk -v f="$(basename "$DMG")" '{print $1"  "f}' > "$DMG.sha256.txt"
-shasum -a 256 "$ZIP" | awk -v f="$(basename "$ZIP")" '{print $1"  "f}' > "$ZIP.sha256.txt"
+# 说明：此前出现过 .sha256.txt 为空（0 字节）的情况——`shasum | awk > 文件` 里 shasum 失败时
+# 管道退出码仍是 awk 的 0，set -e 拦不住，结果留下一个空校验文件。改为：算不出哈希就报错退出，
+# 并对产物做非空自检 + 把校验值打到 CI 日志，便于一眼核对。
+sha_line() {
+  local f="$1" h=""
+  h="$(shasum -a 256 "$f" 2>/dev/null | awk '{print $1}')"
+  if [ -z "$h" ]; then h="$(openssl dgst -sha256 -r "$f" 2>/dev/null | awk '{print $1}')"; fi
+  if [ -z "$h" ]; then echo "[ERR] 无法计算 $(basename "$f") 的 sha256" >&2; exit 1; fi
+  printf '%s  %s\n' "$h" "$(basename "$f")"
+}
+sha_line "$DMG" > "$DMG.sha256.txt"
+sha_line "$ZIP" > "$ZIP.sha256.txt"
+for _s in "$DMG.sha256.txt" "$ZIP.sha256.txt"; do
+  if [ ! -s "$_s" ]; then echo "[ERR] 校验文件为空：$_s" >&2; exit 1; fi
+  echo "  sha256: $(cat "$_s")"
+done
 
 echo ""
 echo "完成 ✅"

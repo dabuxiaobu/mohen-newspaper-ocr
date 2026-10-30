@@ -244,6 +244,7 @@ def extract_images_per_page(pdf_path: str):
     reader = PdfReader(pdf_path)
     out = []
     errors = []
+    jbig2_pages = 0   # JBIG2 压缩页计数（摘要提示用，详见枚举失败处注释）
     for i, page in enumerate(reader.pages, 1):
         best = None
         best_area = 0
@@ -264,7 +265,12 @@ def extract_images_per_page(pdf_path: str):
                 images = _filter_images_by_content(page, images)
             except Exception as e:
                 enum_err = f"{os.path.basename(pdf_path)} page {i}: 页面图像枚举失败: {type(e).__name__}: {e}"
-                _elog(f"  [warn] {enum_err}（将尝试 pdfium 整页渲染回退）")
+                # JBIG2 页属已知限制（pypdf 无内置 jbig2 解码器），已由下方 pdfium 整页渲染回退兜住，
+                # 结果不受影响。逐页刷 warn 会让用户误以为导入失败，故只计数、最后汇总一条。
+                if "jbig2" in str(e).lower():
+                    jbig2_pages += 1
+                else:
+                    _elog(f"  [warn] {enum_err}（将尝试 pdfium 整页渲染回退）")
             if not enum_err:
                 for im in images:
                     try:
@@ -322,7 +328,8 @@ def extract_images_per_page(pdf_path: str):
                     best = render_page_pdfium(pdf_path, i, dpi=300)
                     if best is not None:
                         if enum_err:
-                            _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 内嵌图枚举失败，改用整页渲染（{best.width}x{best.height}）")
+                            if "jbig2" not in enum_err.lower():
+                                _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 内嵌图枚举失败，改用整页渲染（{best.width}x{best.height}）")
                         else:
                             _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 页内无内嵌图，改用整页渲染（{best.width}x{best.height}）")
                 except Exception as e:
@@ -336,6 +343,12 @@ def extract_images_per_page(pdf_path: str):
                     continue
         if best:
             out.append((i, best))
+    # JBIG2 页已由 pdfium 回退成功：从错误列表剔除，避免「N 条页级错误」误导用户；
+    # 若确实有回退也失败的 JBIG2 页，其「无内嵌图且 pdfium 渲染失败」记录会以另一文案保留在 errors 里。
+    if jbig2_pages:
+        errors = [e for e in errors if "jbig2" not in e.lower()]
+        _elog(f"  [info] {os.path.basename(pdf_path)}：{jbig2_pages} 页为 JBIG2 压缩（pypdf 无内置解码器），"
+              f"已自动改用 pdfium 整页渲染，识别结果不受影响。")
     return out, errors
 
 

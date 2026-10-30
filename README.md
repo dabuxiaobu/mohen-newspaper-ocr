@@ -13,7 +13,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Windows%2010%2F11-supported-0078D4?style=flat-square&logo=windows11&logoColor=white" alt="支持 Windows">
   <img src="https://img.shields.io/badge/macOS%2014%2B-supported-4A90E2?style=flat-square&logo=apple&logoColor=white" alt="支持 macOS">
-  <img src="https://img.shields.io/badge/Release-v1.2.1-FF6B6B?style=flat-square" alt="Release v1.2.1">
+  <img src="https://img.shields.io/badge/Release-v4.0.0-FF6B6B?style=flat-square" alt="Release v4.0.0">
   <img src="https://img.shields.io/badge/license-AGPL--3.0--only-6A5ACD?style=flat-square" alt="AGPL-3.0-only">
 </p>
 
@@ -94,7 +94,7 @@ flowchart LR
     K --> L[知识库 / 结构化文本]
 ```
 
-墨痕把“识别哪篇、边界在哪”完全交给人。框选完成后，程序按框裁切小图并发给视觉模型转录；**同组名的多个框、或均未填组名的多个框会按顺序合并成一篇**，字段（标题 / 作者 / 正文）严格按你框上的标签归位，不做模型内部的二次拆分；**不同组名的框则各自独立成篇**。转录文本落盘后，`postprocess.py` 负责出规范题录与结构化整理。
+墨痕把“识别哪篇、边界在哪”完全交给人。框选完成后，程序按框裁切小图并发给视觉模型转录；**同组名的多个框、或均未填组名的多个框会按顺序合并成一篇**，字段（标题 / 节标题 / 作者 / 正文）严格按你框上的标签归位，不做模型内部的二次拆分；**不同组名的框则各自独立成篇**。跨页模式下分篇边界只看标题：标为 `section`（节标题）的框是文章内部分节，归入正文且不参与分篇。转录文本落盘后，`postprocess.py` 负责出规范题录与结构化整理。**分了几篇就出几份结构化文档**：无论跨页合并多篇，还是一版之内用组名分了多篇，原始转录都按篇写成 `{基名}__{篇序}.txt`，逐篇独立结构化，不会把多篇糊进同一个文件。
 
 OCR 与题录所需密钥默认存于本机 `box_config.json`，首次启动自动生成空白配置文件；**密钥不会随安装包分发**，安装后自行填写。
 
@@ -109,7 +109,7 @@ OCR 与题录所需密钥默认存于本机 `box_config.json`，首次启动自�
 
 **macOS**
 - **macOS 14（Sonoma）及以上**；
-- 当前提供 **Apple Silicon（arm64）** 构建；
+- 提供 **Apple Silicon（arm64）** 与 **Intel（x86_64）** 两种构建；
 - 安装 / 运行**不需要 Python**，pywebview 使用系统自带 WebKit（无需 WebView2）；
 - 提供 `.dmg` 安装包与 `.zip` 绿色版，通过 GitHub Releases 下载。
 
@@ -152,14 +152,15 @@ pythonw box_launcher.py
 
 **Windows**
 
-1. 把 `deploy\Output\墨痕-1.2.1-windows-setup.exe` 交给使用者，双击安装；
+1. 把 `deploy\Output\墨痕-4.0.0-windows-setup.exe` 交给使用者，双击安装；
 2. 启动「墨痕」，在设置面板填 OCR 密钥与模型名（使用者自己的 key）；
 3. 其余操作与源码模式第 3、4 步相同。
 
 **macOS**
 
 1. 从 GitHub Releases 下载对应架构的安装包：
-   - Apple Silicon（M 系列芯片）：`墨痕-v1.2.1-macos-arm64.dmg`（或 `.zip` 绿色版）
+   - Apple Silicon（M 系列芯片）：`墨痕-v4.0.0-macos-arm64.dmg`（或 `.zip` 绿色版）
+   - Intel（x86_64 芯片）：`墨痕-v4.0.0-macos-x86_64.dmg`（或 `.zip` 绿色版）
 2. 打开 `.dmg`，将「墨痕」拖入「应用程序」文件夹；
 3. 首次启动若提示「无法打开」，前往「系统设置 → 隐私与安全性」，点击「仍要打开」；
 4. 启动后在设置面板填写 OCR 密钥与模型名。
@@ -230,7 +231,7 @@ build_exe.bat
 # 1) 把 ChineseSimplified.isl 放在 deploy/（已随仓库提供）
 # 2) 用 Inno Setup 的 ISCC 编译：
 " C:\Program Files (x86)\Inno Setup 6\ISCC.exe" deploy\墨痕_setup.iss
-# 产物：deploy\Output\墨痕-1.2.1-windows-setup.exe
+# 产物：deploy\Output\墨痕-4.0.0-windows-setup.exe
 ```
 
 > 构建红线：`build_exe.bat` 改动 `scripts/` 后**必须完整重打包** exe 才生效；`SKILL.md`、教程、部署脚本等非打包文档改动即时生效。  
@@ -243,8 +244,9 @@ macOS 版使用独立的 `macOS/` 构建体系（`box_tool_mac.spec` / `build_ma
 ```bash
 # 在 macOS 上本地构建（单次，单架构）：
 cd <项目根目录>
-MH_ARCH=arm64 bash macOS/build_mac.sh
-# 产物：dist/墨痕.app（onedir）→ deploy/Output/墨痕-v1.2.1-macos-arm64.dmg / .zip
+MH_ARCH=arm64  bash macOS/build_mac.sh   # Apple Silicon
+MH_ARCH=x86_64 bash macOS/build_mac.sh   # Intel Mac
+# 产物：dist/墨痕.app（onedir）→ deploy/Output/墨痕-v4.0.0-macos-<arch>.dmg / .zip
 ```
 
 ## 隐私与许可

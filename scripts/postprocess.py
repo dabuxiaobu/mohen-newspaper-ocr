@@ -22,6 +22,7 @@ import json
 import argparse
 import csv
 import time
+import traceback
 from openai import OpenAI, APIStatusError, APIConnectionError, RateLimitError
 from stop_flag import STOP_EVENT
 
@@ -1564,35 +1565,52 @@ def main():
         tps = _collect()
         tps.sort()
 
+    failed = []
     for tp in tps:
         if STOP_EVENT.is_set():
             print("!! 已请求停止，结构化中止")
             break
-        if args.post_mode == "plain":
-            plain_path = os.path.join(os.path.dirname(tp),
-                                     PLAIN_PREFIX + os.path.splitext(os.path.basename(tp))[0] + ".txt")
-            if os.path.exists(plain_path):
-                print(f"skip (已结构化): {os.path.basename(plain_path)}")
-                continue
-            postprocess(tp, client, model, prompt_override=args.prompt_post_plain,
-                        rename=False, timing_root=args.root, mode="plain",
-                        src_name=args.src_name, src_date=args.src_date, src_page=args.src_page,
-                        src_issue=args.src_issue, carrier=args.src_carrier,
-                        citation_format=args.citation_format, keep_traditional=args.keep_traditional)
-        else:
-            md_path = os.path.splitext(tp)[0] + "_题录.md"
-            if os.path.exists(md_path):
-                print(f"skip (已后置): {os.path.basename(md_path)}")
-                continue
-            postprocess(tp, client, model, prompt_override=args.prompt_post,
-                        rename=not args.no_rename, timing_root=args.root, mode="kb",
-                        src_name=args.src_name, src_date=args.src_date, src_page=args.src_page,
-                        src_issue=args.src_issue, carrier=args.src_carrier,
-                        citation_format=args.citation_format, keep_traditional=args.keep_traditional)
+        # 单篇隔离：任何一篇崩溃（数据缺字段、模型返回异常等）只记失败、继续后面的篇，
+        # 不再因一篇中断整批（此前会整批中止，前端只看到一句异常串如 'NoneType' object is not subscriptable）。
+        try:
+            if args.post_mode == "plain":
+                plain_path = os.path.join(os.path.dirname(tp),
+                                         PLAIN_PREFIX + os.path.splitext(os.path.basename(tp))[0] + ".txt")
+                if os.path.exists(plain_path):
+                    print(f"skip (已结构化): {os.path.basename(plain_path)}")
+                    continue
+                postprocess(tp, client, model, prompt_override=args.prompt_post_plain,
+                            rename=False, timing_root=args.root, mode="plain",
+                            src_name=args.src_name, src_date=args.src_date, src_page=args.src_page,
+                            src_issue=args.src_issue, carrier=args.src_carrier,
+                            citation_format=args.citation_format, keep_traditional=args.keep_traditional)
+            else:
+                md_path = os.path.splitext(tp)[0] + "_题录.md"
+                if os.path.exists(md_path):
+                    print(f"skip (已后置): {os.path.basename(md_path)}")
+                    continue
+                postprocess(tp, client, model, prompt_override=args.prompt_post,
+                            rename=not args.no_rename, timing_root=args.root, mode="kb",
+                            src_name=args.src_name, src_date=args.src_date, src_page=args.src_page,
+                            src_issue=args.src_issue, carrier=args.src_carrier,
+                            citation_format=args.citation_format, keep_traditional=args.keep_traditional)
+        except Exception as e:
+            failed.append(os.path.basename(tp))
+            print(f"!! 失败: {os.path.basename(tp)}: {type(e).__name__}: {e}")
+            # 完整堆栈打到 stderr，前端「失败原因」会取 stderr 末几行，便于用户直接反馈定位
+            traceback.print_exc()
+            continue
+
+    if failed:
+        print(f"!! 本次共 {len(failed)} 篇结构化失败：{', '.join(failed)}")
 
     # 全部篇完成后统一改目录名 + 图片名（多篇用来源名，单篇用文章标题）
     if not args.no_rename:
         finalize_round(args.root, args.post_mode)
+
+    # 有失败篇时以非 0 退出：前端据此把该版判定为「未完成」，不会被误当成功从工作集移除。
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

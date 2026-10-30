@@ -136,12 +136,77 @@ def _migrate_legacy_data():
             sys.stderr.write(f"[migrate] 迁移 {name} 失败：{_e}\n")
 _migrate_legacy_data()
 
+
+# ── 网络下载标记（Mark of the Web）自动解除 ──────────────────────────────
+# 从浏览器下载的 zip 解压后，Windows 会给其中每个文件写入 Zone.Identifier 备用数据流。
+# .NET 的 Assembly.LoadFrom 拒绝加载带该标记的托管程序集，pythonnet 因此报：
+#   RuntimeError: Failed to resolve Python.Runtime.Loader.Initialize from ...Python.Runtime.dll
+# 本机实测：仅给 Python.Runtime.dll 写入该标记即可 100% 复现此错误（本机 .NET 4.8 完好，
+# 与环境无关），删除标记后立即恢复。它是该错误最常见、也最容易被误判成
+# 「缺 .NET Framework」的成因——portable.zip 用户几乎必踩，setup.exe 安装版不受影响。
+# 只删安全元数据流、不改文件内容；无标记时每个文件仅一次 stat（157 个 dll 约 17ms）。
+def _clear_motw():
+    if sys.platform != "win32":
+        return 0
+    roots = [APP_DIR]
+    _mei = getattr(sys, "_MEIPASS", "")
+    if _mei:
+        _a_mei, _a_app = os.path.abspath(_mei), os.path.abspath(APP_DIR)
+        # onedir 打包态 _MEIPASS 就是 APP_DIR\_internal，已被上面覆盖，避免重复遍历
+        if not (_a_mei == _a_app or _a_mei.startswith(_a_app + os.sep)):
+            roots.append(_mei)
+    n = 0
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            for fn in files:
+                if not fn.lower().endswith((".dll", ".exe")):
+                    continue
+                p = os.path.join(dirpath, fn)
+                try:
+                    if os.path.exists(p + ":Zone.Identifier"):
+                        os.remove(p + ":Zone.Identifier")
+                        n += 1
+                except OSError:
+                    pass  # 非 NTFS 卷 / 权限不足 / 文件正被占用
+    return n
+
+
 try:
-    import webview  # type: ignore
-except ImportError as _e:
-    _msg = ("缺少 pywebview（内嵌窗口依赖）。请先安装：\n"
-            "  pip install pywebview\n"
-            f"\n原始错误：{_e}")
+    _n_motw = _clear_motw()
+    if _n_motw:
+        with open(os.path.join(DATA_DIR, "box_launcher.log"), "a", encoding="utf-8") as _lf:
+            _lf.write(f"[motw] 启动时解除 {_n_motw} 个文件的网络下载标记（否则 .NET 拒绝加载）\n")
+except Exception:
+    pass
+
+
+def _startup_fail(raw):
+    """启动期致命错误统一出口：中文可操作提示 → 写日志 → 弹系统框 → 退出。
+    双击 exe 时没有控制台，不弹窗就表现为「点了没反应」。"""
+    low = raw.lower()
+    if ("python.runtime" in low or "pythonnet" in low
+            or "failed to resolve" in low or "clr_loader" in low):
+        _msg = ("内嵌窗口组件（pythonnet / .NET）加载失败，程序无法启动。\n\n"
+                "最常见原因：程序包是网络下载的 zip 解压出来的，Windows 给其中的\n"
+                "Python.Runtime.dll 打了「来自 Internet」标记，.NET 拒绝加载它。\n"
+                "程序启动时已自动尝试解除该标记。若仍失败，按顺序尝试：\n\n"
+                "1) 右键点击下载的 zip → 属性 → 勾选「解除锁定」→ 确定，再重新解压\n"
+                "   （这一步可根治，务必先做）；\n"
+                "2) 或在程序文件夹内用 PowerShell 执行：\n"
+                "   Get-ChildItem -Path . -Recurse | Unblock-File\n"
+                "3) 精简版或较旧系统若缺 .NET Framework，请安装 4.8：\n"
+                "   https://dotnet.microsoft.com/download/dotnet-framework/net48\n"
+                "4) 确认没有把新版文件直接覆盖到旧版目录（新旧依赖混用同样会报此错）。\n\n"
+                f"原始错误：{raw}")
+    elif "webview" in low and ("no module" in low or "modulenotfound" in low):
+        _msg = ("缺少 pywebview（内嵌窗口依赖）。请先安装：\n"
+                "  pip install pywebview\n"
+                f"\n原始错误：{raw}")
+    else:
+        _msg = ("内嵌窗口初始化失败，程序无法启动。\n\n"
+                "建议：删除程序文件夹后重新解压/安装（避免新旧文件混用），"
+                "并确认系统已安装 .NET Framework 4.8 与 VC++ 运行库。\n\n"
+                f"原始错误：{raw}")
     print(_msg)
     try:
         sys.stdout = open(os.path.join(DATA_DIR, "box_launcher.log"), "a", encoding="utf-8")
@@ -149,17 +214,31 @@ except ImportError as _e:
         print(_msg)
     except Exception:
         pass
+    if sys.platform == "win32":
+        try:
+            import ctypes as _ct
+            _ct.windll.user32.MessageBoxW(None, _msg, "墨痕 · 启动失败", 0x10)
+        except Exception:
+            pass
     os._exit(1)
 
-VERSION = "3.1.1"
 
-# ---------- OCR 服务商（千问 / 豆包 自由切换） ----------
+try:
+    import webview  # type: ignore
+except Exception as _e:
+    # 注意：pywebview 6.x 的 import 本身很轻，不加载 pythonnet；
+    # pythonnet 真正初始化在 webview.start() 里（见文件末尾，那里也做了兜底）。
+    _startup_fail(f"{type(_e).__name__}: {_e}")
+
+VERSION = "4.0.0"
+
+# ---------- OCR 服务商（豆包 / 千问 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
 # 互不影响。BOX_OCR_PROVIDER 记录当前用哪一个。旧版仅有的 BOX_OCR_* 字段会在
 # 首次启动时迁移进 QWEN_*（见 _migrate_cfg）。
 OCR_PROVIDERS = {
     "qwen": {
-        "label": "千问（日常）",
+        "label": "千问",
         "key_prefix": "QWEN",
         "default_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "default_model": "qwen3.6-plus",
@@ -168,13 +247,13 @@ OCR_PROVIDERS = {
         "model_placeholder": "",
     },
     "doubao": {
-        "label": "豆包（疑难）",
+        "label": "豆包（推荐）",
         "key_prefix": "DOUBAO",
         "default_base_url": "https://ark.cn-beijing.volces.com/api/v3",
         "default_model": "",
         "base_placeholder": "https://ark.cn-beijing.volces.com/api/v3",
         "key_placeholder": "ark-",
-        "model_placeholder": "",
+        "model_placeholder": "ep-2024xxxxxxxx-xxxxx（火山方舟接入点 ID）",
     },
     "other": {
         "label": "其他（自定义）",
@@ -304,22 +383,25 @@ def _mac_arch_keyword():
 
 def _build_update_result(current, rel, rel2=None):
     is_mac = (sys.platform == "darwin")
+    local_arch = _mac_arch_keyword() if is_mac else None
     def _pick(r):
         if not r: return None, None
-        win_asset=None; mac_asset=None; fallback_zip=None
+        win_asset=None; mac_asset=None; mac_other=None; fallback_zip=None
         for a in r["assets"]:
             n=a["name"].lower()
             if not n.endswith(".zip"): continue
             if fallback_zip is None: fallback_zip=a
             if is_mac:
                 if "macos" in n:
-                    arch=_mac_arch_keyword()
-                    if arch is None or arch in n:
+                    if local_arch is None or local_arch in n:
                         mac_asset=a; break
+                    if mac_other is None: mac_other=a   # 架构不匹配的 Mac 包，仅作最后兜底
             else:
                 if any(k in n for k in WIN_PKG_KEYWORDS):
                     win_asset=a; break
-        tgt = mac_asset or win_asset or fallback_zip
+        # Mac 上绝不回退到 Windows 包：装不上，还会让用户以为「更新后打不开」。
+        # 同架构 Mac 包 > 异架构 Mac 包（并置 arch_warn 提示）> 无。
+        tgt = (mac_asset or mac_other) if is_mac else (win_asset or fallback_zip)
         if not tgt: return None, None
         sha=None
         want=tgt["name"]+".sha256.txt"
@@ -334,7 +416,8 @@ def _build_update_result(current, rel, rel2=None):
     if not tgt:
         return {"ok": True, "current": current, "latest": (rel or {}).get("tag",""), "notes": (rel or {}).get("notes",""), "page_url": (rel or {}).get("page_url",""),
                 "download_url":"", "asset_name":"", "sha256_url":"", "alt_download_url":"", "alt_sha256_url":"",
-                "need": False, "platform":"macos" if is_mac else "windows"}
+                "need": False, "platform":"macos" if is_mac else "windows",
+                "arch_warn": False, "local_arch": local_arch or ""}
     tgt2, sha2 = _pick(rel2) if rel2 else (None, None)
     need = bool(tgt) and bool((rel or {}).get("tag")) and (rel or {}).get("tag") != current
     return {
@@ -346,6 +429,9 @@ def _build_update_result(current, rel, rel2=None):
         "alt_sha256_url": sha2["url"] if sha2 else "",
         "need": need,
         "platform": "macos" if is_mac else "windows",
+        # 该版本没提供与本机芯片匹配的 Mac 包时置 True，前端据此提示「手动去发布页选包」
+        "arch_warn": bool(is_mac and local_arch and local_arch not in tgt["name"].lower()),
+        "local_arch": local_arch or "",
     }
 
 def _check_update():
@@ -555,8 +641,10 @@ def _load_cfg():
         if os.environ.get(k):
             cfg[k] = os.environ[k]; explicit.add(k)
     cfg = {k: v for k, v in cfg.items() if v not in (None, "")}
-    # 兼容旧版：仅有 BOX_OCR_* 时未设置服务商，按千问处理
-    cfg.setdefault("BOX_OCR_PROVIDER", "qwen")
+    # 缺服务商键时的兜底：全新配置默认豆包；旧配置（千问时代）通常已填 QWEN_API_KEY，
+    # 对这类沿用千问，避免升级后被切成豆包却无豆包 Key。
+    if not cfg.get("BOX_OCR_PROVIDER"):
+        cfg["BOX_OCR_PROVIDER"] = "qwen" if cfg.get("QWEN_API_KEY") else "doubao"
     return cfg, explicit
 
 
@@ -580,7 +668,7 @@ def _ensure_blank_config():
                              "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                              "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
                              "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE", "RENAME_POLICY")}
-    blank["BOX_OCR_PROVIDER"] = "qwen"
+    blank["BOX_OCR_PROVIDER"] = "doubao"
     blank["AUTO_UPDATE"] = False
     try:
         with open(p, "w", encoding="utf-8") as f:
@@ -625,7 +713,8 @@ def _migrate_cfg():
         data["QWEN_MODEL"] = data.pop("BOX_OCR_MODEL", "")
         changed = True
     if not data.get("BOX_OCR_PROVIDER"):
-        data["BOX_OCR_PROVIDER"] = "qwen"
+        # 有千问 Key 说明是千问时代的老配置，沿用千问；否则按新配置默认豆包
+        data["BOX_OCR_PROVIDER"] = "qwen" if data.get("QWEN_API_KEY") else "doubao"
         changed = True
     if changed:
         try:
@@ -699,11 +788,11 @@ def _translate_net_error(e, base_url=""):
            "单张整版裁切图 base64 后可达数 MB，中间节点会直接掐断连接。\n"
            "解决办法（任选其一）：\n"
            "  1. 切换网络节点、换 Wi-Fi 或重新联网后重试；\n"
-           "  2. 把 OCR Base URL 改回官方直连 https://dashscope.aliyuncs.com/compatible-mode/v1 测试；\n"
+           "  2. 关闭网络代理 / VPN（含图书馆 WebVPN 等网关），改直连后重试；\n"
            "  3. 仍失败请把这段提示反馈给开发者。")
     bu = (base_url or "").lower()
     if "vpn" in bu or "/https/" in bu or "webvpn" in bu:
-        msg += "\n提示：当前 OCR Base URL 填的是代理网关地址，建议先按第 2 条改用官方直连，以确认是否网关限制所致。"
+        msg += "\n提示：当前 OCR Base URL 填的是代理网关地址，单张整版图经网关转发时容易被掐断，建议先按第 2 条关闭代理、改直连后重试。"
     return msg
 
 
@@ -717,9 +806,9 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
     ov = overrides or {}
     # provider 身份优先跟随前端当前选中（overrides.provider），
     # 仅在未传时回退 BOX_OCR_PROVIDER，确保切换即时生效、不静默回退千问
-    provider = ov.get("provider") or provider or cfg.get("BOX_OCR_PROVIDER", "qwen")
+    provider = ov.get("provider") or provider or cfg.get("BOX_OCR_PROVIDER", "doubao")
     if provider not in OCR_PROVIDERS:
-        provider = "qwen"
+        provider = "doubao"
     ppre = OCR_PROVIDERS[provider]["key_prefix"]
     pdef = OCR_PROVIDERS[provider]
     api_key = ov.get("api_key") or cfg.get(ppre + "_API_KEY", "")
@@ -730,6 +819,16 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
                 % (ppre, pdef["label"], ppre + "_API_KEY"))
     base_url = ov.get("base_url") or cfg.get(ppre + "_BASE_URL", "") or pdef["default_base_url"]
     model = ov.get("model") or cfg.get(ppre + "_MODEL", "") or pdef["default_model"]
+    if not model:
+        # 豆包（现为默认服务商）走火山方舟，model 是用户自建的接入点 ID，内置无法预设；
+        # 这里提前给出可操作提示，避免把空 model 发给接口后只回一条费解的 400。
+        return ("【未配置模型】当前 OCR 服务商为「%s」，但未填写模型名。\n"
+                "请在设置中填写 %s_MODEL 后保存，再执行识别。\n"
+                "%s"
+                "标题：\n作者：\n正文：（未配置模型，未调用真实模型）"
+                % (pdef["label"], ppre,
+                   ("豆包填火山方舟的接入点 ID，形如 ep-2024xxxxxxxx-xxxxx（在火山方舟控制台「在线推理-接入点」里创建/复制），不是 doubao-xxx 模型名。\n"
+                    if provider == "doubao" else "")))
     user_text = _safe_format(prompt_override or SINGLE_INSTRUCTION, src=src)
     # 字段模式：单框裁切（作者/标题等）套用整篇提示词会让模型把孤立短文字误判为标题或留空。
     # 显式告知模型本图是某一字段的裁切区域，直接转录纯文本、不要输出字段名结构。
@@ -740,6 +839,10 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
     elif label == "title":
         user_text += ("\n\n【字段模式·标题】本图仅为一篇文章的「标题」裁切区域（可能只有一至数字，竖排或横排），" +
                       "请直接转录图中全部文字，输出为不带任何字段名前缀的纯文本；不要输出「标题：/作者：/正文：」结构。")
+    elif label == "section":
+        user_text += ("\n\n【字段模式·节标题】本图仅为一篇文章内部的分节小标题（如「（一）从人的纪念到人的教训」「二、……」），" +
+                      "不是文章标题。请直接转录图中全部文字并保留原有的（一）/一、等序号，输出为不带任何字段名前缀的纯文本；" +
+                      "不要输出「标题：/作者：/正文：」结构，也不要把它补写成完整句子。")
     payload = {
         "model": model,
         "messages": [
@@ -1063,6 +1166,38 @@ def _clean_renamed_stale(work):
     return removed
 
 
+def _clean_export_variants(out_root, src, ext, multi):
+    """写新一批导出文件前，清掉同一来源「另一种拆分形态」的残留，避免两种形态并存。
+
+    拆篇形态（multi=True，本次写 {src}__{i}.{ext}）→ 删旧的合并单文件 {src}.{ext}；
+    合并形态（multi=False，本次写 {src}.{ext}）→ 删旧的拆篇文件 {src}__*.{ext}。
+    只动本工具自己写出的 raw 中转文件（.txt/.json），不碰图片与结构化产物。
+    不清的后果：上一轮的另一种形态会被 _gather_round 一并收进结构化目录，
+    多出一篇「旧文本」或把 N 篇糊成一篇。
+    """
+    removed = []
+    try:
+        if not os.path.isdir(out_root):
+            return removed
+        if multi:
+            targets = [src + "." + ext]
+        else:
+            pre = src + "__"
+            targets = [fn for fn in os.listdir(out_root)
+                       if fn.startswith(pre) and fn.endswith("." + ext)]
+        for fn in targets:
+            p = os.path.join(out_root, fn)
+            if os.path.isfile(p):
+                try:
+                    os.remove(p)
+                    removed.append(fn)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+    return removed
+
+
 def _gather_round(out_root, work, pages, old_cross_dir):
     """结构化前把该轮 OCR 产物（整版原图 + .txt + .json）从 output/ 根或旧跨页目录
     收拢进 work（output/{top}/{轮次基名}/）。目标已存在则跳过，避免覆盖。
@@ -1095,10 +1230,12 @@ def _gather_round(out_root, work, pages, old_cross_dir):
             for fn in os.listdir(sd):
                 base = os.path.splitext(fn)[0]
                 ext = os.path.splitext(fn)[1].lower()
-                # 跨页·按篇拆分：收集 output/{old_cross_dir}/ 下以「{old_cross_dir}__」开头的拆篇 txt/json，
-                # 它们 base（如 crossBaseName__1）不在 bases 内，需单独放行，否则结构化收拢不到、整轮仍糊成一篇。
-                is_split = bool(old_cross_dir) and fn.startswith(old_cross_dir + "__") \
-                           and ext in (".txt", ".json")
+                # 一篇一个产物：{基名}__{篇序}.txt/.json。跨页（基名=跨页基名）与单页
+                # （基名=整版名，同版内按组/标题分了多篇）都会写这种拆篇文件，
+                # 所以按「本轮任一本名 + __ + 纯数字」放行，不再只认跨页目录名前缀。
+                is_split = ext in (".txt", ".json") and any(
+                    base.startswith(b + "__") and base[len(b) + 2:].isdigit()
+                    for b in bases)
                 if (base not in bases) and not is_split:
                     continue
                 # 只收拢该轮的原图/ocr txt/ocr json（排除已结构化的 _题录.md / 题录_*.md 与 结构化_*.txt）
@@ -1181,9 +1318,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, HTML, "text/html; charset=utf-8")
         if u.path == "/api/config":
             cfg, explicit = _load_cfg()
-            provider = cfg.get("BOX_OCR_PROVIDER", "qwen")
+            provider = cfg.get("BOX_OCR_PROVIDER", "doubao")
             if provider not in OCR_PROVIDERS:
-                provider = "qwen"
+                provider = "doubao"
             ppre = OCR_PROVIDERS[provider]["key_prefix"]
             active_key = cfg.get(ppre + "_API_KEY", "")
             active_model = cfg.get(ppre + "_MODEL", "")
@@ -1465,8 +1602,15 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": False, "error": "(stderr) " + (r.stderr or r.stdout)[:300]})
                 try:
                     res = json.loads(r.stdout.strip().splitlines()[-1])
+                    if not isinstance(res, dict):
+                        res = {"ok": False, "error": "重算引用：子进程返回的不是 JSON 对象"}
                 except Exception:
-                    res = {"ok": True, "raw": r.stdout[:200]}
+                    # 关键：不能把解析失败伪造成 ok:True —— 前端会据此打印
+                    # 「已按手改字段重算引用：undefined」，把真实失败原因彻底掩盖。
+                    _tail = (r.stdout or "").strip()[-300:]
+                    res = {"ok": False,
+                           "error": "重算引用失败：子进程未返回可解析结果。"
+                                    + (("输出末段：" + _tail) if _tail else "")}
                 return self._json(res)
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)[:200]})
@@ -1539,12 +1683,15 @@ class Handler(BaseHTTPRequestHandler):
         if out_dir:
             out_root = os.path.join(out_root, out_dir)
         os.makedirs(out_root, exist_ok=True)
-        # 跨页·按篇拆分：当 out_dir 非空（跨页）且有多篇（boxes 多个）时，每篇单独写一个 txt，
-        # 文件名 {src}__{篇序}.txt，避免「整轮合并成一篇、结构化只取第一篇」导致多篇文章被糊成一篇。
-        # 单篇（boxes 仅 1 个）或单页（out_dir 为空）维持单文件 {src}.txt 向后兼容。
-        multi = bool(out_dir) and len(boxes) > 1
+        # 按篇拆分不再看 out_dir：跨页多篇、单页模式下「同一版内按组分了多篇」都必须
+        # 一篇一个 txt（{src}__{篇序}.txt）。此前只在 out_dir 非空（跨页且载入≥2 版）时拆，
+        # 单页模式/跨页只载 1 版的多篇会被拼进同一个 {src}.txt（【框1】【框2】…），
+        # 结构化只能产出一篇——表现为「分了多篇，只有一个文档能结构化」。
+        # 单篇（boxes 仅 1 个）仍维持单文件 {src}.txt 向后兼容。
+        multi = len(boxes) > 1
         if multi:
-            # 跨页·按篇拆分：每篇单独写一个 txt（{src}__{篇序}.txt），避免整轮合并成一篇
+            # 每篇单独写一个 txt，避免整轮合并成一篇
+            _clean_export_variants(out_root, src, "txt", True)
             written = []
             for i, b in enumerate(boxes, 1):
                 base = f"{src}__{i}"
@@ -1554,7 +1701,8 @@ class Handler(BaseHTTPRequestHandler):
                     f.write(f"出处：{src}\n\n【框1】{(b.get('text') or '').strip()}\n")
                 written.append(base + ".txt")
             return self._json({"ok": True, "written": written, "out_root": out_root, "multi": True})
-        # 单篇/单页（向后兼容）：所有框按序拼进同一个 {src}.txt，编号【框N】
+        # 单篇（向后兼容）：所有框按序拼进同一个 {src}.txt，编号【框N】
+        _clean_export_variants(out_root, src, "txt", False)
         txt_path = os.path.join(out_root, src + ".txt")
         lines = [f"出处：{src}", ""]
         for i, b in enumerate(boxes, 1):
@@ -1576,9 +1724,12 @@ class Handler(BaseHTTPRequestHandler):
         if out_dir:
             out_root = os.path.join(out_root, out_dir)
         os.makedirs(out_root, exist_ok=True)
-        multi = bool(out_dir) and len(boxes) > 1
+        # 与 _export 同构：多篇就一篇一个 json（{src}__{篇序}.json），不看 out_dir，
+        # 否则单页模式/跨页只载 1 版的多篇仍会合成一个 json。
+        multi = len(boxes) > 1
         if multi:
-            # 跨页·按篇拆分：每篇单独写 {src}__{篇序}.json（单 entry 数组）
+            # 每篇单独写一个 {src}__{篇序}.json（单 entry 数组）
+            _clean_export_variants(out_root, src, "json", True)
             written = []
             last_path = ""
             for i, b in enumerate(boxes, 1):
@@ -1592,7 +1743,8 @@ class Handler(BaseHTTPRequestHandler):
                 written.append(base + ".json")
                 last_path = json_path
             return self._json({"ok": True, "written": written, "out_root": out_root, "path": last_path, "multi": True})
-        # 单篇/单页（向后兼容）：所有框累积进同一个 json 数组
+        # 单篇（向后兼容）：所有框累积进同一个 json 数组
+        _clean_export_variants(out_root, src, "json", False)
         arr = []
         for i, b in enumerate(boxes, 1):
             arr.append({"source": src, "mode": mode, "order": i,
@@ -1643,8 +1795,11 @@ class Handler(BaseHTTPRequestHandler):
         os.makedirs(exp_root, exist_ok=True)
 
         # 两类产物直接平铺进同一个 output/oneclick/ 文件夹（不再分子文件夹、不再分时间戳），
-        # 共享 used 字典以处理 .md 与 .txt 间的同名冲突
+        # 共享 used 字典以处理 .md 与 .txt 间的同名冲突。
+        # 逐文件容错：此前任一 copy2 抛 OSError（文件被占用、路径超长等）会中断整个循环，
+        # 用户看到的是「文件夹里只有一半文件」；现改为记录失败项、继续复制其余文件。
         def _copy_flat(files, dst, used):
+            failed = []
             for s in files:
                 name = os.path.basename(s)
                 if name in used:
@@ -1656,14 +1811,19 @@ class Handler(BaseHTTPRequestHandler):
                             name = cand
                             break
                         n += 1
-                used[name] = True
-                shutil.copy2(s, os.path.join(dst, name))
+                try:
+                    shutil.copy2(s, os.path.join(dst, name))
+                    used[name] = True
+                except Exception as e:
+                    failed.append({"src": s, "name": name, "error": f"{type(e).__name__}: {e}"})
+            return failed
 
         used = {}
+        failed = []
         if kb_count > 0:
-            _copy_flat(kb_files, exp_root, used)
+            failed += _copy_flat(kb_files, exp_root, used)
         if plain_count > 0:
-            _copy_flat(plain_files, exp_root, used)
+            failed += _copy_flat(plain_files, exp_root, used)
 
         return self._json({
             "ok": True,
@@ -1671,6 +1831,8 @@ class Handler(BaseHTTPRequestHandler):
             "rel": os.path.relpath(exp_root, _img_dir("")),
             "kb_count": kb_count,
             "plain_count": plain_count,
+            "copied": kb_count + plain_count - len(failed),
+            "failed": failed,
         })
 
     def _open_folder_api(self, data):
@@ -2783,6 +2945,22 @@ HTML = r"""<!doctype html>
   .headright { display:flex; gap:10px; align-items:center; }
   .headright button { white-space:nowrap; flex-shrink:0; }
 
+  /* 主页顶部提示：建议关闭网络代理 / VPN（可关闭，记忆在 localStorage）
+     高度由 JS 实测回填到 .wrap，避免行数变化时撑破视口 */
+  #vpnTip { display:flex; align-items:center; gap:10px; padding:7px 18px;
+            background:#fff8e6; border-bottom:1px solid #f0d9a8; color:#8a5a00;
+            font-size:12.5px; line-height:1.55; }
+  #vpnTip .vpn-txt { flex:1 1 auto; }
+  #vpnTip b { color:#8a4b00; font-weight:700; }
+  #vpnTip .vpn-x { flex:0 0 auto; background:transparent; border:1px solid #eccf94;
+                   color:#8a5a00; border-radius:6px; padding:2px 10px; font-size:12px;
+                   font-weight:600; cursor:pointer; }
+  #vpnTip .vpn-x:hover { background:#fdf0d2; }
+  .eye-care #vpnTip { background:#EDF6E4; border-bottom-color:#C6DEB6; color:#3F6B36; }
+  .eye-care #vpnTip b { color:#2F5B2A; }
+  .eye-care #vpnTip .vpn-x { border-color:#C6DEB6; color:#3F6B36; }
+  .eye-care #vpnTip .vpn-x:hover { background:#DCEDD0; }
+
   /* 流程提示 */
   .hint .stage { display:inline-flex; align-items:center; gap:5px; margin-right:14px;
                  white-space:nowrap; font-size:12.5px; color:var(--mut); }
@@ -2833,7 +3011,7 @@ HTML = r"""<!doctype html>
   #resultList .card .hd { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:12px; color:var(--mut); margin-bottom:4px; min-width:0; }
   #resultList .card .hd .title { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #resultList .card .hd .meta { flex-shrink:0; white-space:nowrap; }
-  #resultList textarea { width:100%; min-height:90px; font-family:"Microsoft YaHei",monospace; font-size:12px;
+  #resultList textarea { width:100%; min-height:90px; font-family:"Microsoft YaHei",monospace; font-size:var(--rs-fs,12px);
                          border:1px solid var(--bd); border-radius:4px; padding:6px; resize:vertical; }
   .srcname { font-weight:600; color:var(--pri); }
   .kbd { font-family:ui-monospace,monospace; background:#e2e8f0; padding:1px 4px; border-radius:3px; font-size:11px; }
@@ -2991,6 +3169,10 @@ HTML = r"""<!doctype html>
     </button>
   </div>
 </div>
+<div id="vpnTip">
+  <div class="vpn-txt"><b>识别前请先关闭网络代理 / VPN</b>（含图书馆 WebVPN 等网关）。整版裁切图单张可达数 MB，经代理转发时容易被中途掐断，表现为「连接被远端中断 / 连接超时」；改用直连后重试即可。</div>
+  <button class="vpn-x" id="vpnTipClose" title="不再显示这条提示">知道了</button>
+</div>
 <div class="wrap">
   <div class="left">
       <div id="toolbar" style="display:flex; align-items:center; gap:8px; margin-bottom:8px; padding:6px 8px; background:#f1f5f9; border-radius:8px; font-size:13px;">
@@ -3063,6 +3245,7 @@ HTML = r"""<!doctype html>
       <label>框选标签</label>
       <select id="lblSel">
         <option value="title">title（标题）</option>
+        <option value="section">section（节标题）</option>
         <option value="author">author（作者）</option>
         <option value="text" selected>text（正文）</option>
       </select>
@@ -3070,7 +3253,7 @@ HTML = r"""<!doctype html>
 
     <div class="card">
       <h2>③ OCR识别</h2>
-      <p class="sub">组 = 一篇文章：同组（同色）框合并识别/导出为一篇，留空则自动合并为一篇，组内按“标题 → 作者 → 正文”排序。</p>
+      <p class="sub">组 = 一篇文章：同组（同色）框合并识别/导出为一篇，留空则自动合并为一篇，组内按“标题 → 作者 → 正文”排序。节标题（section）是文章内部分节的小标题，算正文的一部分，不参与分篇。</p>
       <div style="margin-top:12px; border-top:1px solid var(--bd); padding-top:12px;">
         <h3 style="font-size:13px;font-weight:600;margin:0 0 8px;color:var(--ink);">已框选区域（按阅读顺序，序号 = 导出次序）</h3>
         <div id="boxList"><div style="color:var(--mut); font-size:12px;">尚未框选</div></div>
@@ -3151,8 +3334,8 @@ HTML = r"""<!doctype html>
     <div class="set-group">
       <h3>OCR 视觉模型（任选一）</h3>
       <div class="row" style="margin-bottom:8px; align-items:center; gap:10px; flex-wrap:nowrap;">
-        <label class="rdo"><input type="radio" name="cfgProvider" value="qwen"> 千问（日常）</label>
-        <label class="rdo"><input type="radio" name="cfgProvider" value="doubao"> 豆包（疑难）</label>
+        <label class="rdo"><input type="radio" name="cfgProvider" value="doubao"> 豆包（推荐）</label>
+        <label class="rdo"><input type="radio" name="cfgProvider" value="qwen"> 千问</label>
         <label class="rdo"><input type="radio" name="cfgProvider" value="other"> 其他（自定义）</label>
       </div>
       <div class="row">
@@ -3343,10 +3526,11 @@ let dragState = null; let uid = 1; let mode = 'auto'; let backendCfg = {};
 let allPageData = {}; let pageOrder = []; let pageList = []; let navList = []; let pageIdx = -1; let crossResults = {};
 let fileMtimes = {};   // 整版原图修改时间（秒），来自 /api/list_images 的 mtimes，供排序抽屉使用
 let mergeMode = 'single';
-// 跨页分篇策略由后端按「全工作集 title 框总数」自动判定，无前端开关：1 个 title → 合并续页；≥2 → 每版独立成篇
+// 跨页分篇：以「标题」为唯一边界（无前端开关）。有标题开新篇，无标题并入前一篇；
+// 续页题头（重复正题 / 只剩（二）标记 / （一）这类章节小标题）继续写在当前篇里。
 let off = 0;
 
-const LBL_COLOR = { title:'#2563eb', text:'#16a34a', author:'#9333ea' };
+const LBL_COLOR = { title:'#2563eb', section:'#0891b2', text:'#16a34a', author:'#9333ea' };
 const GROUP_COLORS = ['#dc2626','#2563eb','#16a34a','#9333ea','#d97706','#0891b2','#7c3aed','#db2777','#65a30d','#ea580c'];
 function groupColor(g){ let h=0; for(let i=0;i<g.length;i++) h=(h*31+g.charCodeAt(i))%16777215; return GROUP_COLORS[h%GROUP_COLORS.length]; }
 const HANDLE=9, HIT_PAD=2;
@@ -3363,13 +3547,13 @@ restoreLogs();
 autoUpdateCheckOnLaunch();
 // 启动时把已保存的密钥/模型回填进输入框，避免重开后看似"丢失"
 // OCR 服务商切换：每个服务商各存一组凭据，切换时回填对应值
-let ocrProvider = 'qwen';
+let ocrProvider = 'doubao';
 const ocrStash = { qwen:{api_key:'',base_url:'',model:''}, doubao:{api_key:'',base_url:'',model:''}, other:{api_key:'',base_url:'',model:''} };
 function applyProviderFromValues(v){
   v = v || {};
   for(const p of ['qwen','doubao','other']){ const pre=p.toUpperCase();
     ocrStash[p] = { api_key:v[pre+'_API_KEY']||'', base_url:v[pre+'_BASE_URL']||'', model:v[pre+'_MODEL']||'' }; }
-  ocrProvider = (['qwen','doubao','other'].includes(v.BOX_OCR_PROVIDER)) ? v.BOX_OCR_PROVIDER : 'qwen';
+  ocrProvider = (['qwen','doubao','other'].includes(v.BOX_OCR_PROVIDER)) ? v.BOX_OCR_PROVIDER : 'doubao';
   setProviderRadio(ocrProvider);
   fillActiveProviderInputs();
   // 回填独立的结构化（DeepSeek）密钥/地址/模型，否则重启后设置面板显示为空（密钥已落盘只是未恢复显示）
@@ -3384,7 +3568,7 @@ function fillActiveProviderInputs(){
   const def = (ocrProvider==='qwen')
     ? { key:'sk-...', base:'https://dashscope.aliyuncs.com/compatible-mode/v1', model:'' }
     : (ocrProvider==='doubao')
-    ? { key:'ark-', base:'https://ark.cn-beijing.volces.com/api/v3', model:'' }
+    ? { key:'ark-', base:'https://ark.cn-beijing.volces.com/api/v3', model:'ep-2024xxxxxxxx-xxxxx（火山方舟接入点 ID）' }
     : { key:'', base:'', model:'' };
   $('cfgApiKey').placeholder = def.key;
   $('cfgBaseUrl').placeholder = def.base;
@@ -3415,6 +3599,26 @@ function applyEyeCare(on, save){
   }
 }
 const _eye=$('eyeBtn'); if(_eye) _eye.onclick=()=>applyEyeCare(!document.body.classList.contains('eye-care'), true);
+
+// ---------- 主页顶部提示：建议关闭网络代理 / VPN（可关闭，记忆在 localStorage） ----------
+// 提示条占位高度由实测回填到 .wrap，避免窗口变窄换行时撑破视口（.wrap 原为 calc(100vh - 56px)）。
+function syncVpnTipH(){
+  const tip=$('vpnTip'), w=document.querySelector('.wrap'); if(!tip||!w) return;
+  if(tip.style.display==='none' || !tip.offsetHeight){ w.style.height=''; return; }
+  w.style.height='calc(100vh - 56px - '+tip.offsetHeight+'px)';
+}
+function initVpnTip(){
+  const tip=$('vpnTip'); if(!tip) return;
+  let off=false; try{ off = localStorage.getItem('mh_vpn_tip_off')==='1'; }catch(_e){}
+  if(off){ tip.style.display='none'; return; }
+  const b=$('vpnTipClose');
+  if(b) b.onclick=()=>{ tip.style.display='none';
+    try{ localStorage.setItem('mh_vpn_tip_off','1'); }catch(_e){}
+    syncVpnTipH(); };
+  window.addEventListener('resize', syncVpnTipH);
+  syncVpnTipH();
+}
+initVpnTip();
 function updateCfgLine(){
   const hasKey = backendCfg && backendCfg.dry_run===false;
   const model = (backendCfg&&backendCfg.model)||'未配置';
@@ -3572,7 +3776,7 @@ function renderBoxList(){ const el=$('boxList');
     const pageTag = cross ? `<span class="bx-page" title="所在版">${esc(v.pageName.replace(/\.[^.]+$/,'')||'')}</span>` : '';
     d.innerHTML=`<span class="bx-num" style="background:${color}">${num}</span>${pageTag}
       <div class="bx-main">
-        <select data-page="${esc(v.pageName)}" data-idx="${v.localIdx}">${['title','author','text'].map(l=>`<option ${l===b.label?'selected':''}>${l}</option>`).join('')}</select>
+        <select data-page="${esc(v.pageName)}" data-idx="${v.localIdx}">${['title','section','author','text'].map(l=>`<option ${l===b.label?'selected':''}>${l}</option>`).join('')}</select>
         <input class="grp" data-page="${esc(v.pageName)}" data-idx="${v.localIdx}" value="${esc(b.group||'')}" placeholder="自动分组" title="留空=按标题自动分组；填同名手动合并">
         <span class="bx-group" style="color:${color}" title="${groupHint}">${groupHint}</span>
       </div>
@@ -3589,10 +3793,13 @@ function renderBoxList(){ const el=$('boxList');
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
 // ---------- 识别 ----------
+// 组内排序优先级：标题 → 作者 → 正文。节标题(section)与正文同级（同为 2），
+// 同级再按框选顺序排，因此节标题会留在它在正文中的原位置，不会被挪到段首或段尾。
 function labelPriority(l){ return l==='title'?0:l==='author'?1:2; }
 // 生效组计算（单一事实来源）：无 group 的框按"框选顺序"遍历，遇到一个 title 就开新组（auto1/auto2…），
 // 该标题及其之后、下一个标题之前的框都归这一组；首个标题之前的框并入第一组（auto1）；整页无标题则统一 auto0（一篇）。
 // 显式标 group 的框始终优先，按组各自独立成篇。
+// 注意：只有 title 开新组；section（节标题）是文章内部的分节小标题，永远留在当前组里，不参与分篇。
 function effectiveGroups(arr){
   const map=new Map(); const pre=[]; let idx=0, cur=null;
   (arr||[]).forEach(b=>{
@@ -3614,58 +3821,88 @@ function getOcrTargets(bs){ bs=bs||boxes;
     const label = g.isAuto ? (boxesOf.length>1 ? g.key.replace('auto:','') : boxesOf[0].label) : ('group:'+g.group);
     return {key:g.key,boxes:boxesOf,group:g.group||'',label,auto:g.isAuto?g.key.replace('auto:',''):''}; }); }
 
-// 跨页拆分策略（后端自动判定，无需用户选择）：
-//   「单框无 title」在数据上无法区分「续页」与「独立文章」，故改用「全工作集 title 框总数」判定——
-//   标题是分篇的唯一语义信号：只有 1 个 title 说明整组版本讲的是同一篇文章（跨页续页），
-//   此时全部并入该篇；有 ≥2 个 title 说明是多篇独立文章，此时每版各自成篇。
+// 跨页分篇：以「标题」为唯一边界，不按版切。
+//   跨页模式把多版按阅读顺序串成一条流，遇到标题框就开新篇；
+//   没有标题的框（同版续文、无题头的续页）一律并入当前这一篇。
+//   这与单页模式的本质区别：单页模式边界落在版内、绝不跨版合并；跨页模式允许跨版续写。
+//   续页题头（「……（续）」「（二）」之类）若与当前篇标题相同或高度相似，也算续文并入当前篇，
+//   否则「每版都印一遍题头」的报刊会被误判成多篇。
 function countTitleBoxes(){
   let n=0;
   for(const pname of pageOrder){ const pd=allPageData[pname]; if(!pd) continue;
     for(const b of (pd.boxes||[])) if(b.label==='title') n++; }
   return n; }
-// 判定结果缓存：仅在框集合变化时重算，避免每次聚合重复遍历
-let _splitCache={n:-1,mode:'auto'};
-function autoCrossSplitMode(){
-  const n=countTitleBoxes();
-  if(n!==_splitCache.n){ _splitCache={n, mode:(n>=2?'perpage':'auto')}; }
-  return _splitCache.mode; }
-// 跨页聚合：把 pageOrder 中各页的框/识别结果按阅读顺序合并。
-// 单页模式每版独立成篇；跨页模式按下列规则：
-//   ① 显式组 group → 跨页合成一篇（cross:group，优先级最高）；
-//   ② 某版 ≥2 组（多标题）→ 按版各自成篇（crossauto，逐版拆分，不互并）；
-//   ③ 全工作集仅 1 个 title（一篇文章跨多版）→ 无 title 的版并入阅读顺序中前一篇（prevArticleKey）；
-//   ④ 全工作集 ≥2 个 title（多篇独立文章）→ 每版独立成篇。
+// 标题规范化：去空白、去「（续）/（二）/（未完）」类标记、去尾部分隔符
+function _normTitle(s){
+  return (s||'')
+    .replace(/[\s\u3000]/g,'')
+    .replace(/[（(]\s*(?:续|續|续完|續完|未完|待续|待續|[一二三四五六七八九十百]+|\d+)\s*[)）]/g,'')
+    .replace(/^(?:续|續|续完|續完|续前|續前)/,'')
+    .replace(/[.。·・…—\-－_:：;；,，]+$/,'')
+    .trim(); }
+// 是否为「章节小标题」：以（一）/一、/1. 之类序号起头。报刊里这类是正文内部分节，
+// 不是新文章的开篇题头，必须续写当前篇，否则一篇长文会被它自己的小标题切成多篇。
+function _isSectionMark(s){
+  const t=(s||'').replace(/^[\s\u3000]+/,'');
+  return /^[（(]\s*[一二三四五六七八九十百\d]+\s*[)）]/.test(t)
+      || /^[一二三四五六七八九十百]+\s*[、.．]/.test(t)
+      || /^\d+\s*[、.．]\s*/.test(t); }
+// 是否为同一篇的题头：完全相同 / 一方是另一方的片段（续页题头常被截短）/ 公共前缀达 80%（错字、繁简差异）
+function _titleSame(a,b){
+  if(!a||!b) return false;
+  if(a===b) return true;
+  const s=a.length<=b.length?a:b, l=a.length<=b.length?b:a;
+  if(s.length>=4 && l.indexOf(s)>=0 && s.length>=Math.ceil(l.length*0.5)) return true;
+  const m=Math.min(a.length,b.length); let n=0;
+  while(n<m && a[n]===b[n]) n++;
+  return n>=Math.max(6, Math.ceil(m*0.8)); }
+// 跨页聚合：把 pageOrder 中各页的框/识别结果按阅读顺序合并成「文章」。
+// 分篇边界只看标题，不按版切 —— 这是跨页模式与单页模式的根本区别（单页模式每版成篇，绝不跨版合并）：
+//   ① 显式组 group → 同组跨版合成一篇（cross:group，优先级最高）；
+//   ② 有标题框 → 开新篇；但「与该篇正题相同/相似的续页题头」「只剩（二）（续）这类标记的题头」
+//      「以（一）/一、/1. 起头的章节小标题」都算续写当前篇，不另起；
+//   ③ 无标题框 → 并入当前篇（同版续文、无题头的续页）；开头就无标题则落 __cross_default__ 兜底。
 function aggregateCrossTargets(){
   if(!pageOrder.length) return getOcrTargets().map(t=>({...t,pageTargets:[{pname:srcName,t}]}));
   const groups=new Map();
-  const splitPerPage=(autoCrossSplitMode()==='perpage');
-  let prevArticleKey=null; // 最近一个"已成篇"文章的 key，续页并入它
+  let curKey=null;    // 当前正在续写的篇（最近一次由标题开篇的文章）
+  let curTitle='';    // 该篇规范化后的标题，用于续页题头比对
   for(const pname of pageOrder){
     const pd=allPageData[pname]; if(!pd) continue;
     const ts=getOcrTargets(pd.boxes);
     for(const t of ts){
+      const titled=(t.boxes||[]).some(b=>b.label==='title');
+      // 该组识别出的标题（识别前为空字符串；识别完成后才可用于续页题头比对）
+      const hasRes=!!(pd.results && pd.results[t.key]);
+      const rawTitle=titled?resultToItem(hasRes?pd.results[t.key]:null).title:'';
+      const recTitle=_normTitle(rawTitle);
       let k,label,isArticle=false;
       if(mergeMode!=='cross'){
         // 单页模式：分篇边界落在版内（按 group / 标题切分成若干篇），key 必带版名，绝不跨页合并
         k='page:'+pname+':'+t.key; label=t.group?('group:'+t.group):t.label; isArticle=true;
+      } else if(t.group){
+        // ① 显式组最高优先级：同组跨版合成一篇
+        k='cross:'+t.group; label='group:'+t.group; isArticle=true;
+      } else if(titled){
+        // ② 有标题 → 开新篇。以下三种算续写当前篇，不另起：
+        //    a) 标题与该篇正题相同/高度相似（续页题头重复印正题）；
+        //    b) 识别完成后标题只剩「（二）」「（续）」这类标记（规范化后为空）——无法命名新篇；
+        //    c) 以（一）/一、/1. 起头的章节小标题——是正文分节，不是新文章题头。
+        //    注意识别前 hasRes 为假，此时一律保守按新篇处理，避免尚未拿到文本就误并。
+        const isCont=!!(curKey && hasRes && (
+            recTitle ? ((curTitle && _titleSame(recTitle, curTitle)) || _isSectionMark(rawTitle))
+                     : true));
+        if(isCont){ k=curKey; label=groups.get(curKey).label; }
+        else { k='crossauto:'+pname+':'+t.key; label=t.label; isArticle=true; }
       } else {
-        if(t.group){ k='cross:'+t.group; label='group:'+t.group; isArticle=true; }
-        else if(ts.length>1||splitPerPage){ k='crossauto:'+pname+':'+t.key; label=t.label; isArticle=true; } // 每版多文 / 多篇独立文章→逐版独立成篇
-        else {
-          const hasTitle=(t.boxes||[]).some(b=>b.label==='title');
-          if(hasTitle){ k='crossauto:'+pname+':'+t.key; label=t.label; isArticle=true; } // 唯一的 title 所在版→独立成篇
-          else {
-            // 无标题续页：并入阅读顺序中前一篇；无前文则落__cross_default__ 兜底
-            if(prevArticleKey){ k=prevArticleKey; label=groups.get(prevArticleKey).label; }
-            else { k='__cross_default__'; label='跨页·续页（开头无标题）'; }
-            isArticle=false;
-          }
-        }
+        // ③ 无标题 → 并入当前篇（同版续文 / 无题头的续页）；开头就无标题则落兜底篇
+        if(curKey){ k=curKey; label=groups.get(curKey).label; }
+        else { k='__cross_default__'; label='跨页·续页（开头无标题）'; }
       }
       if(!groups.has(k)) groups.set(k,{key:k,label,group:t.group||'',boxes:(t.boxes||[]).slice(),pageTargets:[]});
       else { const g=groups.get(k); if(t.boxes) g.boxes.push(...t.boxes); }
       groups.get(k).pageTargets.push({pname,t});
-      if(isArticle) prevArticleKey=k;
+      if(isArticle){ curKey=k; if(recTitle) curTitle=recTitle; }
     }
   }
   return Array.from(groups.values());
@@ -3677,7 +3914,9 @@ function mergeCrossTarget(ct){
     const item=resultToItem(pd.results[t.key]);
     if(item.title){
       if(!title) title=item.title;               // 首个非空作为标题
-      else bodies.push(item.title);              // 后续非空：绝不能丢，并入正文（跨页续页的题头即在此）
+      else if(!_titleSame(_normTitle(item.title), _normTitle(title))) bodies.push(item.title);
+      // 后续标题：与正题相同者视为续页题头，丢弃不进正文（避免产物里重复一遍标题）；
+      // 明显不同者（显式组里混了另一篇）绝不能丢，并入正文
     }
     if(item.author){
       if(!author) author=item.author;            // 首个非空作为作者
@@ -3685,15 +3924,23 @@ function mergeCrossTarget(ct){
     }
     if(item.body) bodies.push(item.body);
   }
-  // 跨页拼接：若上一段末句未收尾（无句号/问号/叹号/引号收尾），说明是跨页续句，直接衔接不分段
+  // 跨页拼接：若上一段末句未收尾（无句号/问号/叹号/引号收尾），说明是跨页续句，直接衔接不分段。
+  // 例外：上一段是「（一）/一、/1.」起头的节标题，或极短（不足 12 字）的独立行时，另行分段——
+  // 否则节标题会被后一段粘成「（一）从人的纪念到人的教训本年一月中，德国人民……」。
+  // 阈值不宜放大：跨页被切断的句子也可能只有十几字，放大就会把真正的续句误断开。
   const SENT_END=/[。！？」』）】.!?\"'）]\s*$/;
-  let body='';
+  const HEADING_LIKE_MAX=12;
+  let body='', lastSeg='';
   const bs=bodies.filter(Boolean);
   for(let k=0;k<bs.length;k++){
     const seg=bs[k].replace(/^\s+|\s+$/g,'');
-    if(k===0){ body=seg; continue; }
-    if(SENT_END.test(body)) body += '\n\n' + seg;   // 上段已收尾 → 新段落
+    if(!seg) continue;
+    if(!body){ body=seg; lastSeg=seg; continue; }
+    const ends=SENT_END.test(lastSeg);
+    const headingLike=(!ends && (_isSectionMark(lastSeg) || lastSeg.length<HEADING_LIKE_MAX));
+    if(ends || headingLike) body += '\n\n' + seg;   // 上段已收尾 / 上段是短标题行 → 新段落
     else body += seg;                                // 跨页续句 → 直接衔接
+    lastSeg=seg;
   }
   const raw=`标题：${title}\n作者：${author}\n正文：${body}`.trim();
   return {title,author,body,raw};
@@ -3706,12 +3953,42 @@ function osRel(p){ if(!p) return p; try{ const base=((window.__RUNTIME_DIR)||'')
 // 常整列漏读（表现为「开头必丢一列」）。补边后贴边列离开图像边界，恢复正常识别。
 // 边距自适应：min(48, max(16, 4% × 长边))；纯白无内容，不引入噪声，源框坐标不变。
 function ocrPad(w,h){ return Math.min(48, Math.max(16, Math.round(0.04*Math.max(w,h)))); }
+// —— OCR 输出质量自检 ——
+// 便宜的视觉模型（如千问）遇到复杂竖排/密排原文会「整段读飞」：返回空、返回一两行、
+// 返回大量非汉字乱码或连续重复字符。这类失败此前静默混进结果，用户以为工具坏了。
+// 判定为可疑时记入 ocrQualityFlags，识别结束后统一提示「改用豆包 Seed-2.0-Pro 重跑」。
+let ocrQualityFlags=[];
+function ocrQualityIssue(text, b){
+  const lab=(b&&b.label)||'';
+  // 只剥掉行首的「标题：/作者：/正文：」字段名，保留其后内容（不能连整行一起删）
+  const raw=(text||'').replace(/^(标题|作者|正文)[:：]/gm,'').trim();
+  const visible=raw.replace(/\s/g,'');
+  if(!visible) return '返回空内容';
+  const han=(visible.match(/[\u4e00-\u9fff]/g)||[]).length;
+  const area=(b&&b.w&&b.h)?(b.w*b.h):0;
+  if(/(.)\1{9,}/.test(visible)) return '出现连续重复字符，疑似模型退化输出';
+  const bad=(visible.match(/[�\uFFFD□]/g)||[]).length;
+  if(visible.length>=20 && bad/visible.length>0.12) return '不可辨字符占比 '+Math.round(bad/visible.length*100)+'%';
+  // 标题/作者/节标题框本来就短，不做长度判断（否则正常短标题会被误报）
+  if(lab==='title'||lab==='author'||lab==='section') return '';
+  // 外文原文（成词、空格分界的拉丁文本）不算乱码，跳过汉字占比判断
+  const latinWords=(visible.match(/[A-Za-z]{2,}/g)||[]).length;
+  if(han/visible.length<0.15 && latinWords>=8) return '';
+  // 大框却只读出几个字：正常密排框不会这样，判定疑似整段漏读
+  if(visible.length<10 && area>150000) return '框内面积较大但仅 '+visible.length+' 字，疑似整段漏读';
+  if(visible.length>=25 && han/visible.length<0.15) return '汉字占比仅 '+Math.round(han/visible.length*100)+'%，疑似乱码/串行';
+  return '';
+}
 async function ocrBox(b, im, nW, nH){ const P=ocrPad(b.w,b.h);
   const oc=document.createElement('canvas'); oc.width=b.w+2*P; oc.height=b.h+2*P;
   const octx=oc.getContext('2d'); octx.fillStyle='#fff'; octx.fillRect(0,0,oc.width,oc.height);
   octx.drawImage(im,b.x,b.y,b.w,b.h,P,P,b.w,b.h); const b64=oc.toDataURL('image/png').split(',')[1];
   const r=await fetch('/api/ocr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_b64:b64,src:srcName,label:(b.label||''),overrides:getOverrides()})});
-  const j=await r.json(); if(!j.ok) return {text:'[OCR_ERROR] '+(j.error||''), usage:{}}; return {text:j.text||'', usage:j.usage||{}}; }
+  const j=await r.json(); if(!j.ok) return {text:'[OCR_ERROR] '+(j.error||''), usage:{}};
+  const _t=j.text||'';
+  const _issue=ocrQualityIssue(_t, b);
+  if(_issue) ocrQualityFlags.push({page:srcName, label:(b.label||'未标标签'), issue:_issue});
+  return {text:_t, usage:j.usage||{}}; }
 async function recognizeOneBox(b){ return ocrBox(b, img, natW, natH); }
 async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); return; }
   if(!pageOrder.length){ alert('请先在卡片②勾选并「载入」整版原图。'); return; }
@@ -3721,6 +3998,7 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
   if(!boxedPages.length){ alert('没有可识别的整版：请先为至少一版框选区域再识别，无框严禁识别。'); return; }
   if(noBoxPages.length){ log('[识别全部] 以下整版未框选，已跳过（仅识别已框选的 '+boxedPages.length+' 版）：'+noBoxPages.join('、')); }
   setOcrHint('识别中…', true);
+  ocrQualityFlags=[];   // 每次识别全部重置质量自检标记，避免跨批次累积
   // 逐版离线识别：每版重新取图并按页存回 allPageData，最后统一聚合
   let failedPages=[];
   let ocrPt=0,ocrCt=0,ocrTt=0,ocrDur=0;  // 本次识别累计 token / 耗时
@@ -3745,7 +4023,10 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
           const parsed={title:'',author:'',body:''};
           if(b.label==='title') parsed.title=p.title||p.body;
           else if(b.label==='author') parsed.author=p.author||p.body;
-          else parsed.body=p.body;
+          else if(b.label==='section') parsed.body=(p.body||p.title||p.author||'').replace(/^(标题|作者|正文)[：:]\s*/,'');
+          // 未标标签的框：三个字段全部保留。此前只取 body —— 模型在未标标签框里输出
+          // 「标题：xxx」时该行被整段丢弃，表现为「结构化后第一个框的标题被吞」。
+          else { parsed.title=p.title||''; parsed.author=p.author||''; parsed.body=p.body||''; }
           pd.results[t.key]=parsed; if(r.usage){ ocrPt+=r.usage.prompt_tokens||0; ocrCt+=r.usage.completion_tokens||0; ocrTt+=r.usage.total_tokens||0; ocrDur+=r.usage.duration_s||0; } }
         else if(t.boxes&&t.boxes.length>1){ const parts=[]; for(const b of t.boxes){ const r=await ocrBox(b,im,nW,nH);
           // 同单框：先用 parseArticle 拆分模型输出，再按框 label 只取对应字段，避免内容串位。
@@ -3753,7 +4034,10 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
           const parsed={title:'',author:'',body:''};
           if(b.label==='title') parsed.title=p.title||p.body;
           else if(b.label==='author') parsed.author=p.author||p.body;
-          else parsed.body=p.body;
+          else if(b.label==='section') parsed.body=(p.body||p.title||p.author||'').replace(/^(标题|作者|正文)[：:]\s*/,'');
+          // 未标标签的框：三个字段全部保留。此前只取 body —— 模型在未标标签框里输出
+          // 「标题：xxx」时该行被整段丢弃，表现为「结构化后第一个框的标题被吞」。
+          else { parsed.title=p.title||''; parsed.author=p.author||''; parsed.body=p.body||''; }
           parts.push(parsed); if(r.usage){ ocrPt+=r.usage.prompt_tokens||0; ocrCt+=r.usage.completion_tokens||0; ocrTt+=r.usage.total_tokens||0; ocrDur+=r.usage.duration_s||0; } }
           const title=parts.map(p=>p.title).find(x=>x)||''; const author=parts.map(p=>p.author).find(x=>x)||''; const body=parts.map(p=>p.body).filter(x=>x).join('\n\n');
           pd.results[t.key]={title,author,body,raw:`标题：${title}\n作者：${author}\n正文：${body}`.trim()}; } }
@@ -3773,21 +4057,21 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
   const cross = mergeMode==='cross';
   const okCount = boxedPages.length - failedPages.length;
   const wall = ((performance.now()-tStart)/1000).toFixed(2);
-  const _prov=(backendCfg&&backendCfg.values&&backendCfg.values.BOX_OCR_PROVIDER)||'qwen';
+  const _prov=(backendCfg&&backendCfg.values&&backendCfg.values.BOX_OCR_PROVIDER)||'doubao';
   const _pre=_prov.toUpperCase();
   const cfgModel=(backendCfg&&backendCfg.values&&backendCfg.values[_pre+'_MODEL'])||'';
-  log('[识别全部] 已识别 '+okCount+' / '+boxedPages.length+' 版（共载入 '+pageOrder.length+' 版，跳过未框选 '+noBoxPages.length+' 版）'+(cross?'（跨页模式：按阅读顺序合并为一篇）':'（单页模式：每版独立）')+'。');
+  log('[识别全部] 已识别 '+okCount+' / '+boxedPages.length+' 版（共载入 '+pageOrder.length+' 版，跳过未框选 '+noBoxPages.length+' 版）'+(cross?'（跨页模式：按阅读顺序、以标题为界分篇）':'（单页模式：每版独立）')+'。');
   // 分篇清单：明确「每版是否都识别到了、内容归到哪一篇」，避免只看结果面板的文本框数量而误判漏识别
   try{
     const _cts=aggregateCrossTargets();
     const _tn=countTitleBoxes();
-    log('[识别全部] 分篇结果：共 '+_cts.length+' 篇'+(cross&&_cts.length?('（工作集标题框 '+_tn+' 个 → '+(autoCrossSplitMode()==='perpage'?'判定为多篇独立文章，每版各自成篇':'判定为一篇文章跨多版，无标题的版并入前一篇')+'）'):''));
+    log('[识别全部] 分篇结果：共 '+_cts.length+' 篇'+(cross&&_cts.length?('（按标题分篇：工作集标题框 '+_tn+' 个 → 遇标题开新篇，无标题的框并入前一篇，续页题头与当前篇标题相同则续写同篇）'):''));
     _cts.forEach((ct,i)=>{
       const names=ct.pageTargets.map(pt=>pt.pname.replace(/\.[^.]+$/,''));
       const nbox=ct.pageTargets.reduce((s,pt)=>s+((pt.t&&pt.t.boxes)?pt.t.boxes.length:0),0);
       log('  第 '+(i+1)+' 篇 · '+(ct.label||'-')+' ← '+names.length+' 版 / '+nbox+' 框：'+names.join(' + '));
     });
-    if(cross&&_cts.length===1&&boxedPages.length>1) log('[识别全部] 提示：7 版内容已合并成 1 篇。若每版其实是不同文章，请把「跨页分篇策略」改为「每版独立成篇」，或给各版框在「自动分组」里填不同组号。');
+    if(cross&&_cts.length===1&&boxedPages.length>1) log('[识别全部] 提示：'+boxedPages.length+' 版内容已合并成 1 篇（分篇只看标题）。若其中某版其实是另一篇文章，请给它那篇画上并标注「标题」框；也可在「自动分组」里给各篇填不同组号强制分篇。');
   }catch(_e){ log('[识别全部] 分篇清单打印失败：'+_e); }
   if(failedPages.length) setOcrHint('识别完成，'+failedPages.length+' 版失败', false);
   else setOcrHint('识别完成 ✓（'+okCount+' 版）', true);
@@ -3795,6 +4079,16 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
   // 记录一次「识别全部」运行；OCR 调用次数按本次识别的「组」数计（每个 group 1 次，含未标 group 自动合并的默认组）
   if(okCount>0){ try{ const callGroups=aggregateCrossTargets(); fetch('/api/ocr_run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:cfgModel,pages:pageOrder.length,boxes:pageOrder.reduce((s,p)=>s+((allPageData[p]&&allPageData[p].boxes)?allPageData[p].boxes.length:0),0),calls:callGroups.length})}).catch(()=>{}); }catch(e){} }
   if(failedPages.length) log('[识别全部] 以下版识别失败：'+failedPages.join('、'));
+  // 质量自检汇总：把本批次可疑框一次性报出，并给出模型建议
+  if(ocrQualityFlags.length){
+    const _p=(backendCfg&&backendCfg.values&&backendCfg.values.BOX_OCR_PROVIDER)||'doubao';
+    log('[质量自检] 本次有 '+ocrQualityFlags.length+' 个框的识别结果异常，疑似识别失败：');
+    ocrQualityFlags.slice(0,15).forEach(f=>log('  · '+f.page+' / '+f.label+' — '+f.issue));
+    if(ocrQualityFlags.length>15) log('  · …其余 '+(ocrQualityFlags.length-15)+' 个略');
+    if(_p!=='doubao') log('[质量自检] 当前识别模型不是豆包。此类整段读飞多因原文字形/版式复杂超出该模型能力边界，建议在「设置 → 识别模型」改用豆包 Seed-2.0-Pro 后重跑这些框。');
+    else log('[质量自检] 若原图清晰仍大量异常，请检查框是否切到字行、或整版图分辨率过低。');
+    ocrQualityFlags=[];
+  }
   // 跨页模式：循环结束后统一导出合并结果；单页模式已在循环内逐版导出，此处不再重复导出
   if(cross){ exportTxt(false); exportJson(false); } }
 function parseArticle(text){ const t=(text||'').replace(/\r/g,'');
@@ -3838,6 +4132,7 @@ function renderResults(){ const el=$('resultList');
     if(!cross && t.boxes&&t.boxes.length===1){ const b=t.boxes[0];
       if(b.label==='title')display=item.title?`标题：${item.title}`:item.raw;
       else if(b.label==='author')display=item.author?`作者：${item.author}`:item.raw;
+      else if(b.label==='section')display=item.body||item.title||item.author||item.raw||'';
       else if(b.label==='text'){ const ls=[]; if(item.title)ls.push(`标题：${item.title}`); if(item.author)ls.push(`作者：${item.author}`); if(item.body)ls.push(item.body); display=ls.join('\n')||item.raw; } }
     const d=document.createElement('div'); d.className='card'; d.innerHTML=`<div class="hd"><span class="title">${title}</span><span class="meta">${size}</span></div><textarea data-key="${esc(t.key)}">${esc(display)}</textarea>`;
     el.appendChild(d); });
@@ -3923,7 +4218,8 @@ async function saveEdit(){
       try{
         for(let i=0;i<items.length;i++){
           const br=await fetch('/api/rebuild_ref',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_name:`${en}__${i+1}`,mode:mode,out_dir:od,boxes:[items[i]]})}).then(r=>r.json());
-          if(br&&br.ok) log('[保存修改] 已按手改字段重算引用(篇'+(i+1)+')：'+br.ref);
+          if(br&&br.ok&&br.ref) log('[保存修改] 已按手改字段重算引用(篇'+(i+1)+')：'+br.ref);
+          else if(br&&br.ok) log('[保存修改] 引用重算未返回结果(篇'+(i+1)+')，产物引用可能未更新');
           else if(br) log('[保存修改] 引用重算跳过(篇'+(i+1)+')：'+(br.error||'未结构化'));
         }
       }catch(e){}
@@ -3948,10 +4244,18 @@ async function saveEdit(){
       if(j2.ok){ log('['+en+'] 已覆盖写回 json → '+(j2.path||'(未知路径)')); done++; }
       else log('['+en+'] 保存 JSON 失败：'+(j2.error||''));
       // 引用联动：单页模式手改作者/标题/日期后本地重算引用串（不调模型）
+      // 该版内分了多篇（按组/标题）时，产物是 {版名}__{篇序}，必须逐篇重算；
+      // 只传整版名会定位不到已拆篇的产物，引用一律「跳过」。
       try{
-        const br=await fetch('/api/rebuild_ref',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_name:en,mode:mode,out_dir:'',boxes:items})}).then(r=>r.json());
-        if(br&&br.ok) log('['+en+'] 已按手改字段重算引用：'+br.ref);
-        else if(br) log('['+en+'] 引用重算跳过：'+(br.error||'未结构化'));
+        const _rfBase = (items.length>1) ? `${en}__` : null;
+        for(let i=0;i<items.length;i++){
+          const _sn = _rfBase ? (_rfBase+(i+1)) : en;
+          const br=await fetch('/api/rebuild_ref',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_name:_sn,mode:mode,out_dir:'',boxes:[items[i]]})}).then(r=>r.json());
+          const _tag = _rfBase ? ('['+en+' 篇'+(i+1)+']') : ('['+en+']');
+          if(br&&br.ok&&br.ref) log(_tag+' 已按手改字段重算引用：'+br.ref);
+          else if(br&&br.ok) log(_tag+' 引用重算未返回结果，产物引用可能未更新');
+          else if(br) log(_tag+' 引用重算跳过：'+(br.error||'未结构化'));
+        }
       }catch(e){}
     }catch(e){ log('['+en+'] 保存失败：'+e); }
   }
@@ -4088,6 +4392,13 @@ async function runPost(){
   // 复用 saveEdit 的落盘逻辑（跨页合并单文件 / 单页逐版写回），同时 flushEditsToAll 防止手动编辑丢字。
   log('[结构化] 先自动保存当前识别结果（等同「保存修改」）…');
   await saveEdit();
+  // 诊断：本轮到底分成几篇。若此处是 N 篇而结构化只出 1 篇文档，问题在导出/收拢层；
+  // 若此处就是 1 篇，说明分篇判定把多篇并成了一篇（看结果面板卡片数即可确认）。
+  try{
+    const _nExp = aggregateTargetsForExport().length;
+    const _modeTxt = (mergeMode==='cross'?'跨页模式':'单页模式');
+    log('[结构化] 本轮分 '+_nExp+' 篇（'+_modeTxt+'）'+( _nExp>1 ? '，raw 产物按篇写为 {基名}__{篇序}.txt' : '，单篇' )+'。');
+  }catch(e){}
   // 结构化成功后的统一清理：clearPost 只移除「本次实际结构化处理（ok 且未 skipped）」的版，
   // 其余载入但未处理的版保留在工作集与目录列表（pageList）中，可继续框选识别 / 再次结构化，
   // 避免出现「结构化后所有载入图片全部消失」的问题。cropped_hi/ 下已处理的源图仍物理删除。
@@ -4156,13 +4467,17 @@ async function runPost(){
   // 且失败时前端只打 j.error，而后端对「子进程退出码非 0」的返回没有 error 字段（真实原因在
   // stdout/stderr），用户只看到「失败:」空提示。现改为串行 + 失败时打印 stderr/stdout 末尾。
   const pages = recPages.slice();
-  let okCount=0, hasRealOutput=false; const okPages=[]; const failedPages=[];
+  // 每版将导出几篇（=将出几份文档）：单页模式「一版内按组分多篇」时，版数与文档数不等，
+  // 只报「N 版」会让人误以为只出 N 份，故此处按 aggregateTargetsForExport 的篇口径统计。
+  const nArtsOf = {};
+  for(const p of pages){ try{ nArtsOf[p]=aggregateTargetsForExport(p).length; }catch(_e){ nArtsOf[p]=0; } }
+  let okCount=0, okArts=0, hasRealOutput=false; const okPages=[]; const failedPages=[];
   for(const pname of pages){
     const od = pname.replace(/\.[^.]+$/,'');
     try{
       const r = await fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:od,pages:[pname],no_open:true,source_override:(perPageSO[pname]||globalSO||null)})});
       const j = await r.json();
-      if(j.ok && !j.skipped){ okCount++; hasRealOutput=true; okPages.push(pname); }
+      if(j.ok && !j.skipped){ okCount++; okArts += (nArtsOf[pname]||0); hasRealOutput=true; okPages.push(pname); }
       if(j.ok){
         const head=(j.stdout||'').split('\n').slice(0,2).join(' / ');
         log('[版 '+esc(pname)+'] '+(head||(j.skipped?'无产物':'成功')));
@@ -4179,7 +4494,15 @@ async function runPost(){
     }
   }
   {
-    let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+'] 单页模式：本次识别 '+pages.length+' 版，其中可结构化 '+okCount+' 版，每版独立子文件夹（output/'+top+'/整版名/）。';
+    // 口径说明：版数 ≠ 文档数。单页模式一版之内用组名/标题分了多篇时，一篇出文档一份，
+    // 因此这里同时报「版 / 篇 / 将出几份」，避免用户以为「1 版」就只该出 1 份。
+    const _scope = (okCount===pages.length)
+        ? ('本次识别 '+pages.length+' 版、共 '+okArts+' 篇')
+        : ('本次识别 '+pages.length+' 版（其中可结构化 '+okCount+' 版）、共 '+okArts+' 篇');
+    let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+'] 单页模式：'+_scope
+         +(okArts>0
+             ? (' → 将出 '+okArts+' 份文档（逐篇一份，产物在 output/'+top+'/整版名/ 下）。')
+             : ('；未能统计出可分篇数，请点「保存修改」核对实际导出的文件数后反馈。'));
     const after = ()=>{ if(hasRealOutput){ clearPost(okPages); s+='\n[结构化] 已完成版已从工作集移除，其余版保留在列表中，可继续框选识别。'; if(failedPages.length){ s+='\n[提示] 以下版未完成结构化（无产物/失败），仍保留在列表与 cropped_hi/：'+failedPages.join('、'); } } log(s); };
     // 统一打开父目录 output/{top}（多子文件夹，不钻进某一页）
     fetch('/api/open_folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:top})})
@@ -4255,9 +4578,16 @@ $('exportAll').onclick=()=>{
         log('[一键导出] '+(j.error||'没有可导出的产物')+'（请先完成识别并结构化）');
         return;
       }
-      const kbPart = j.kb_count>0 ? ('已复制 '+j.kb_count+' 个 .md') : '无 .md';
-      const plainPart = j.plain_count>0 ? ('已复制 '+j.plain_count+' 个 .txt') : '无 .txt';
-      log('[一键导出] '+kbPart+'；'+plainPart+'。已平铺到：'+j.rel);
+      const totalFound=j.kb_count+j.plain_count;
+      const copied=(j.copied!=null)?j.copied:totalFound;
+      log('[一键导出] 扫描到 '+j.kb_count+' 个 .md、'+j.plain_count+' 个 .txt，成功复制 '+copied+' / '+totalFound+' 个。已平铺到：'+j.rel);
+      // 部分文件复制失败时逐条报出原因（此前静默中断，用户只看到文件夹里少了一半文件）
+      if(j.failed && j.failed.length){
+        log('[一键导出] 注意：有 '+j.failed.length+' 个文件复制失败（已成功 '+(j.copied||0)+' 个），以下为失败原因：');
+        j.failed.slice(0,30).forEach(f=>log('  ✗ '+f.name+' — '+f.error));
+        if(j.failed.length>30) log('  …其余 '+(j.failed.length-30)+' 条略（详见日志文件）');
+        log('[一键导出] 常见原因：目标文件被 Word/编辑器占用、路径过长（>260 字符）、磁盘空间不足。处理后可再次点击导出。');
+      }
       fetch('/api/open_folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:j.dir})});
     }).catch(e=>{ alert('导出请求失败：'+e); });
 };
@@ -4538,9 +4868,18 @@ async function checkUpdate(){
     if(!j.ok) throw new Error(j.error||'检查失败');
     if(j.need){
       let html='发现新版本 <b>'+escHtml(j.latest)+'</b>（当前 '+escHtml(j.current||'--')+'）';
-      html+=' <button class="sec" id="doUpdate" style="margin-left:8px;">立即更新</button>';
+      // 该版本没提供与本机芯片匹配的 Mac 包时（如 Intel 包缺失），不提供自动更新按钮——
+      // 否则点了必然装错架构、装完打不开，用户还找不到原因。
+      if(j.arch_warn){
+        html+='<div style="color:var(--warn);margin-top:6px;line-height:1.6;">'
+            + '该版本未提供适用于本机芯片（'+escHtml(j.local_arch||'未知')+'）的 Mac 安装包，已停用自动更新以免装错架构；'
+            + '请 <button class="sec" id="gotoReleaseArch" style="margin:0 2px;">手动打开发布页</button> 自行选择。</div>';
+      } else {
+        html+=' <button class="sec" id="doUpdate" style="margin-left:8px;">立即更新</button>';
+      }
       st.innerHTML=html;
-      $('doUpdate').onclick=()=>startUpdate(j);
+      const _du=$('doUpdate'); if(_du) _du.onclick=()=>startUpdate(j);
+      const _ga=$('gotoReleaseArch'); if(_ga) _ga.onclick=()=>openExternalUrl(j.page_url||RELEASE_PAGE_URL);
     } else {
       st.textContent='当前已是最新版本（'+escHtml(j.current||'--')+'）'; st.style.color='var(--ok)';
     }
@@ -4576,7 +4915,8 @@ async function autoUpdateCheckOnLaunch(){
     const j=await r.json();
     if(!j.ok || !j.need) return;
     if(j.latest===SKIP_VERSION){ log('[更新] 已设置跳过 '+SKIP_VERSION+'，暂不提醒'); return; }
-    if(AUTO_UPDATE){ log('[更新] 已开启自动更新，正在下载新版本…'); startUpdate(j); }
+    if(AUTO_UPDATE && !j.arch_warn){ log('[更新] 已开启自动更新，正在下载新版本…'); startUpdate(j); }
+    else if(AUTO_UPDATE && j.arch_warn){ log('[更新] 该版本无本机芯片（'+(j.local_arch||'未知')+'）对应包，跳过自动更新，改提示手动选包'); showUpdateModal(j); }
     else { showUpdateModal(j); }
   }catch(e){ /* 启动检查失败不打扰用户 */ }
 }
@@ -4587,14 +4927,22 @@ function showUpdateModal(j){
     m=document.createElement('div'); m.id='updateModal'; m.className='modal-mask';
     m.innerHTML='<div class="modal-card">'
       +'<div class="modal-title">发现新版本</div>'
-      +'<div class="modal-body">墨痕已发布新版本 <b class="um-latest"></b>，是否立即更新？</div>'
+      +'<div class="modal-body"><span class="um-body"></span></div>'
       +'<label class="switch-row um-skip-row" style="margin:6px 0 14px;">'
       +'<input type="checkbox" id="umSkip"><span>不再提示该版本</span></label>'
       +'<div class="modal-foot"><button class="ghost" id="umLater">稍后</button>'
       +'<button class="sec" id="umNow">立即更新</button></div></div>';
     document.body.appendChild(m);
   }
-  m.querySelector('.um-latest').textContent=j.latest||'';
+  // 架构不匹配时：文案改说明、按钮改「打开发布页」，不提供装错架构的入口
+  const _bodyM=m.querySelector('.um-body'), _nowM=m.querySelector('#umNow');
+  if(j.arch_warn){
+    _bodyM.textContent='墨痕已发布新版本 '+ (j.latest||'') +'，但该版本未提供适用于本机芯片（'+(j.local_arch||'未知')+'）的 Mac 安装包。为避免装错架构，请到发布页手动选择对应芯片的包。';
+    _nowM.textContent='打开发布页';
+  } else {
+    _bodyM.textContent='墨痕已发布新版本 '+ (j.latest||'') +'，是否立即更新？';
+    _nowM.textContent='立即更新';
+  }
   const skipBox=m.querySelector('#umSkip'); if(skipBox) skipBox.checked=false;
   m.classList.add('open');
   m.querySelector('#umLater').onclick=async ()=>{
@@ -4607,7 +4955,10 @@ function showUpdateModal(j){
     }
     m.classList.remove('open');
   };
-  m.querySelector('#umNow').onclick=()=>{ m.classList.remove('open'); startUpdate(j); };
+  _nowM.onclick=()=>{
+    m.classList.remove('open');
+    if(j.arch_warn){ openExternalUrl(j.page_url||RELEASE_PAGE_URL); } else { startUpdate(j); }
+  };
   m.onclick=(e)=>{ if(e.target===m) m.classList.remove('open'); };
 }
 function openSettingsDrawer(){ drawer.classList.add('open'); usageDrawer.classList.remove('open'); promptDrawer.classList.remove('open'); mask.classList.add('open'); }
@@ -4821,6 +5172,24 @@ function setupCtxMenu(){
   document.addEventListener('scroll',hide,true);
   window.addEventListener('blur',hide);
   const resultList=$('resultList');
+  // 校对文本框字号：Ctrl+滚轮缩放（10–28px，普通滚轮不受影响），记忆到 localStorage。
+  // 屏幕较小时正文 12px 偏小，用户习惯与 txt 编辑器一致的 Ctrl+滚轮缩放手势。
+  (function(){
+    let fs=parseInt(localStorage.getItem('mh_result_fs')||'12',10);
+    if(!(fs>=10&&fs<=28)) fs=12;
+    const apply=()=>document.documentElement.style.setProperty('--rs-fs', fs+'px');
+    apply();
+    const el=document.getElementById('resultList');
+    if(!el) return;
+    el.addEventListener('wheel', e=>{
+      if(!e.ctrlKey) return;            // 非 Ctrl 滚轮保持原有竖向滚动
+      e.preventDefault();
+      const next=Math.min(28, Math.max(10, fs + (e.deltaY<0?1:-1)));
+      if(next===fs) return;
+      fs=next; apply();
+      try{ localStorage.setItem('mh_result_fs', String(fs)); }catch(_e){}
+    }, {passive:false});
+  })();
   if(resultList){ resultList.addEventListener('contextmenu',e=>{ const ta=e.target.closest('textarea'); if(!ta) return; e.preventDefault(); ctxTarget=ta;
       menu.style.display='block'; const x=e.clientX, y=e.clientY; const w=menu.offsetWidth||110, h=menu.offsetHeight||120; const ww=window.innerWidth, wh=window.innerHeight;
       menu.style.left=Math.min(x, Math.max(8, ww-w-8))+'px'; menu.style.top=Math.min(y, Math.max(8, wh-h-8))+'px'; }); }
@@ -5045,7 +5414,12 @@ def main():
         except Exception:
             pass
         threading.Thread(target=_watch_topmost, args=(win,), daemon=True).start()
-    webview.start(_on_app_ready)
+    try:
+        webview.start(_on_app_ready)
+    except Exception as _e:
+        # pythonnet/.NET 的实际初始化发生在 start() 内部（guilib → winforms → import clr），
+        # 不在 import webview 时。这里是该错误真正的抛出点，必须兜住并给出可操作提示。
+        _startup_fail(f"webview.start 失败：{type(_e).__name__}: {_e}")
 
 
 def _decl_topmost_api():

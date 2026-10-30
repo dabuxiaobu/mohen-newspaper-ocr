@@ -4,11 +4,11 @@
 # 触发方式：
 #   1) 推送正式版 tag（无 v 前缀，与 Windows 自动更新约定一致）：
 #        git tag 1.1.0 && git push --tags
-#      → 自动在真实 Mac runner（macos-15 / Apple Silicon）上构建 arm64 架构，
-#        产出 .dmg / .zip / .sha256.txt，并【追加】进同名 release
+#      → 自动在真实 Mac runner 上构建，产出 .dmg / .zip / .sha256.txt，并【追加】进同名 release
 #        （例如已手动建好的 1.1.0 release，含 Windows 文件，这里补上 Mac 文件）。
-#      （注：x86_64 原走 macos-13 Intel runner，常年排队，故暂仅发 arm64；
-#         Intel Mac 用户可改用源码/portable 方式运行。）
+#      （注：arm64 走 macos-15（Apple Silicon），x86_64 走 macos-15-intel（Intel）。
+#        原 macos-13 已于 2025-12 退役，GitHub 官方指定 macos-15-intel 作为唯一 x86_64 镜像，
+#        可用至 2027-08，之后 GitHub 托管 runner 不再提供 Intel。）
 #   2) 手动触发（Actions 页面 Run workflow，填 version=1.1.0）：
 #        构建并把 Mac 产物【追加】进同名 release，不新建。
 #
@@ -43,6 +43,8 @@ jobs:
         include:
           - runner: macos-15       # Apple Silicon（arm64）
             arch: arm64
+          - runner: macos-15-intel # Intel（x86_64）；macos-13 已退役，这是官方唯一 x86_64 镜像（可用至 2027-08）
+            arch: x86_64
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
