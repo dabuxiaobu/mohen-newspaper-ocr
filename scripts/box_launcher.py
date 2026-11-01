@@ -230,7 +230,7 @@ except Exception as _e:
     # pythonnet 真正初始化在 webview.start() 里（见文件末尾，那里也做了兜底）。
     _startup_fail(f"{type(_e).__name__}: {_e}")
 
-VERSION = "4.0.0"
+VERSION = "4.0.1"
 
 # ---------- OCR 服务商（豆包 / 千问 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -502,8 +502,13 @@ SYSTEM_PROMPT = """你是近代文献（图书、期刊、报纸等）OCR 与转
 
 硬性约束：
 1. 原文多为繁体中文，常见竖排（右起左行、上起下行）与横排两种版式；**标题、作者、出版信息亦可能横排**，横排有左起（从左往右）与右起（从右往左）两种方向。转录时**横排按实际阅读方向读（左起横排从左到右，右起横排从右到左）、竖排元素按从右到左**，严禁按图像像素行顺序误排，严禁把横排内容按竖排方向读。**横排文本若为右起（从右往左读），须按实际阅读顺序输出，不得机械从左到右拼接**。输出横排，繁/简依用户要求（未指明则保留繁体）。
-2. 严格忠实原文：不增删、不臆造、不擅自改写文意、不把旧用法改成现代用法。对模糊或疑似错字，按你的最佳判断直接给出你认定的字，不要加任何"疑为…""照录""（注：…）"之类的注释或说明；实在无法辨认的字才以 □ 占位。
-3. 异体字、俗字、旧字形、缺笔字按你的最佳判断直接转录，不擅自替换时也不加任何注记。
+2. 严格忠实原文：不增删、不臆造、不擅自改写文意、不把旧用法改成现代用法。**判断依据是"这个字在图上是否看得清"，不是"这里应该是什么字"**：
+   - 字形完整、主要笔画齐全 → 照实转录；
+   - 关键笔画缺失、上下或左右部件分辨不清、墨迹粘连成块 → 以 □ 占位；
+   - 整字只剩墨团、或残存笔画不足三成 → 以 □ 占位。
+   **严禁依上下文补全**：人名、地名、机构名、书刊名等专名中若有看不清的字，不得替换为更常见、更知名的字或词，也不得因标题或前文已出现过某个名字，就把此处补成那个名字。例：见"林□"（第二字笔画残缺）不得补为"林伯渠""林则徐"，应原样输出"林□"。
+   不要加任何"疑为…""照录""（注：…）"之类的注释或说明；□ 本身是占位符而非注释，可以正常出现。
+3. 异体字、俗字、旧字形、缺笔字属刻印字形写法（字仍可辨认、非图像缺损），直接转录其字形，不擅自改成通行写法、也不加注记；但若连部件轮廓都无法分辨、无法判断是哪个字（属缺墨或图像缺损），按第 2 条以 □ 占位，不得凭字形或上下文猜测。
 4. 保留标题、副题、正文、图注、页码、书眉、版权页信息之间的层级与分隔；同一视觉块内的内容归为一段。
 5. 若区域含多篇文章/多栏接续，按视觉分块分别输出并明确标注边界，不要擅自拼接为一段。
 6. 不输出与转录无关的说明、寒暄或"以下是转录结果"之类前缀；直接给内容。
@@ -512,7 +517,7 @@ SYSTEM_PROMPT = """你是近代文献（图书、期刊、报纸等）OCR 与转
 SINGLE_INSTRUCTION = """这是民国竖排报纸中的一篇文章（出处：{src}）。
 请你完成该篇文章的转录：
 1. 图中文字多为竖排繁体，按「从右到左逐列、每列从上到下」的顺序读取；若遇横排（左起或右起）按实际阅读方向读，严禁按图像像素行机械拼接。
-   **必须完整读满全图**：竖排的阅读起点即图像最右侧的第一列，即使该列紧贴图像边缘、或字形被裁切得不完整，也必须逐字转录，严禁漏掉最右一列；横排起始端（左起为最左列、右起为最右列）同理不得漏读。宁可多读可疑字，不可整列跳过。
+   **必须完整读满全图**：竖排的阅读起点即图像最右侧的第一列，即使该列紧贴图像边缘、或字形被裁切得不完整，也必须逐字转录，严禁漏掉最右一列；横排起始端（左起为最左列、右起为最右列）同理不得漏读。**宁可把整列中的模糊字标成 □，也不可整列跳过**。
 2. 输出结构必须严格为三行，不要写其他前缀、分篇标记或说明：
    标题：
    作者：
@@ -524,7 +529,8 @@ SINGLE_INSTRUCTION = """这是民国竖排报纸中的一篇文章（出处：{s
    - 引题、副标题、正文首句、刊头信息一律归入正文或标题，绝不可塞入作者字段。
    - 严禁把字段名"正文：""标题："写入作者或正文的内容中。
 4. 将竖排繁体转为简体中文输出；忠实原文，不擅自改写文意、不把旧用法改成现代用法。
-5. **不要对任何字词加注释或疑似说明**（如"疑为…""照录""（注：…）""（原文…）"等）。遇到模糊或疑似错字，凭你的最佳判断直接给出你认定的字；实在无法辨认才以 □ 占位。
+5. **不要对任何字词加注释或疑似说明**（如"疑为…""照录""（注：…）""（原文…）"等）。遇到模糊或缺墨的字，判断依据是"在图上是否看得清"：笔画完整就照实转录；关键笔画缺失、部件分辨不清、只剩墨团，一律以 □ 占位。
+   **尤须警惕人名、地名等专名**：写得模糊的字，绝不可因标题或前文已出现过某个人名，便把它补成那个名字，也不可补成更常见的知名人物。例：见"林□"（第二字笔画残缺）应原样输出"林□"，不得补为"林伯渠""林则徐"。□ 是占位符，不是注释，允许出现。
 6. 若本图是该文的接续页（跨页续文，正文起首即承接上一版末句），则把**接续处上行尾与下行首连成一句完整输出**，不要在版/栏衔接处强行插入分段或空行；跨页的最终合并由系统完成，单页转录只需保证本页文字连续、不擅自断句。仅当确属新段落（上一版末已是完整句且有句号等收尾）时，才在段首正常起段。
 7. 本篇正文中，若文字因框选边缘被几何截断（如某句跨框、框底/框右切到句中），须保持句子连续，在截断处不得换行断句；仅在确属新段落时正常起段。
 
@@ -1663,6 +1669,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._cleanup_cropped(data)
         if u.path == "/api/cleanup_cross_raw":
             return self._cleanup_cross_raw(data)
+        if u.path == "/api/clear_results":
+            return self._clear_results(data)
         if u.path == "/api/open_url":
             return self._open_url(data)
         if u.path == "/api/update_download":
@@ -1672,6 +1680,69 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/auto_update":
             return self._set_auto_update(data)
         return self._send(404, "not found")
+
+    def _clear_results(self, data):
+        """「一键清空」：删除本轮各版已导出到 output/ 下的 raw 转录产物（.txt / .json）。
+
+        清空范围以本轮载入的版名为边界，逐个精确匹配 `{基名}.txt`、`{基名}.json`、
+        `{基名}__{篇序}.txt/.json`，不使用通配删除；只处理 .txt/.json，
+        结构化产物（.md）与整版原图一律不动。目录不存在时静默跳过，返回空清单。
+        跨页模式额外处理跨页基名（导出以 crossBaseName 命名）与其中转目录。
+        """
+        pages = [str(p) for p in (data.get("pages") or []) if p]
+        out_dir = (data.get("out_dir") or "").strip()
+        cross_base = (data.get("cross_base") or "").strip()
+        out_root = _img_dir("output")
+        # 安全阀（先于归一化校验）：版名只能是纯文件名。含路径分隔符 / 盘符 / 上级目录符号
+        # 一律中止——不做静默 basename，避免「传错了反而删掉另一个同名版」的隐性误删。
+        for raw in pages + ([cross_base] if cross_base else []) + ([out_dir] if out_dir else []):
+            if ("/" in raw) or ("\\" in raw) or (".." in raw) or (":" in raw):
+                return self._json({"ok": False, "error": "版名不合法，已中止：" + raw})
+        bases = set()
+        for p in pages:
+            b = os.path.splitext(os.path.basename(p))[0]
+            if b:
+                bases.add(b)
+        if cross_base:
+            b = os.path.splitext(os.path.basename(cross_base))[0]
+            if b:
+                bases.add(b)
+        if not bases:
+            return self._json({"ok": True, "removed": []})
+        # 安全阀：版名只能是文件名，含路径分隔符 / 盘符 / 上级目录符号一律中止，避免越界删除
+        for b in bases:
+            if ("/" in b) or ("\\" in b) or (".." in b) or (":" in b):
+                return self._json({"ok": False, "error": "版名不合法，已中止：" + b})
+        # 候选目录：output 根（单页/未收拢的 raw）、output/{out_dir}（跨页中转）、
+        # output/{plain_text|knowledge_base}/{基名}（已结构化过的轮次目录内仍留有 raw）
+        dirs = [out_root]
+        if out_dir:
+            dirs.append(os.path.join(out_root, out_dir))
+        for top in ("plain_text", "knowledge_base"):
+            for b in bases:
+                dirs.append(os.path.join(out_root, top, b))
+        pat = re.compile(r"^(?:" + "|".join(re.escape(b) for b in sorted(bases))
+                         + r")(?:__\d+)?\.(?:txt|json)$")
+        removed = []
+        for d in dict.fromkeys(dirs):
+            if not os.path.isdir(d):
+                continue
+            try:
+                names = os.listdir(d)
+            except OSError:
+                continue
+            for fn in names:
+                if not pat.match(fn):
+                    continue
+                fp = os.path.join(d, fn)
+                if not os.path.isfile(fp):
+                    continue
+                try:
+                    os.remove(fp)
+                    removed.append(os.path.relpath(fp, out_root).replace("\\", "/"))
+                except OSError:
+                    pass
+        return self._json({"ok": True, "removed": removed, "bases": sorted(bases)})
 
     def _export(self, data):
         src = data.get("source_name", "")
@@ -2527,7 +2598,7 @@ class Handler(BaseHTTPRequestHandler):
         for k in ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL"):
             if cfg.get(k):
                 env[k] = cfg[k]
-        env.setdefault("DEEPSEEK_MODEL", "deepseek-v4-flash")
+        env.setdefault("DEEPSEEK_MODEL", "deepseek-flash")
         # 子进程需能 import stop_flag（脚本目录 HERE），否则冻结态会 ModuleNotFoundError 崩溃
         env["PYTHONPATH"] = HERE + os.pathsep + env.get("PYTHONPATH", "")
         # 数据目录统一传到子进程，避免 postprocess.py 在打包态把 token_log 写到 exe 目录
@@ -2697,7 +2768,7 @@ class Handler(BaseHTTPRequestHandler):
             for k in ("DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL"):
                 if cfg.get(k):
                     env[k] = cfg[k]
-            env.setdefault("DEEPSEEK_MODEL", "deepseek-v4-flash")
+            env.setdefault("DEEPSEEK_MODEL", "deepseek-flash")
             # 把数据目录注入子进程，确保 extract_original.py / postprocess.py 等子脚本
             # 在打包态下把产物写到「文档/墨痕数据」而不是 exe 目录。
             env["MOHEN_DATA_DIR"] = RUNTIME_DIR
@@ -3271,6 +3342,7 @@ HTML = r"""<!doctype html>
       <div id="ctxMenu" style="display:none;"></div>
       <div class="btns" style="margin-top:10px; align-items:center;">
         <button class="run" id="saveEdit">保存修改</button>
+        <button class="stop" id="clearResults" title="清空所有已载入版的识别结果，并删除 output/ 下本轮导出的 txt/json；框选与原图保留">一键清空</button>
         <span id="saveEditHint" style="font-size:13px; color:var(--ok); display:none;"></span>
       </div>
       <!-- 来源补充：墨痕题录信息默认取自导入文件名。文件名未携带报刊名/日期/版次时，在此按版补充。同一版内多篇共享来源，不同版各自填；留空沿用原逻辑。 -->
@@ -3357,7 +3429,7 @@ HTML = r"""<!doctype html>
             <input id="cfgDsKey" class="secret" type="text" placeholder="sk-..." autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
             <span class="eye" data-target="cfgDsKey" title="显示/隐藏"></span>
           </div></div>
-        <div><label>DeepSeek 模型名</label><input id="cfgDsModel" placeholder="deepseek-v4-flash"></div>
+        <div><label>DeepSeek 模型名</label><input id="cfgDsModel" placeholder="deepseek-flash"></div>
       </div>
       <label>DeepSeek Base URL（可选，默认官方）</label>
       <input id="cfgDsUrl" placeholder="https://api.deepseek.com">
@@ -3956,7 +4028,7 @@ function ocrPad(w,h){ return Math.min(48, Math.max(16, Math.round(0.04*Math.max(
 // —— OCR 输出质量自检 ——
 // 便宜的视觉模型（如千问）遇到复杂竖排/密排原文会「整段读飞」：返回空、返回一两行、
 // 返回大量非汉字乱码或连续重复字符。这类失败此前静默混进结果，用户以为工具坏了。
-// 判定为可疑时记入 ocrQualityFlags，识别结束后统一提示「改用豆包 Seed-2.0-Pro 重跑」。
+// 判定为可疑时记入 ocrQualityFlags，识别结束后统一提示「改用豆包 Seed-2.1-Pro 重跑」。
 let ocrQualityFlags=[];
 function ocrQualityIssue(text, b){
   const lab=(b&&b.label)||'';
@@ -4085,7 +4157,7 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
     log('[质量自检] 本次有 '+ocrQualityFlags.length+' 个框的识别结果异常，疑似识别失败：');
     ocrQualityFlags.slice(0,15).forEach(f=>log('  · '+f.page+' / '+f.label+' — '+f.issue));
     if(ocrQualityFlags.length>15) log('  · …其余 '+(ocrQualityFlags.length-15)+' 个略');
-    if(_p!=='doubao') log('[质量自检] 当前识别模型不是豆包。此类整段读飞多因原文字形/版式复杂超出该模型能力边界，建议在「设置 → 识别模型」改用豆包 Seed-2.0-Pro 后重跑这些框。');
+    if(_p!=='doubao') log('[质量自检] 当前识别模型不是豆包。此类整段读飞多因原文字形/版式复杂超出该模型能力边界，建议在「设置 → 识别模型」改用豆包 Seed-2.1-Pro 后重跑这些框。');
     else log('[质量自检] 若原图清晰仍大量异常，请检查框是否切到字行、或整版图分辨率过低。');
     ocrQualityFlags=[];
   }
@@ -4558,6 +4630,38 @@ $('canvasWrap').addEventListener('wheel',e=>{
   else { setZoom(userZoom*(e.deltaY<0?1.1:0.9)); }
 },{passive:false});
 $('saveEdit').onclick=saveEdit;
+// 一键清空：清掉「所有已载入版」的识别结果，并删除 output/ 下本轮导出的 raw 转录产物（txt/json）。
+// 不动框选区域、不动 cropped_hi/ 整版原图、不动已生成的结构化 .md；清空后需重新点「识别全部」。
+// 用 addEventListener 绑定（与 clearBoxes 同理），避免按钮 id 与同名函数/变量冲突导致点击无反应。
+const _clearResultsBtn=$('clearResults');
+if(_clearResultsBtn){ _clearResultsBtn.addEventListener('click', async ()=>{
+  if(!pageOrder.length){ alert('尚未载入整版，没有可清空的结果。'); return; }
+  const _anyRes=aggregateCrossTargets().some(t=>{
+    const it=resultToItem(crossResults[t.key]); return !!(it.raw||it.body||it.title||it.author); });
+  if(!_anyRes){ alert('当前没有识别结果可清空。'); return; }
+  const _od=currentOutDir();                                              // 跨页且载入≥2 版时非空
+  const _cb=(mergeMode==='cross'&&pageOrder.length>1)?crossBaseName():''; // 跨页导出所用基名
+  if(!confirm('确认清空全部 '+pageOrder.length+' 版的识别结果？\n\n'
+    + '· 右侧结果面板全部清空\n'
+    + '· output/ 下本轮导出的 txt / json 一并删除\n'
+    + '· 框选区域、整版原图、已生成的结构化文档不受影响\n\n'
+    + '清空后需重新点「识别全部」。')) return;
+  let _removed=[];
+  try{
+    const r=await fetch('/api/clear_results',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({pages:pageOrder.slice(), out_dir:_od, cross_base:_cb})});
+    const j=await r.json();
+    if(j&&j.ok) _removed=j.removed||[];
+    else log('[一键清空] 删除产物失败：'+((j&&j.error)||'未知原因'));
+  }catch(e){ log('[一键清空] 删除产物失败：'+e.message); }
+  // 清内存：各版 results 置空后，按当前框选重建 crossResults（重建出来的都是空文本）
+  for(const p of pageOrder){ const k=String(p||'').replace(/\.[^.]+$/,''); if(allPageData[k]) allPageData[k].results={}; }
+  crossResults={}; for(const ct of aggregateCrossTargets()) crossResults[ct.key]=mergeCrossTarget(ct);
+  renderResults();
+  log('[一键清空] 已清空 '+pageOrder.length+' 版的识别结果'
+      + (_removed.length ? ('，删除产物 '+_removed.length+' 个：\n'+_removed.map(s=>'  output/'+s).join('\n'))
+                         : '，output/ 下无对应产物文件') + '。');
+}); }
 // 注意：按钮 id 为 clearBoxes，与脚本中可能存在的同名函数/变量存在全局属性命名冲突，
 // 用 addEventListener 绑定，避免被同名函数声明覆盖导致点击无反应。
 const _clearBoxesBtn=$('clearBoxes');

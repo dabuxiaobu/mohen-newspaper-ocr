@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-民国报纸 OCR 全链路后置：DeepSeek V4 Flash 题录结构化
+民国报纸 OCR 全链路后置：DeepSeek V4.1 Flash（模型名 deepseek-flash）题录结构化
 =====================================================
 输入：民国报纸OCR/ 各篇子目录的 OCR 转录 .txt（ocr_from_labels.py 产出）
 输出：同子目录下 <篇名>_题录.md，含 标题/日期/作者/引用(GB/T 7714-2015)
@@ -11,8 +11,8 @@
 
 凭证（环境变量，沙箱无，需本机设定）：
   DEEPSEEK_API_KEY   必填
-  DEEPSEEK_MODEL     必填（如火山方舟 ep-xxxx / deepseek-chat 等）
-  DEEPSEEK_BASE_URL  可选，默认火山方舟 Ark（与豆包同端点）；换平台时覆盖
+  DEEPSEEK_MODEL     可选，默认 deepseek-flash（DeepSeek-V4.1-Flash）；火山方舟 ep-xxxx 等亦可
+  DEEPSEEK_BASE_URL  可选，默认 DeepSeek 官方 https://api.deepseek.com；换平台（如火山方舟）时覆盖
 """
 import os
 import re
@@ -1530,7 +1530,7 @@ def main():
         return
 
     api_key = os.environ.get("DEEPSEEK_API_KEY")
-    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    model = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
     if not api_key:
         sys.exit("缺少环境变量 DEEPSEEK_API_KEY")
     if not HAS_OPENCC:
