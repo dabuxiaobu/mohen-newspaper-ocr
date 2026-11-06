@@ -230,7 +230,7 @@ except Exception as _e:
     # pythonnet 真正初始化在 webview.start() 里（见文件末尾，那里也做了兜底）。
     _startup_fail(f"{type(_e).__name__}: {_e}")
 
-VERSION = "4.0.1"
+VERSION = "4.1.0"
 
 # ---------- OCR 服务商（豆包 / 千问 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -254,6 +254,24 @@ OCR_PROVIDERS = {
         "base_placeholder": "https://ark.cn-beijing.volces.com/api/v3",
         "key_placeholder": "ark-",
         "model_placeholder": "ep-2024xxxxxxxx-xxxxx（火山方舟接入点 ID）",
+    },
+    "kandian": {
+        "label": "看典古籍（免费）",
+        "key_prefix": "KANDIAN",
+        "default_base_url": "https://ocr.kandianguji.com",
+        "default_model": "v2",
+        "base_placeholder": "https://ocr.kandianguji.com",
+        "key_placeholder": "看典 API Token",
+        "model_placeholder": "v2（推荐）/ beta / default",
+    },
+    "baidu": {
+        "label": "百度智能云",
+        "key_prefix": "BAIDU",
+        "default_base_url": "https://aip.baidubce.com",
+        "default_model": "accurate_basic",
+        "base_placeholder": "https://aip.baidubce.com",
+        "key_placeholder": "百度应用的 API Key",
+        "model_placeholder": "accurate_basic（高精度，推荐）/ accurate（含位置）/ general_basic（标准）",
     },
     "other": {
         "label": "其他（自定义）",
@@ -381,9 +399,74 @@ def _mac_arch_keyword():
         return "x86_64"
     return None
 
+def _mac_update_env_problem():
+    """macOS：判断当前运行位置是否不能做「程序内自我替换」。
+    返回 (code, hint)；code 为空串表示环境正常。
+    code: translocation=系统临时隔离位置；dmg=仍在 dmg 只读卷里；readonly=所在目录不可写。
+    必须单独判这个的原因：用户在 dmg 里直接双击运行时，替换脚本对只读卷必然失败，
+    而旧脚本会无条件删掉旧包备份，直接把用户的程序毁掉（2026-11-03 实际故障）。
+    """
+    if sys.platform != "darwin":
+        return "", ""
+    # APP_DIR 在 mac 冻结态 = <xxx>.app/Contents/MacOS，上溯两级即 .app 本体
+    app_bundle = os.path.dirname(os.path.dirname(APP_DIR))
+    if "AppTranslocation" in app_bundle:
+        return "translocation", "墨痕当前运行在 macOS 的临时隔离位置，说明它还没被拖进「应用程序」文件夹。"
+    if app_bundle.startswith("/Volumes/"):
+        return "dmg", "墨痕正在 dmg 安装包里直接运行，该磁盘是只读的，无法自我更新。"
+    parent = os.path.dirname(app_bundle) or "/"
+    try:
+        _t = os.path.join(parent, ".moh_write_test")
+        with open(_t, "w") as _f:
+            _f.write("")
+        os.remove(_t)
+    except Exception:
+        return "readonly", "墨痕所在的 %s 目录不可写，无法自我替换。" % parent
+    return "", ""
+
+# 更新失败记忆：替换开始前把「目标版本」写进 update_pending.json，成功启动后（VERSION 已等于
+# 目标版本）自动清除。作用是打断「每次启动都重下一遍、每次都失败」的死循环——上次没装成就
+# 不再自动重试，改提示手动下载，否则用户看到的就是「一直在自动更新」。
+UPDATE_PENDING_FILE = os.path.join(CONFIG_DIR, "update_pending.json")
+
+def _update_pending_target():
+    """返回「上次更新未完成」的目标版本号；无标记或已成功则返回空串。"""
+    try:
+        if not os.path.exists(UPDATE_PENDING_FILE):
+            return ""
+        with open(UPDATE_PENDING_FILE, "r", encoding="utf-8") as _f:
+            _d = json.load(_f) or {}
+        _tgt = str(_d.get("target") or "").strip()
+    except Exception:
+        return ""
+    if _tgt and _tgt == VERSION:
+        # 当前版本已追平目标 → 上次更新成功，清掉标记
+        try:
+            os.remove(UPDATE_PENDING_FILE)
+        except Exception:
+            pass
+        return ""
+    return _tgt
+
+def _update_pending_write(target):
+    try:
+        with open(UPDATE_PENDING_FILE, "w", encoding="utf-8") as _f:
+            json.dump({"target": str(target or ""), "ts": int(time.time()), "stage": "applying"}, _f)
+    except Exception:
+        pass
+
 def _build_update_result(current, rel, rel2=None):
     is_mac = (sys.platform == "darwin")
     local_arch = _mac_arch_keyword() if is_mac else None
+    # macOS 只在「运行位置无法自我替换」或「上次更新没完成」时才禁用自动更新；
+    # 正常装在「应用程序」里的 mac 用户照常自动更新（位置检测全部通过即允许）。
+    env_code, env_hint = _mac_update_env_problem()
+    _pend = _update_pending_target()
+    if is_mac and not env_code and _pend:
+        env_code = "pending"
+        env_hint = ("上次更新到 %s 没有完成。请手动下载安装包：双击 dmg，"
+                    "把里面的「墨痕」拖进「应用程序」文件夹覆盖。" % _pend)
+    manual_only = bool(is_mac and env_code)
     def _pick(r):
         if not r: return None, None
         win_asset=None; mac_asset=None; mac_other=None; fallback_zip=None
@@ -417,7 +500,8 @@ def _build_update_result(current, rel, rel2=None):
         return {"ok": True, "current": current, "latest": (rel or {}).get("tag",""), "notes": (rel or {}).get("notes",""), "page_url": (rel or {}).get("page_url",""),
                 "download_url":"", "asset_name":"", "sha256_url":"", "alt_download_url":"", "alt_sha256_url":"",
                 "need": False, "platform":"macos" if is_mac else "windows",
-                "arch_warn": False, "local_arch": local_arch or ""}
+                "arch_warn": False, "local_arch": local_arch or "",
+                "manual_only": manual_only, "env_warn": env_code, "env_hint": env_hint}
     tgt2, sha2 = _pick(rel2) if rel2 else (None, None)
     need = bool(tgt) and bool((rel or {}).get("tag")) and (rel or {}).get("tag") != current
     return {
@@ -432,6 +516,11 @@ def _build_update_result(current, rel, rel2=None):
         # 该版本没提供与本机芯片匹配的 Mac 包时置 True，前端据此提示「手动去发布页选包」
         "arch_warn": bool(is_mac and local_arch and local_arch not in tgt["name"].lower()),
         "local_arch": local_arch or "",
+        # manual_only：mac 上仅在「运行位置不可自替换」或「上次更新未完成」时为 True，
+        # 前端据此只给「手动打开发布页」、不给「立即更新」；位置正常的 mac 用户照常自动更新
+        "manual_only": manual_only,
+        # env_warn：运行位置不适合自更新时给出原因码，前端额外提示
+        "env_warn": env_code, "env_hint": env_hint,
     }
 
 def _check_update():
@@ -509,7 +598,7 @@ SYSTEM_PROMPT = """你是近代文献（图书、期刊、报纸等）OCR 与转
    **严禁依上下文补全**：人名、地名、机构名、书刊名等专名中若有看不清的字，不得替换为更常见、更知名的字或词，也不得因标题或前文已出现过某个名字，就把此处补成那个名字。例：见"林□"（第二字笔画残缺）不得补为"林伯渠""林则徐"，应原样输出"林□"。
    不要加任何"疑为…""照录""（注：…）"之类的注释或说明；□ 本身是占位符而非注释，可以正常出现。
 3. 异体字、俗字、旧字形、缺笔字属刻印字形写法（字仍可辨认、非图像缺损），直接转录其字形，不擅自改成通行写法、也不加注记；但若连部件轮廓都无法分辨、无法判断是哪个字（属缺墨或图像缺损），按第 2 条以 □ 占位，不得凭字形或上下文猜测。
-4. 保留标题、副题、正文、图注、页码、书眉、版权页信息之间的层级与分隔；同一视觉块内的内容归为一段。
+4. 保留标题、副题、正文、图注、页码、书眉、版权页信息之间的层级与分隔；同一视觉块内的内容归为一段。**框内可见的主标题、引题、副题（含双副题、多行题组）须逐一转录，不得只留主标题。**
 5. 若区域含多篇文章/多栏接续，按视觉分块分别输出并明确标注边界，不要擅自拼接为一段。
 6. 不输出与转录无关的说明、寒暄或"以下是转录结果"之类前缀；直接给内容。
 7. 同一栏/同一视觉块内连续排印的正文，不得因框选边缘几何截断而断行；栏内文字连排为一段，仅在确属新段落（上一句已有句末标点收尾，或存在明显层级/空行分隔）处换行。"""
@@ -518,6 +607,7 @@ SINGLE_INSTRUCTION = """这是民国竖排报纸中的一篇文章（出处：{s
 请你完成该篇文章的转录：
 1. 图中文字多为竖排繁体，按「从右到左逐列、每列从上到下」的顺序读取；若遇横排（左起或右起）按实际阅读方向读，严禁按图像像素行机械拼接。
    **必须完整读满全图**：竖排的阅读起点即图像最右侧的第一列，即使该列紧贴图像边缘、或字形被裁切得不完整，也必须逐字转录，严禁漏掉最右一列；横排起始端（左起为最左列、右起为最右列）同理不得漏读。**宁可把整列中的模糊字标成 □，也不可整列跳过**。
+   **同一框内若有多列或多行并列的短文字（主标题与副题、双副题、并列署名、并列小标题等），每一列、每一行都要逐条转录，按阅读顺序用换行分隔，不得只取其中最醒目的一条。**
 2. 输出结构必须严格为三行，不要写其他前缀、分篇标记或说明：
    标题：
    作者：
@@ -632,9 +722,13 @@ def _load_cfg():
     _CFG_KEYS = ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
                  "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
                  "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
+                 "KANDIAN_API_KEY", "KANDIAN_EMAIL", "KANDIAN_MODEL", "KANDIAN_BASE_URL", "KANDIAN_DET_MODE",
+                 "KANDIAN_HP_ORDER",
+                 "BAIDU_API_KEY", "BAIDU_SECRET_KEY", "BAIDU_MODEL", "BAIDU_BASE_URL", "BAIDU_AUTO_FALLBACK",
                  "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                  "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
-                 "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE", "RENAME_POLICY")
+                 "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE", "RENAME_POLICY",
+                 "OCR_CONCURRENCY", "OCR_TEMPERATURE")
     if os.path.exists(p):
         try:
             data = json.load(open(p, encoding="utf-8"))
@@ -671,6 +765,9 @@ def _ensure_blank_config():
     blank = {k: "" for k in ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
                              "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
                              "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
+                             "KANDIAN_API_KEY", "KANDIAN_EMAIL", "KANDIAN_MODEL", "KANDIAN_BASE_URL", "KANDIAN_DET_MODE",
+                             "KANDIAN_HP_ORDER",
+                             "BAIDU_API_KEY", "BAIDU_SECRET_KEY", "BAIDU_MODEL", "BAIDU_BASE_URL", "BAIDU_AUTO_FALLBACK",
                              "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                              "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
                              "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE", "RENAME_POLICY")}
@@ -687,6 +784,9 @@ def _cfg_status(cfg, explicit):
     keys = ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
             "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
             "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
+            "KANDIAN_API_KEY", "KANDIAN_EMAIL", "KANDIAN_MODEL", "KANDIAN_BASE_URL", "KANDIAN_DET_MODE",
+            "KANDIAN_HP_ORDER",
+            "BAIDU_API_KEY", "BAIDU_SECRET_KEY", "BAIDU_MODEL", "BAIDU_BASE_URL", "BAIDU_AUTO_FALLBACK",
             "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
             "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
             "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE", "RENAME_POLICY")
@@ -802,6 +902,312 @@ def _translate_net_error(e, base_url=""):
     return msg
 
 
+def _norm_region_boxes(rb):
+    """把 region_boxes 规范成看典要求的**字符串**：'[[x1,y1,x2,y2], ...]'。
+
+    官方规定：坐标是**整图像素**、左上角原点，且必须是字符串（不是 JSON 数组）；
+    硬约束是「用 region_boxes 必须 det_layout=False」，两者互斥。
+    接受 list（[x1,y1,x2,y2]，或 {x,y,w,h}）与已是 JSON 字符串两种入参；
+    任何非法内容都返回空串＝不启用，绝不把脏坐标发给接口。
+    """
+    if not rb:
+        return ""
+    if isinstance(rb, str):
+        s = rb.strip()
+        if not s:
+            return ""
+        try:
+            arr = json.loads(s)
+        except Exception:
+            return ""
+    else:
+        arr = rb
+    try:
+        out = []
+        for b in arr:
+            if isinstance(b, dict):
+                x1, y1 = float(b.get("x", 0) or 0), float(b.get("y", 0) or 0)
+                if b.get("x2") is not None and b.get("y2") is not None:
+                    x2, y2 = float(b["x2"]), float(b["y2"])
+                else:
+                    x2, y2 = x1 + float(b.get("w", 0) or 0), y1 + float(b.get("h", 0) or 0)
+            else:
+                seq = list(b)
+                if len(seq) < 4:
+                    continue
+                x1, y1, x2, y2 = float(seq[0]), float(seq[1]), float(seq[2]), float(seq[3])
+            if x2 < x1:
+                x1, x2 = x2, x1
+            if y2 < y1:
+                y1, y2 = y2, y1
+            if x2 - x1 < 1 or y2 - y1 < 1:
+                continue
+            out.append([int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))])
+    except Exception:
+        return ""
+    return json.dumps(out, ensure_ascii=False) if out else ""
+
+
+def _kandian_ocr(b64, token, email, version="v2", base_url="https://ocr.kandianguji.com",
+                 det_mode="auto", hp_order="right2left", src="", label="",
+                 region_boxes="", return_position=False):
+    """看典古籍 OCR（免费）：同步接口，一次请求即出结果。
+
+    与豆包/千问的根本差异：判别式引擎（检测+识别），**不吃提示词、不做字段判断、
+    不加现代标点**，见字出字。它独有的能力是显式的排版方向参数：
+      det_mode  = auto 自判 / sp 强制竖排 / hp 强制横排
+      hp_order  = hp_line_words_angel，横排字序 left2right / right2left（仅 v2）
+      sp_order  = sp_line_words_angel，竖排字序 top2bottom / bottom2top（仅 v2）
+
+    hp_order 是本轮实测的关键：民国报纸横排标题多为**右起排版**（视觉首字在右），
+    模型默认 left2right 只按视觉顺序照抄，于是「烟臺紀行」被输出成「行紀台烟」、
+    「雲姑」被输出成「姑雲」，题录直接废掉。PaddleOCR-VL 与 MinerU 同样是照抄
+    视觉序列，但**没有参数可纠正**；看典提供了 right2left，是四家里唯一能把
+    「右起重排」交给引擎完成的。
+    """
+    import urllib.request
+    import urllib.error
+
+    base = (base_url or "https://ocr.kandianguji.com").strip().rstrip("/")
+    if "/ocr_api" in base:                 # 允许直接粘接口全地址
+        base = base.split("/ocr_api")[0]
+    mode = (det_mode or "auto").strip().lower()
+    if mode not in ("auto", "sp", "hp"):
+        mode = "auto"
+    hp = (hp_order or "right2left").strip().lower()
+    if hp not in ("left2right", "right2left"):
+        hp = "right2left"
+    ver = (version or "v2")
+    payload = {
+        "token": token or "",
+        "email": email or "",
+        "image": b64,
+        "det_mode": mode,
+        "version": ver,
+        "image_size": 0,
+        "return_position": bool(return_position),
+    }
+    # hp_line_words_angel 仅在 version=v2 受支持（官方文档标注），低版本传入会被忽略
+    if ver == "v2":
+        payload["hp_line_words_angel"] = hp
+    # region_boxes（仅 v2）：在一张**整版图**上一次指定多个框同时识别，坐标为整图像素。
+    # 留空即完全不发送，主流程（一框一次、裁剪图）零变化；只有显式传入时才启用。
+    _rb = _norm_region_boxes(region_boxes)
+    if _rb and ver == "v2":
+        payload["region_boxes"] = _rb
+        payload["det_layout"] = False   # 官方硬约束：与 region_boxes 互斥，必须关闭版面识别
+    req = urllib.request.Request(base + "/ocr_api",
+                                 data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                                 method="POST")
+    req.add_header("Content-Type", "application/json")
+    t0 = time.time()
+    raw = b""
+    try:
+        with urllib.request.urlopen(req, timeout=180, context=_ssl_ctx()) as resp:
+            raw = resp.read()
+        j = json.loads(raw.decode("utf-8", "replace"))
+        if (j.get("message") or "").strip().lower() != "success":
+            raise RuntimeError("看典古籍返回错误：%s" % (j.get("info") or j.get("message") or "未知原因"))
+        d = j.get("data")
+        if isinstance(d, list):
+            text = "\n".join([str(x) for x in d if str(x).strip()])
+        elif isinstance(d, dict):
+            text = "\n".join([str(x) for x in (d.get("texts") or []) if str(x).strip()])
+        else:
+            text = ""
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:600]
+        raise RuntimeError("看典古籍接口返回 %s：%s" % (e.code, detail))
+    except OSError as e:
+        raise RuntimeError(_translate_net_error(e, base))
+    except ValueError:
+        raise RuntimeError("看典古籍返回内容不是合法 JSON，前 300 字：" + raw[:300].decode("utf-8", "replace"))
+
+    dur = round(time.time() - t0, 3)
+    log_token(stage="box_ocr", image=src or "", model="kandian-" + (version or "v2"),
+              prompt_tokens=0, completion_tokens=0, total_tokens=0, duration_s=dur)
+    return {"text": text, "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                                    "total_tokens": 0, "duration_s": dur},
+            "finish_reason": ""}
+
+
+# ---------- 百度智能云 OCR（通用文字识别） ----------
+# 同步接口，一次 POST 即出结果；鉴权是 API Key + Secret Key 先换 access_token（约 30 天）。
+# 端点由「模型名」决定，四档对应四个 URL 后缀：
+#   accurate_basic 高精度 / accurate 高精度含位置 / general_basic 标准 / general 标准含位置
+_BAIDU_ENDPOINTS = ("accurate_basic", "accurate", "general_basic", "general")
+# 额度用尽的错误码：17=调用量超限（免费额度或付费包用尽）、19=请求总量超限。
+# 4（集群超限额）与 18（QPS 超限）属于限流，不算额度，不换档——换档只会同样被限。
+_BAIDU_QUOTA_CODES = (17, 19)
+# 换档配对：两档额度独立计，任一档用尽就切到另一档重试一次。
+_BAIDU_ALT_ENDPOINT = {"accurate_basic": "accurate", "accurate": "accurate_basic"}
+_BAIDU_TOKEN_CACHE = {"api_key": "", "secret": "", "token": "", "exp": 0.0}
+
+
+class BaiduQuotaExhausted(RuntimeError):
+    """百度报「额度用尽」（error_code 17 / 19）。
+
+    单独成类是为了让 do_ocr 能把这种错误与真正的失败区分开：前者换档重试有意义，
+    后者（鉴权、参数、网络）换档只会同样失败。
+    """
+
+    def __init__(self, endpoint, code, msg):
+        RuntimeError.__init__(
+            self, "百度智能云 OCR（%s）报额度用尽，错误 %s：%s" % (endpoint, code, msg))
+        self.endpoint = endpoint
+        self.code = code
+        self.msg = msg
+
+
+def _persist_baidu_model(model):
+    """换档后把新档位写回 box_config.json，避免下次启动又先撞一次额度错误。
+
+    只改 BAIDU_MODEL 一个键，其余键原样保留；任何异常都不影响本次识别结果。
+    """
+    p = os.path.join(CONFIG_DIR, "box_config.json")
+    try:
+        data = {}
+        if os.path.exists(p):
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f) or {}
+        data["BAIDU_MODEL"] = model
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        _probe_log("[BAIDU] 档位已写回配置：BAIDU_MODEL=%s" % model)
+    except Exception as e:
+        _probe_log("[BAIDU] 新档位写回配置失败（不影响本次识别）：%s" % e)
+
+
+def _baidu_access_token(api_key, secret_key, base_url=""):
+    """用 API Key + Secret Key 换 access_token，进程内缓存（失效或被服务端拒绝时清空重取）。"""
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    c = _BAIDU_TOKEN_CACHE
+    now = time.time()
+    if (c["token"] and c["api_key"] == api_key and c["secret"] == secret_key
+            and now < float(c["exp"]) - 60):
+        return c["token"]
+    base = (base_url or "https://aip.baidubce.com").strip().rstrip("/")
+    if "/rest/" in base:                    # 允许直接粘接口全地址
+        base = base.split("/rest/")[0]
+    url = base + "/oauth/2.0/token?" + urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": api_key,
+        "client_secret": secret_key,
+    })
+    req = urllib.request.Request(url, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=60, context=_ssl_ctx()) as resp:
+            j = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:400]
+        raise RuntimeError("百度智能云换 token 失败（HTTP %s）：%s" % (e.code, detail))
+    except OSError as e:
+        raise RuntimeError(_translate_net_error(e, base))
+    if not j.get("access_token"):
+        raise RuntimeError("百度智能云换 token 失败：%s"
+                           % (j.get("error_description") or j.get("error") or "未知原因，请核对 API Key 与 Secret Key"))
+    c.update({"api_key": api_key, "secret": secret_key, "token": j["access_token"],
+              "exp": now + float(j.get("expires_in") or 2592000)})
+    return c["token"]
+
+
+def _baidu_ocr(b64, api_key, secret_key, endpoint="accurate_basic", base_url="", src="", label=""):
+    """百度智能云 OCR（通用文字识别）：同步单次 POST，判别式引擎。
+
+    与豆包/千问的根本差异：**不吃提示词、不做字段判断、不加现代标点**，见字出字，
+    也没有任何控制字序/方向的参数（detect_direction 只管整图旋转 90/180/270 度，
+    不是列序）。返回是行级结果 words_result[]，一行一条，本函数按返回顺序以换行拼接。
+
+    probability=true 打开后会带回逐行置信度，本函数只做统计（写进探针日志），
+    不改文本——字数校验抓不到的整段跳读，靠低置信度行提示人工复核。
+    """
+    import urllib.request
+    import urllib.parse
+    import urllib.error
+
+    ep = (endpoint or "accurate_basic").strip()
+    for _p in ("https://", "http://"):
+        if ep.startswith(_p):
+            ep = ep[len(_p):]
+    if "/" in ep:
+        ep = ep.rstrip("/").split("/")[-1]
+    if ep not in _BAIDU_ENDPOINTS:
+        ep = "accurate_basic"
+    base = (base_url or "https://aip.baidubce.com").strip().rstrip("/")
+    if "/rest/" in base:
+        base = base.split("/rest/")[0]
+
+    # 验证用模拟开关（不进界面）：MOHEN_BAIDU_FAKE_QUOTA=accurate_basic 或 1 时，
+    # 该档直接按「额度用尽」报错，用来观察换档过程而不必真把额度跑光。默认为空，无任何影响。
+    _fake = (os.environ.get("MOHEN_BAIDU_FAKE_QUOTA") or "").strip()
+    if _fake and _fake in ("1", ep):
+        raise BaiduQuotaExhausted(ep, 17, "模拟额度用尽（MOHEN_BAIDU_FAKE_QUOTA=%s）" % _fake)
+
+    j = {}
+    for attempt in (1, 2):
+        token = _baidu_access_token(api_key, secret_key, base)
+        form = urllib.parse.urlencode({
+            "image": b64,
+            "language_type": "CHN_ENG",
+            "detect_direction": "false",
+            "paragraph": "true",
+            "probability": "true",
+            "multidirectional_recognize": "true",
+        }).encode("utf-8")
+        url = (base + "/rest/2.0/ocr/v1/" + ep + "?access_token="
+               + urllib.parse.quote(token))
+        req = urllib.request.Request(url, data=form, method="POST")
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+        t0 = time.time()
+        raw = b""
+        try:
+            with urllib.request.urlopen(req, timeout=120, context=_ssl_ctx()) as resp:
+                raw = resp.read()
+            j = json.loads(raw.decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            detail = e.read().decode("utf-8", "replace")[:400]
+            raise RuntimeError("百度智能云 OCR 返回 HTTP %s：%s" % (e.code, detail))
+        except OSError as e:
+            raise RuntimeError(_translate_net_error(e, base))
+        except ValueError:
+            raise RuntimeError("百度智能云返回内容不是合法 JSON，前 300 字："
+                               + raw[:300].decode("utf-8", "replace"))
+        ec = j.get("error_code")
+        if ec in (110, 111) and attempt == 1:
+            _BAIDU_TOKEN_CACHE["token"] = ""      # token 无效/过期，清缓存重换一次
+            continue
+        if ec:
+            if ec in _BAIDU_QUOTA_CODES:
+                # 不在这里决定换档：由 do_ocr 依据「额度用尽自动切档」设置统一处理
+                raise BaiduQuotaExhausted(ep, ec, j.get("error_msg") or "未知原因")
+            raise RuntimeError("百度智能云 OCR 返回错误 %s：%s"
+                               % (ec, j.get("error_msg") or "未知原因"))
+        break
+
+    items = j.get("words_result") or []
+    lines = [(it.get("words") or "").strip() for it in items]
+    lines = [x for x in lines if x]
+    text = "\n".join(lines)
+    scores, lows = [], 0
+    for it in items:
+        p = ((it.get("probability") or {}).get("average"))
+        if isinstance(p, (int, float)):
+            scores.append(float(p))
+            if float(p) < 0.9:
+                lows += 1
+    avg = (sum(scores) / len(scores)) if scores else 0.0
+
+    dur = round(time.time() - t0, 3)
+    log_token(stage="box_ocr", image=src or "", model="baidu-" + ep,
+              prompt_tokens=0, completion_tokens=0, total_tokens=0, duration_s=dur)
+    return {"text": text, "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                                    "total_tokens": 0, "duration_s": dur},
+            "finish_reason": ""}
+
+
 def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=None):
     import urllib.request
     import urllib.error
@@ -817,6 +1223,64 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
         provider = "doubao"
     ppre = OCR_PROVIDERS[provider]["key_prefix"]
     pdef = OCR_PROVIDERS[provider]
+    if provider == "kandian":
+        # 看典古籍：同步单次 POST，不吃提示词；必须同时传 Token 与账号（邮箱/手机号）。
+        # 独有能力是 det_mode=sp 强制竖排（右起、每列自上而下），正是另两家缺的参数。
+        _kt = ov.get("api_key") or cfg.get("KANDIAN_API_KEY", "")
+        _ke = ov.get("email") or cfg.get("KANDIAN_EMAIL", "")
+        if not _kt or not _ke:
+            return ("【未配置看典古籍凭据】看典需要同时填写 API Token 与账号（注册看典用的邮箱或手机号）。\n"
+                    "请在设置中选择「看典古籍」、把这两项填好并保存，再执行识别。\n"
+                    "标题：\n作者：\n正文：（未配置凭据，未调用真实模型）")
+        return _kandian_ocr(b64, _kt, _ke,
+                            ov.get("model") or cfg.get("KANDIAN_MODEL", "") or pdef["default_model"],
+                            ov.get("base_url") or cfg.get("KANDIAN_BASE_URL", "") or pdef["default_base_url"],
+                            ov.get("det_mode") or cfg.get("KANDIAN_DET_MODE", "") or "auto",
+                            ov.get("hp_order") or cfg.get("KANDIAN_HP_ORDER", "") or "right2left",
+                            src=src, label=label)
+    if provider == "baidu":
+        # 百度智能云：同步单次 POST；鉴权为 API Key + Secret Key 换 access_token。
+        _bk = ov.get("api_key") or cfg.get("BAIDU_API_KEY", "")
+        _bs = ov.get("secret") or cfg.get("BAIDU_SECRET_KEY", "")
+        if not _bk or not _bs:
+            return ("【未配置百度智能云凭据】百度需要同时填写 API Key 与 Secret Key（控制台「应用列表」里的那一对）。\n"
+                    "请在设置中选择「百度智能云」、把这两项填好并保存，再执行识别。\n"
+                    "标题：\n作者：\n正文：（未配置凭据，未调用真实模型）")
+        _ep = (ov.get("model") or cfg.get("BAIDU_MODEL", "")
+               or pdef["default_model"] or "accurate_basic").strip()
+        _burl = ov.get("base_url") or cfg.get("BAIDU_BASE_URL", "") or ""
+        # 「额度用尽自动换档」默认开启，只有显式关掉（false/0/off/no）才不换
+        _af = str(ov.get("auto_fallback") if ov.get("auto_fallback") is not None
+                  else cfg.get("BAIDU_AUTO_FALLBACK", "true")).strip().lower()
+        _auto = _af not in ("false", "0", "off", "no")
+        try:
+            return _baidu_ocr(b64, _bk, _bs, _ep, _burl, src=src, label=label)
+        except BaiduQuotaExhausted as e1:
+            _alt = _BAIDU_ALT_ENDPOINT.get(e1.endpoint) or "accurate_basic"
+            if not _auto:
+                raise RuntimeError(
+                    "百度智能云（%s）额度用尽（错误 %s：%s）。设置里未开启「额度用尽自动换档」，"
+                    "请手动切换接口档位，或到百度控制台确认额度后重试。"
+                    % (e1.endpoint, e1.code, e1.msg))
+            _probe_log("[BAIDU] 档位 %s 报额度用尽（error_code=%s），自动切到 %s 重试"
+                       % (e1.endpoint, e1.code, _alt))
+            try:
+                _res = _baidu_ocr(b64, _bk, _bs, _alt, _burl, src=src, label=label)
+            except BaiduQuotaExhausted as e2:
+                _probe_log("[BAIDU] 两档均报额度用尽：%s(code=%s) / %s(code=%s)"
+                           % (e1.endpoint, e1.code, e2.endpoint, e2.code))
+                raise RuntimeError(
+                    "百度智能云两档均报额度用尽：%s（%s）、%s（%s）。"
+                    "请到百度智能云控制台「文字识别」确认额度，或开通付费后重试。"
+                    % (e1.endpoint, e1.code, e2.endpoint, e2.code))
+            _persist_baidu_model(_alt)
+            _probe_log("[BAIDU] 已切到 %s 并识别成功（档位已写回配置）" % _alt)
+            if isinstance(_res, dict):
+                # 交给前端在日志区显示，避免用户不知道档位被换过
+                _res["note"] = ("百度档位 %s 额度用尽（错误 %s），已自动切到 %s 并识别成功；"
+                                "档位已写回配置，后续直接用 %s。"
+                                % (e1.endpoint, e1.code, _alt, _alt))
+            return _res
     api_key = ov.get("api_key") or cfg.get(ppre + "_API_KEY", "")
     if not api_key:
         return ("【未配置 %s 的 API Key】当前 OCR 服务商为「%s」，但其 API Key 未填写。\n"
@@ -839,26 +1303,47 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
     # 字段模式：单框裁切（作者/标题等）套用整篇提示词会让模型把孤立短文字误判为标题或留空。
     # 显式告知模型本图是某一字段的裁切区域，直接转录纯文本、不要输出字段名结构。
     if label == "author":
-        user_text += ("\n\n【字段模式·作者署名】本图仅为一篇文章的「作者署名」裁切区域（可能只有一至数字，" +
-                      "竖排或横排），请直接转录图中全部文字，输出为不带任何字段名前缀的纯文本；" +
+        user_text += ("\n\n【字段模式·作者署名】本图仅为一篇文章的「作者署名」裁切区域（可能只有一个署名，"
+                      "也可能是两个或更多人并列署名；竖排或横排），请直接转录图中全部文字（并列署名逐个转录，"
+                      "按阅读顺序用换行分隔），输出为不带任何字段名前缀的纯文本；" +
                       "不要输出「标题：/作者：/正文：」结构，也不要因文字过少而判定为无署名而留空。")
     elif label == "title":
-        user_text += ("\n\n【字段模式·标题】本图仅为一篇文章的「标题」裁切区域（可能只有一至数字，竖排或横排），" +
-                      "请直接转录图中全部文字，输出为不带任何字段名前缀的纯文本；不要输出「标题：/作者：/正文：」结构。")
+        user_text += ("\n\n【字段模式·标题】本图仅为一篇文章的「标题」裁切区域，可能是单行短题（只有一至数字），"
+                      "也可能是主标题与副题、双副题、引题等多列/多行组成的题组（竖排或横排）。" +
+                      "**本框内每一列、每一行只要肉眼可辨，都必须逐条转录**，按竖排从右到左（横排按实际阅读方向）的"
+                      "顺序用换行分隔输出；**不得只挑最醒目的主标题、把副题整列跳过**。" +
+                      "输出为不带任何字段名前缀的纯文本；不要输出「标题：/作者：/正文：」结构。")
     elif label == "section":
         user_text += ("\n\n【字段模式·节标题】本图仅为一篇文章内部的分节小标题（如「（一）从人的纪念到人的教训」「二、……」），" +
                       "不是文章标题。请直接转录图中全部文字并保留原有的（一）/一、等序号，输出为不带任何字段名前缀的纯文本；" +
                       "不要输出「标题：/作者：/正文：」结构，也不要把它补写成完整句子。")
+    elif label == "text":
+        # 正文框此前漏了这一支，模型仍按整篇提示词输出「标题/作者/正文」三段，
+        # 首行短文字（如某列开头十几字）被填进「标题：」，前端又全盘收下，
+        # 表现为正文按错位置拆出一行、并冒充该篇标题。正文框就是一个正文框，不该再分三段。
+        user_text += ("\n\n【字段模式·正文】本图仅为一篇文章的「正文」裁切区域，标题与署名由其他框负责，"
+                      "本框不需要判断哪一行是标题、也不需要给出署名。请直接转录图中全部文字，"
+                      "按阅读顺序（竖排从右到左逐列、每列从上到下）连续输出，段与段之间用空行分隔；"
+                      "输出为不带任何字段名前缀的纯文本，**不要输出「标题：/作者：/正文：」结构，"
+                      "也不要把某一行单独提升为标题或署名单列出来**。")
+    _ucontent = [{"type": "text", "text": user_text},
+                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]
     payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": [
-                {"type": "text", "text": user_text},
-                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-            ]},
+            {"role": "user", "content": _ucontent},
         ],
     }
+    # 确定性输出：转录任务不该有随机性，同一张图两次识别应当一致。
+    # OCR_TEMPERATURE=-1 表示不发送该参数（复现厂商默认温度的基线批次）；默认 0。
+    _temp_v = str(cfg.get("OCR_TEMPERATURE", "") or "0").strip()
+    try:
+        _temp = float(_temp_v)
+    except Exception:
+        _temp = 0.0
+    if _temp >= 0:
+        payload["temperature"] = _temp
     # 关闭深度思考：各厂商语法不同
     # 豆包/DeepSeek/OpenAI 系 -> thinking.type=disabled
     # Qwen(dashscope) 默认开启，须 enable_thinking=false 显式关
@@ -883,6 +1368,8 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
         text = j["choices"][0]["message"]["content"]
         usage = j.get("usage") or {}
         duration = round(time.time() - t0, 3)
+        # finish_reason=length 即输出被截断（大框整列消失的典型成因）
+        finish_reason = str(j["choices"][0].get("finish_reason") or "")
         log_token(stage="box_ocr", image=src or "", model=model or "",
                   prompt_tokens=usage.get("prompt_tokens", 0),
                   completion_tokens=usage.get("completion_tokens", 0),
@@ -893,7 +1380,7 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
             "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
             "total_tokens": int(usage.get("total_tokens", 0) or 0),
             "duration_s": duration,
-        }}
+        }, "finish_reason": finish_reason}
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:600]
         raise RuntimeError(_translate_api_error(detail, e.code))
@@ -1347,9 +1834,12 @@ class Handler(BaseHTTPRequestHandler):
                            ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
                             "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
                             "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
+                            "KANDIAN_API_KEY", "KANDIAN_EMAIL", "KANDIAN_MODEL", "KANDIAN_BASE_URL", "KANDIAN_DET_MODE",
+                            "KANDIAN_HP_ORDER",
+                            "BAIDU_API_KEY", "BAIDU_SECRET_KEY", "BAIDU_MODEL", "BAIDU_BASE_URL", "BAIDU_AUTO_FALLBACK",
                             "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                             "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
-                            "DATA_DIR")},
+                            "DATA_DIR", "OCR_CONCURRENCY", "OCR_TEMPERATURE")},
                 # 提示词出厂默认（抽屉「恢复默认」回填；自定义留空则回落到此）
                 "prompt_ocr_default": SINGLE_INSTRUCTION,
                 "prompt_post_default": _read_post_default_prompt(),
@@ -1633,7 +2123,10 @@ class Handler(BaseHTTPRequestHandler):
                     _err = _err[len("RuntimeError: "):]   # 友好提示自带前缀，去掉冗余类型名
                 return self._json({"ok": False, "error": _err})
             if isinstance(res, dict):
-                return self._json({"ok": True, "text": res.get("text", ""), "usage": res.get("usage", {})})
+                # note：本次识别的过程提示（如百度额度用尽自动换档），由前端写进日志区
+                return self._json({"ok": True, "text": res.get("text", ""), "usage": res.get("usage", {}),
+                                   "finish_reason": res.get("finish_reason", ""),
+                                   "note": res.get("note", "")})
             return self._json({"ok": True, "text": res, "usage": {}})
         if u.path == "/api/export":
             return self._export(data)
@@ -2275,6 +2768,15 @@ class Handler(BaseHTTPRequestHandler):
         """下载更新包 zip → 校验 SHA256 → 解压 → 排除 box_config.json → 生成 TEMP 更新器 bat。
         返回 ok 后由前端调 /api/update_apply 触发「退出主程序 + bat 覆盖 exe 目录 + 重启」。"""
         global _UPDATE_STATE
+        # macOS 允许自动更新，但必须先过两道门禁：①运行位置能自我替换（非 dmg 只读卷、
+        # 非 AppTranslocation 临时路径、父目录可写）；②上次更新不是未完成状态。
+        # 过不了就拒绝下载，让用户手动装 dmg——比冒险替换、把程序弄坏要划算。
+        if sys.platform == "darwin":
+            _code, _hint = _mac_update_env_problem()
+            if _code:
+                return self._json({"ok": False, "error": _hint})
+            if _update_pending_target():
+                return self._json({"ok": False, "error": "上次更新未完成，请手动下载安装包覆盖安装（双击 dmg 后把「墨痕」拖进「应用程序」）。"})
         import os, zipfile, shutil, tempfile, urllib.request, urllib.error, ssl
         url = (data.get("download_url") or "").strip()
         sha_url = (data.get("sha256_url") or "").strip()
@@ -2374,18 +2876,75 @@ class Handler(BaseHTTPRequestHandler):
                 sh_path = os.path.join(work, "apply.sh")
                 sh_content = (
                     "#!/bin/sh\n"
-                    "sleep 3\n"
+                    "# $1=目标 .app  $2=新 .app  $3=日志  $4=失败标记  $5=pending标记(成功后删除)\n"
                     'APP_BUNDLE="$1"\n'
                     'NEW_APP="$2"\n'
+                    'LOG="${3:-/tmp/mohen_update.log}"\n'
+                    'FAILFLAG="$4"\n'
+                    'PENDING="$5"\n'
                     'OLD_BAK="${APP_BUNDLE}.old"\n'
-                    'pkill -f "$(basename "$APP_BUNDLE")" 2>/dev/null || true\n'
-                    'if [ -e "$APP_BUNDLE" ]; then\n'
-                    '  mv "$APP_BUNDLE" "$OLD_BAK" 2>/dev/null || rm -rf "$APP_BUNDLE" 2>/dev/null || true\n'
+                    'PARENT=$(dirname "$APP_BUNDLE")\n'
+                    'NEW_TMP="$PARENT/.mohen_new_$$.app"\n'
+                    'say(){ echo "$(date "+%Y-%m-%d %H:%M:%S") $*" >> "$LOG" 2>/dev/null || true; }\n'
+                    'fail(){ say "FAIL $*"; if [ -n "$FAILFLAG" ]; then echo "$*" > "$FAILFLAG" 2>/dev/null || true; fi; }\n'
+                    'say "start bundle=$APP_BUNDLE"\n'
+                    "# 1) 等主进程退出，最多 30 秒\n"
+                    "i=0\n"
+                    'while [ $i -lt 30 ]; do\n'
+                    '  if ! pgrep -f "${APP_BUNDLE}/Contents/MacOS/" >/dev/null 2>&1; then break; fi\n'
+                    "  sleep 1; i=$((i+1))\n"
+                    "done\n"
+                    "sleep 1\n"
+                    "# 2) 父目录必须可写；只读卷（dmg）或无权限直接放弃，旧包分毫不动\n"
+                    'if [ ! -w "$PARENT" ]; then fail "目录不可写 $PARENT"; exit 2; fi\n'
+                    "# 3) 关键改动：先把新包拷到同目录的临时名。这一步失败时旧包完好，用户完全不受影响\n"
+                    'rm -rf "$NEW_TMP" 2>/dev/null || true\n'
+                    'if ! cp -R "$NEW_APP" "$NEW_TMP" 2>>"$LOG"; then\n'
+                    '  rm -rf "$NEW_TMP" 2>/dev/null || true\n'
+                    '  fail "拷贝新版失败，旧版未动"\n'
+                    '  open "$APP_BUNDLE" 2>/dev/null || true\n'
+                    "  exit 3\n"
                     "fi\n"
-                    'cp -R "$NEW_APP" "$APP_BUNDLE" 2>/dev/null\n'
+                    "# 4) 校验临时包完整性（Info.plist 与可执行文件都要在），不合格就丢弃，绝不换名\n"
+                    'if [ ! -f "$NEW_TMP/Contents/Info.plist" ]; then\n'
+                    '  rm -rf "$NEW_TMP" 2>/dev/null || true\n'
+                    '  fail "新包缺少 Info.plist，已取消"\n'
+                    '  open "$APP_BUNDLE" 2>/dev/null || true\n'
+                    "  exit 4\n"
+                    "fi\n"
+                    'BIN=$(ls -1 "$NEW_TMP/Contents/MacOS/" 2>/dev/null | head -1)\n'
+                    'if [ -z "$BIN" ] || [ ! -x "$NEW_TMP/Contents/MacOS/$BIN" ]; then\n'
+                    '  rm -rf "$NEW_TMP" 2>/dev/null || true\n'
+                    '  fail "新包缺少可执行文件，已取消"\n'
+                    '  open "$APP_BUNDLE" 2>/dev/null || true\n'
+                    "  exit 5\n"
+                    "fi\n"
+                    'xattr -dr com.apple.quarantine "$NEW_TMP" 2>/dev/null || true\n'
+                    "# 5) 换名：旧 → .old，临时新包 → 原名。同一磁盘内 mv 是原子操作，不会出现半包状态\n"
+                    'rm -rf "$OLD_BAK" 2>/dev/null || true\n'
+                    'if [ -e "$APP_BUNDLE" ]; then\n'
+                    '  if ! mv "$APP_BUNDLE" "$OLD_BAK" 2>>"$LOG"; then\n'
+                    '    rm -rf "$NEW_TMP" 2>/dev/null || true\n'
+                    '    fail "旧版改名失败，已取消"\n'
+                    '    open "$APP_BUNDLE" 2>/dev/null || true\n'
+                    "    exit 6\n"
+                    "  fi\n"
+                    "fi\n"
+                    'if ! mv "$NEW_TMP" "$APP_BUNDLE" 2>>"$LOG"; then\n'
+                    '  if [ -e "$OLD_BAK" ]; then mv "$OLD_BAK" "$APP_BUNDLE" 2>/dev/null || true; fi\n'
+                    '  rm -rf "$NEW_TMP" 2>/dev/null || true\n'
+                    '  fail "新版换名失败，已恢复旧版"\n'
+                    '  open "$APP_BUNDLE" 2>/dev/null || true\n'
+                    "  exit 7\n"
+                    "fi\n"
+                    "# 6) 成功：清隔离标记、清失败标记与 pending，打开程序，最后才删备份\n"
+                    'say ok\n'
                     'xattr -dr com.apple.quarantine "$APP_BUNDLE" 2>/dev/null || true\n'
+                    'if [ -n "$FAILFLAG" ]; then rm -f "$FAILFLAG" 2>/dev/null || true; fi\n'
+                    'if [ -n "$PENDING" ]; then rm -f "$PENDING" 2>/dev/null || true; fi\n'
                     'open "$APP_BUNDLE" 2>/dev/null || true\n'
                     'rm -rf "$OLD_BAK" 2>/dev/null || true\n'
+                    "exit 0\n"
                 )
                 with open(sh_path, "w", encoding="utf-8") as _f:
                     _f.write(sh_content)
@@ -2393,7 +2952,15 @@ class Handler(BaseHTTPRequestHandler):
                     os.chmod(sh_path, 0o755)
                 except Exception:
                     pass
-                _UPDATE_STATE = {"script": sh_path, "app_bundle": app_bundle, "new_app": new_app}
+                # 记下「要装到哪个版本」：替换脚本成功后自己删，程序启动时若发现版本没追平
+                # 就说明上次没装成，本次不再自动重试（打断无限循环）
+                _tgt_ver = str(data.get("target") or "").strip()
+                if _tgt_ver:
+                    _update_pending_write(_tgt_ver)
+                _UPDATE_STATE = {"script": sh_path, "app_bundle": app_bundle, "new_app": new_app,
+                                 "log": os.path.join(CONFIG_DIR, "update.log"),
+                                 "fail_flag": os.path.join(CONFIG_DIR, "update_failed.txt"),
+                                 "pending": UPDATE_PENDING_FILE}
                 return self._json({"ok": True, "exe_name": "墨痕.app", "asset": os.path.basename(url)})
             # 5) 排除用户配置：不覆盖 box_config.json（保留 API Key 等）
             cfg_in_pkg = os.path.join(src_root, "box_config.json")
@@ -2426,6 +2993,11 @@ class Handler(BaseHTTPRequestHandler):
         """启动 TEMP 更新器（Windows: bat 覆盖 exe 目录；macOS: sh 替换 .app），随后退出主程序。"""
         global _UPDATE_STATE
         st = _UPDATE_STATE
+        # macOS：临门再核一次运行环境，防止有人绕过前面的门禁直接调这个接口
+        if sys.platform == "darwin":
+            _code, _hint = _mac_update_env_problem()
+            if _code:
+                return self._json({"ok": False, "error": _hint})
         if not st:
             return self._json({"ok": False, "error": "未找到已下载的更新包，请先点「立即更新」"})
         # ===== macOS：/bin/sh 启动 apply.sh 替换 .app 后退出 =====
@@ -2434,7 +3006,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "error": "未找到已下载的更新包，请先点「立即更新」"})
             try:
                 subprocess.Popen(
-                    ["/bin/sh", st["script"], st["app_bundle"], st["new_app"]],
+                    ["/bin/sh", st["script"], st["app_bundle"], st["new_app"],
+                     st.get("log", ""), st.get("fail_flag", ""), st.get("pending", "")],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 )
             except Exception as e:
@@ -2714,7 +3287,13 @@ class Handler(BaseHTTPRequestHandler):
             mode = (data.get("mode") or "auto").strip() or "auto"
             extra = ["--mode", mode, "--src", _img_dir("cropped_hi"), "--dst", _img_dir("民国报纸OCR")]
         try:
-            r = subprocess.run([_py(), "--run-script", script, *extra], cwd=HERE,
+            # --run-script 只在冻结态需要（主 exe 拦截进脚本模式）；开发态 python.exe 不识别该参数，
+            # 传了会直接 unknown option 退出（returncode=2）——抽图/归档/结构化全挂。
+            _cmd = [_py()]
+            if getattr(sys, "frozen", False):
+                _cmd.append("--run-script")
+            _cmd += [script, *extra]
+            r = subprocess.run(_cmd, cwd=HERE,
                                capture_output=True, text=True, env=env, timeout=900)
             res = {"ok": r.returncode == 0, "returncode": r.returncode,
                    "stdout": r.stdout[-4000:], "stderr": r.stderr[-2000:]}
@@ -2789,8 +3368,13 @@ class Handler(BaseHTTPRequestHandler):
             out = {"ok": False, "steps": [], "stdout": "", "stderr": ""}
             try:
                 # 1) 抽图：source/ -> cropped_hi/（绝对路径传给脚本，对齐 DATA_DIR，避免脚本回退到 exe 目录）
-                r1 = subprocess.run([_py(), "--run-script", os.path.join(HERE, "extract_original.py"),
-                                     "--src", src_dir, "--dst", _img_dir("cropped_hi")],
+                #    --run-script 仅冻结态需要，开发态 python.exe 不识别（传了 returncode=2 直接失败）
+                _c1 = [_py()]
+                if getattr(sys, "frozen", False):
+                    _c1.append("--run-script")
+                _c1 += [os.path.join(HERE, "extract_original.py"),
+                        "--src", src_dir, "--dst", _img_dir("cropped_hi")]
+                r1 = subprocess.run(_c1,
                                     cwd=RUNTIME_DIR, capture_output=True, text=True, env=env, timeout=600)
                 out["steps"].append({"step": "extract", "ok": r1.returncode == 0,
                                      "returncode": r1.returncode})
@@ -2850,6 +3434,9 @@ class Handler(BaseHTTPRequestHandler):
         allowed = ("BOX_OCR_PROVIDER", "QWEN_API_KEY", "QWEN_BASE_URL", "QWEN_MODEL",
                    "DOUBAO_API_KEY", "DOUBAO_BASE_URL", "DOUBAO_MODEL",
                    "OTHER_API_KEY", "OTHER_BASE_URL", "OTHER_MODEL",
+                   "KANDIAN_API_KEY", "KANDIAN_EMAIL", "KANDIAN_MODEL", "KANDIAN_BASE_URL", "KANDIAN_DET_MODE",
+                   "KANDIAN_HP_ORDER",
+                   "BAIDU_API_KEY", "BAIDU_SECRET_KEY", "BAIDU_MODEL", "BAIDU_BASE_URL", "BAIDU_AUTO_FALLBACK",
                    "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                    "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
                    "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE",
@@ -2941,7 +3528,7 @@ HTML = r"""<!doctype html>
   .eye-care .src-list .item .ord { background:#cfe0cc; color:#274534; }
   .eye-care .src-list .item .ops .mv { background:#EAF3E8; border-color:#cfe0cc; color:#274534; }
   .eye-care .src-list .item .ops .mv:hover:not(:disabled) { background:#DCEBD9; }
-  .eye-care .left, .eye-care #canvasWrap { background:#D7E8D5; }
+  .eye-care .left, .eye-care #canvasWrap, .eye-care #canvasHost { background:#D7E8D5; }
   .eye-care #cv { background:#F2F8F1; }
   .eye-care #hint { background:#EAF3E8; }
   .eye-care #toolbar { background:#EAF3E8 !important; }
@@ -2952,14 +3539,18 @@ HTML = r"""<!doctype html>
   body { margin:0; background:var(--bg); color:var(--ink);
          font-family: -apple-system,"Segoe UI","Microsoft YaHei",sans-serif; font-size:14px; }
   .wrap { display:flex; height:calc(100vh - 56px); overflow:hidden; }
-  .left { flex:1 1 auto; display:flex; flex-direction:column; min-width:0; background:#eef1f5; }
-  #canvasWrap { flex:1 1 auto; overflow:auto; position:relative; background:#eef1f5; }
-  #zoomBar { position:sticky; top:12px; left:12px; float:left; margin:12px 0 0 12px; z-index:10;
+  .left { flex:1 1 auto; display:flex; flex-direction:column; min-width:0; min-height:0; background:#eef1f5; }
+  /* 缩放栏与翻页栏必须固定在画布视口上，不能随内容滚动：
+     此前它们带 float 放在 #canvasWrap（滚动容器）内，横向滚动时会被一起推走（放大后跑飞）。
+     现改为在外层 #canvasHost（定位参照、不滚动）里绝对定位，滚动与缩放都影响不到它们。 */
+  #canvasHost { position:relative; flex:1 1 auto; min-height:0; display:flex; background:#eef1f5; }
+  #canvasWrap { flex:1 1 auto; min-width:0; min-height:0; overflow:auto; background:#eef1f5; }
+  #zoomBar { position:absolute; top:12px; left:12px; z-index:10;
              display:flex; align-items:center; gap:6px; background:rgba(255,255,255,0.95);
              padding:6px 10px; border-radius:8px; border:1px solid var(--bd); box-shadow:0 2px 8px rgba(0,0,0,.08); }
   #zoomBar span { font-size:12.5px; color:var(--ink); min-width:44px; text-align:center; font-weight:600; }
   #zoomBar button { min-width:auto; padding:5px 10px; }
-  #pageBar { position:sticky; top:12px; right:12px; float:right; margin:12px 12px 0 0; z-index:10;
+  #pageBar { position:absolute; top:12px; right:12px; z-index:10;
              display:flex; align-items:center; gap:6px; background:rgba(255,255,255,0.95);
              padding:6px 10px; border-radius:8px; border:1px solid var(--bd); box-shadow:0 2px 8px rgba(0,0,0,.08); }
   #pageBar button { min-width:auto; padding:5px 10px; }
@@ -3079,11 +3670,32 @@ HTML = r"""<!doctype html>
   #boxList .bx-ops .mini { padding:2px 6px; font-size:11px; flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #resultList .card { border:1px solid var(--bd); border-radius:6px; padding:8px; margin-bottom:8px; min-width:0; transition:border-color .12s, box-shadow .12s; }
   #resultList .card:hover { border-color:var(--pri); box-shadow:0 1px 4px rgba(37,99,235,.18); }
+  #resultList .card.flash { border-color:var(--pri); box-shadow:0 0 0 2px rgba(37,99,235,.22); }
+  /* 识别失败的卡片：边框与提示条标红，明确区分「没读到」与「读到了但内容不对」 */
+  #resultList .card.fail { border-color:#d9534f; background:#fff7f6; }
+  #resultList .card.fail:hover { border-color:#b52b25; box-shadow:0 1px 4px rgba(181,43,37,.18); }
+  #resultList .card.fail .failbar { font-size:11px; line-height:1.6; color:#a5342c; background:#fdecea;
+    border:1px solid #f5c6c2; border-radius:4px; padding:4px 6px; margin-bottom:6px; word-break:break-all; }
+  #resultList .card .hd .loc, #resultList .card .hd .exp { flex-shrink:0; padding:1px 6px; font-size:11px; line-height:1.5; border:1px solid var(--bd); border-radius:4px; background:#fff; color:var(--mut); cursor:pointer; font-family:inherit; }
+  #resultList .card .hd .loc:hover, #resultList .card .hd .exp:hover { border-color:var(--pri); color:var(--pri); }
   #resultList .card .hd { display:flex; justify-content:space-between; align-items:center; gap:8px; font-size:12px; color:var(--mut); margin-bottom:4px; min-width:0; }
   #resultList .card .hd .title { flex:1 1 auto; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
   #resultList .card .hd .meta { flex-shrink:0; white-space:nowrap; }
-  #resultList textarea { width:100%; min-height:90px; font-family:"Microsoft YaHei",monospace; font-size:var(--rs-fs,12px);
+  /* 校对框默认高度：按窗口高度自适应（约 17 行），小屏也有 180px 垫底。
+     此前固定 90px（约 5 行），长文只能靠框内小滚动条翻，频繁滚轮查看很费劲。 */
+  #resultList textarea { width:100%; min-height:max(180px, 30vh); font-family:"Microsoft YaHei",monospace; font-size:var(--rs-fs,12px);
                          border:1px solid var(--bd); border-radius:4px; padding:6px; resize:vertical; }
+  /* 单击画布框时的「片段标记」：只用底色标出该框对应的那段文字，不占用选区，
+     所以点进去改字时标记不会消失，也不与你自己的选字冲突。
+     一级走 CSS Custom Highlight API（Chromium 152+ 的 createValueRange），
+     二级降级为叠在文本框上的半透明色带（见 paintHlBands）。 */
+  ::highlight(mohen-boxfocus) { background-color:#fde68a; color:#111827; }
+  .eye-care ::highlight(mohen-boxfocus) { background-color:#cfe3c8; color:#1f3a2b; }
+  #resultList .ta-wrap { position:relative; }
+  #resultList .ta-wrap .hl-layer { position:absolute; inset:0; overflow:hidden; pointer-events:none; border-radius:4px; }
+  #resultList .ta-wrap .hl-layer .hl-inner { position:absolute; top:0; left:0; width:100%; }
+  #resultList .ta-wrap .hl-layer .hl-band { position:absolute; background:rgba(253,230,138,.55); border-radius:2px; }
+  .eye-care #resultList .ta-wrap .hl-layer .hl-band { background:rgba(176,214,168,.65); }
   .srcname { font-weight:600; color:var(--pri); }
   .kbd { font-family:ui-monospace,monospace; background:#e2e8f0; padding:1px 4px; border-radius:3px; font-size:11px; }
 
@@ -3251,7 +3863,10 @@ HTML = r"""<!doctype html>
         <button id="modeSelect" class="tb-btn" data-mode="select" style="padding:4px 12px; border:1px solid #cbd5e1; border-radius:6px; background:#2563eb; color:#fff; cursor:pointer;">框选</button>
         <button id="modePan" class="tb-btn" data-mode="pan" style="padding:4px 12px; border:1px solid #cbd5e1; border-radius:6px; background:#fff; color:#334155; cursor:pointer;">拖动(平移)</button>
       </div>
+      <div id="canvasHost">
       <div id="canvasWrap">
+      <canvas id="cv" width="800" height="600"></canvas>
+    </div>
       <div id="zoomBar">
         <button id="zoomOut" class="sm sec" title="缩小">−</button>
         <span id="zoomPct" title="双击恢复「适应窗口」">100%</span>
@@ -3263,8 +3878,7 @@ HTML = r"""<!doctype html>
         <span id="pageNav" class="pg"><span id="pageCounter">第 0 / 0 版</span><small id="crossStatus" style="display:none">跨页 · 已载入 0 版</small></span>
         <button class="sm sec" id="nextPage" title="下一版">▶</button>
       </div>
-      <canvas id="cv" width="800" height="600"></canvas>
-    </div>
+      </div>
     <div id="hint">
       <span class="stage"><span class="flow-num">①</span>导入文件 → 抽图并归档</span>
       <span class="stage"><span class="flow-num">②</span>载入图片 → 框选</span>
@@ -3320,11 +3934,14 @@ HTML = r"""<!doctype html>
         <option value="author">author（作者）</option>
         <option value="text" selected>text（正文）</option>
       </select>
+      <div style="color:var(--mut); font-size:11.5px; margin-top:4px; line-height:1.5;">
+        快捷键：<b>1</b> 标题 · <b>2</b> 正文 · <b>3</b> 作者 · <b>4</b> 节标题；每个标签只对下一个新框生效，画完自动回到 text。
+      </div>
     </div>
 
     <div class="card">
       <h2>③ OCR识别</h2>
-      <p class="sub">组 = 一篇文章：同组（同色）框合并识别/导出为一篇，留空则自动合并为一篇，组内按“标题 → 作者 → 正文”排序。节标题（section）是文章内部分节的小标题，算正文的一部分，不参与分篇。</p>
+      <p class="sub">组 = 一篇文章：同组（同色）框合并识别/导出为一篇，留空则自动合并为一篇，组内按“标题 → 作者 → 正文”排序。只有<b>标题（title）</b>会开新组；节标题（section）是文章内部分节的小标题，算正文的一部分，不参与分篇。</p>
       <div style="margin-top:12px; border-top:1px solid var(--bd); padding-top:12px;">
         <h3 style="font-size:13px;font-weight:600;margin:0 0 8px;color:var(--ink);">已框选区域（按阅读顺序，序号 = 导出次序）</h3>
         <div id="boxList"><div style="color:var(--mut); font-size:12px;">尚未框选</div></div>
@@ -3405,10 +4022,12 @@ HTML = r"""<!doctype html>
   <div class="drawer-body">
     <div class="set-group">
       <h3>OCR 视觉模型（任选一）</h3>
-      <div class="row" style="margin-bottom:8px; align-items:center; gap:10px; flex-wrap:nowrap;">
+      <div class="row" style="margin-bottom:8px; align-items:center; gap:10px; flex-wrap:wrap;">
         <label class="rdo"><input type="radio" name="cfgProvider" value="doubao"> 豆包（推荐）</label>
         <label class="rdo"><input type="radio" name="cfgProvider" value="qwen"> 千问</label>
-        <label class="rdo"><input type="radio" name="cfgProvider" value="other"> 其他（自定义）</label>
+        <label class="rdo"><input type="radio" name="cfgProvider" value="kandian"> 看典古籍</label>
+        <label class="rdo"><input type="radio" name="cfgProvider" value="baidu"> 百度智能云（快速）</label>
+        <label class="rdo"><input type="radio" name="cfgProvider" value="other"> 自定义</label>
       </div>
       <div class="row">
         <div class="key-field"><label>OCR API Key</label>
@@ -3416,10 +4035,40 @@ HTML = r"""<!doctype html>
             <input id="cfgApiKey" class="secret" type="text" placeholder="ARK..." autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false">
             <span class="eye" data-target="cfgApiKey" title="显示/隐藏"></span>
           </div></div>
-        <div><label>模型名</label><input id="cfgModel" placeholder=""></div>
+        <div id="cfgModelRow"><label>模型名</label><input id="cfgModel" placeholder=""></div>
       </div>
       <label id="cfgBaseUrlLabel">OCR Base URL（可选，默认千问AI平台）</label>
       <input id="cfgBaseUrl" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1">
+      <div id="cfgKandianBox" style="display:none">
+        <label style="margin-top:8px">看典账号（注册用的邮箱或手机号，必填）</label>
+        <input id="cfgKandianEmail" placeholder="you@example.com" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <label style="margin-top:8px">排版方向 det_mode</label>
+        <select id="cfgKandianMode">
+          <option value="auto">auto 自动判定</option>
+          <option value="sp">sp 强制竖排（右起，每列自上而下）</option>
+          <option value="hp">hp 强制横排</option>
+        </select>
+        <label style="margin-top:8px">横排字序 hp_line_words_angel（仅 v2 生效）</label>
+        <select id="cfgKandianHpOrder">
+          <option value="right2left">right2left 右起（民国报纸横排惯例，默认）</option>
+          <option value="left2right">left2right 左起（引擎原默认）</option>
+        </select>
+        <label style="margin-top:8px;line-height:1.75">看典为判别式引擎：<b>不吃提示词</b>、<b>不加现代标点</b>、繁体原样输出。</label>
+      </div>
+      <div id="cfgBaiduBox" style="display:none">
+        <label style="margin-top:8px">Secret Key（与上面的 API Key 配对，必填）</label>
+        <input id="cfgBaiduSecret" placeholder="百度应用的 Secret Key" autocomplete="off" autocapitalize="off" spellcheck="false">
+        <label style="margin-top:8px">接口档位</label>
+        <select id="cfgBaiduModel">
+          <option value="accurate_basic">accurate_basic · 高精度版（免费额度较高）</option>
+          <option value="accurate">accurate · 高精度含位置版（免费额度约为前者一半）</option>
+        </select>
+        <label class="switch-row" style="margin-top:8px;">
+          <input type="checkbox" id="cfgBaiduFallback">
+          <span>当前档位额度用尽时自动切到另一档</span>
+        </label>
+        <label style="margin-top:8px;line-height:1.75">百度为判别式引擎：<b>不吃提示词</b>、繁体原样输出、<b>输出速度极快</b>。</label>
+      </div>
     </div>
     <div class="set-group">
       <h3>后置（DeepSeek / 结构化题录）</h3>
@@ -3592,6 +4241,12 @@ let boxes = [];   // {id,label,x,y,w,h,group}
 let results = {}; // key -> {title,author,body,raw}
 let srcName = ""; let drawing = null, cur = null; let selectedId = null; let pendingSelectId = null;
 let dragState = null; let uid = 1; let mode = 'auto'; let backendCfg = {};
+// —— 翻页竞态防护（2026-11-05）——
+// imgLoading: 目标版图片尚未解码完成，此刻画布上仍是上一版的图（img/natW/boxes 都还指上一版）；
+// loadSeq: 翻页请求序号，onload 只在序号仍为最新时生效，快速连翻时旧响应不会再抢回状态；
+// baseOf: 起框/拖动瞬间的基准快照（版名 + 图片像素尺寸），mouseup 时不一致即丢弃，杜绝「框记到错的对象上」；
+// pageDims: 同会话内各版图片尺寸，用于发现「图被重抽/旋转后尺寸变了」导致的整体偏移。
+let imgLoading = false, loadSeq = 0, baseOf = null; const pageDims = new Map();
 // 多版识别状态：各整版框选/识别结果按页分别存放于 allPageData，
 // pageOrder 记录工作集（= 阅读顺序，由「载入」批量填充）。
 // mergeMode 决定整版间关系：'single' 每版独立识别/导出；'cross' 多版合并为一篇。
@@ -3608,6 +4263,7 @@ function groupColor(g){ let h=0; for(let i=0;i<g.length;i++) h=(h*31+g.charCodeA
 const HANDLE=9, HIT_PAD=2;
 
 // ---------- 配置 / 状态 ----------
+const IS_MAC = /Mac/i.test(navigator.platform||'') || /Macintosh|Mac OS X/i.test(navigator.userAgent||'');
 let CURRENT_VERSION = '';
 let AUTO_UPDATE = false;
 let SKIP_VERSION = null;
@@ -3620,12 +4276,17 @@ autoUpdateCheckOnLaunch();
 // 启动时把已保存的密钥/模型回填进输入框，避免重开后看似"丢失"
 // OCR 服务商切换：每个服务商各存一组凭据，切换时回填对应值
 let ocrProvider = 'doubao';
-const ocrStash = { qwen:{api_key:'',base_url:'',model:''}, doubao:{api_key:'',base_url:'',model:''}, other:{api_key:'',base_url:'',model:''} };
+const ocrStash = { qwen:{api_key:'',base_url:'',model:''}, doubao:{api_key:'',base_url:'',model:''}, kandian:{api_key:'',base_url:'',model:'',email:'',det_mode:'auto',hp_order:'right2left'}, baidu:{api_key:'',base_url:'',model:'',secret:'',fallback:'true'}, other:{api_key:'',base_url:'',model:''} };
 function applyProviderFromValues(v){
   v = v || {};
-  for(const p of ['qwen','doubao','other']){ const pre=p.toUpperCase();
-    ocrStash[p] = { api_key:v[pre+'_API_KEY']||'', base_url:v[pre+'_BASE_URL']||'', model:v[pre+'_MODEL']||'' }; }
-  ocrProvider = (['qwen','doubao','other'].includes(v.BOX_OCR_PROVIDER)) ? v.BOX_OCR_PROVIDER : 'doubao';
+  for(const p of ['qwen','doubao','kandian','baidu','other']){ const pre=p.toUpperCase();
+    ocrStash[p] = { api_key:v[pre+'_API_KEY']||'', base_url:v[pre+'_BASE_URL']||'', model:v[pre+'_MODEL']||'',
+                    email:v[pre+'_EMAIL']||'', det_mode:v[pre+'_DET_MODE']||'auto',
+                    hp_order:v[pre+'_HP_ORDER']||'right2left',
+                    secret:v[pre+'_SECRET_KEY']||'',
+                    // 未写过该键（老配置）视为默认开启，与后端默认一致
+                    fallback:(p==='baidu' ? (String(v.BAIDU_AUTO_FALLBACK==null?'true':v.BAIDU_AUTO_FALLBACK).toLowerCase()==='false' ? 'false' : 'true') : '') }; }
+  ocrProvider = (['qwen','doubao','kandian','baidu','other'].includes(v.BOX_OCR_PROVIDER)) ? v.BOX_OCR_PROVIDER : 'doubao';
   setProviderRadio(ocrProvider);
   fillActiveProviderInputs();
   // 回填独立的结构化（DeepSeek）密钥/地址/模型，否则重启后设置面板显示为空（密钥已落盘只是未恢复显示）
@@ -3635,12 +4296,29 @@ function applyProviderFromValues(v){
 }
 function setProviderRadio(p){ const r=document.querySelector('input[name="cfgProvider"][value="'+p+'"]'); if(r) r.checked=true; }
 function fillActiveProviderInputs(){
-  const s = ocrStash[ocrProvider];
-  $('cfgApiKey').value = s.api_key; $('cfgBaseUrl').value = s.base_url; $('cfgModel').value = s.model;
+  const s = ocrStash[ocrProvider] || {};
+  $('cfgApiKey').value = s.api_key||''; $('cfgBaseUrl').value = s.base_url||''; $('cfgModel').value = s.model||'';
+  // 看典古籍专有：账号 + 排版方向，随服务商切换显隐
+  const kb=$('cfgKandianBox'); if(kb) kb.style.display = (ocrProvider==='kandian') ? 'block' : 'none';
+  const ke=$('cfgKandianEmail'); if(ke) ke.value = s.email||'';
+  const km=$('cfgKandianMode'); if(km) km.value = s.det_mode||'auto';
+  const kh=$('cfgKandianHpOrder'); if(kh) kh.value = s.hp_order||'right2left';
+  // 百度智能云专有：Secret Key（与 API Key 配对）+ 接口档位下拉（替代共用「模型名」输入框）
+  const bb=$('cfgBaiduBox'); if(bb) bb.style.display = (ocrProvider==='baidu') ? 'block' : 'none';
+  const bs=$('cfgBaiduSecret'); if(bs) bs.value = s.secret||'';
+  // 百度档位只有两档，历史值（如 general_basic）一律回落到 accurate_basic，避免下拉显示空白
+  const bm=$('cfgBaiduModel'); if(bm) bm.value = (s.model==='accurate') ? 'accurate' : 'accurate_basic';
+  const bf=$('cfgBaiduFallback'); if(bf) bf.checked = (String(s.fallback==null?'true':s.fallback).toLowerCase()!=='false');
+  // 两处都能填同一个键会打架，选百度时把共用「模型名」整行藏起来
+  const bmr=$('cfgModelRow'); if(bmr) bmr.style.display = (ocrProvider==='baidu') ? 'none' : 'block';
   const def = (ocrProvider==='qwen')
     ? { key:'sk-...', base:'https://dashscope.aliyuncs.com/compatible-mode/v1', model:'' }
     : (ocrProvider==='doubao')
     ? { key:'ark-', base:'https://ark.cn-beijing.volces.com/api/v3', model:'ep-2024xxxxxxxx-xxxxx（火山方舟接入点 ID）' }
+    : (ocrProvider==='kandian')
+    ? { key:'看典 API Token', base:'https://ocr.kandianguji.com', model:'v2（推荐）/ beta / default' }
+    : (ocrProvider==='baidu')
+    ? { key:'百度应用的 API Key', base:'https://aip.baidubce.com', model:'accurate_basic（高精度）/ accurate（含位置）/ general_basic（标准）' }
     : { key:'', base:'', model:'' };
   $('cfgApiKey').placeholder = def.key;
   $('cfgBaseUrl').placeholder = def.base;
@@ -3649,11 +4327,24 @@ function fillActiveProviderInputs(){
     ? 'OCR Base URL（可选，默认千问AI平台）'
     : (ocrProvider==='doubao')
     ? 'OCR Base URL（可选，默认火山方舟）'
+    : (ocrProvider==='kandian')
+    ? '看典 Base URL（可选，默认 https://ocr.kandianguji.com）'
+    : (ocrProvider==='baidu')
+    ? 'Base URL（可选，默认 https://aip.baidubce.com）'
     : 'OCR Base URL';
 }
 function stashActive(){
-  const s = ocrStash[ocrProvider];
+  const s = ocrStash[ocrProvider] || (ocrStash[ocrProvider]={});
   s.api_key=$('cfgApiKey').value.trim(); s.base_url=$('cfgBaseUrl').value.trim(); s.model=$('cfgModel').value.trim();
+  const ke=$('cfgKandianEmail'); if(ke) s.email=ke.value.trim();
+  const km=$('cfgKandianMode'); if(km) s.det_mode=km.value||'auto';
+  const kh=$('cfgKandianHpOrder'); if(kh) s.hp_order=kh.value||'right2left';
+  const bs=$('cfgBaiduSecret'); if(bs) s.secret=bs.value.trim();
+  // 百度：档位与「额度用尽自动换档」存在与 BAIDU_MODEL / BAIDU_AUTO_FALLBACK 同一组键上
+  if(ocrProvider==='baidu'){
+    const bm=$('cfgBaiduModel'); if(bm) s.model=bm.value||'accurate_basic';
+    const bf=$('cfgBaiduFallback'); if(bf) s.fallback=bf.checked?'true':'false';
+  }
 }
 function fillCfgInputs(v){
   applyProviderFromValues(v);
@@ -3698,21 +4389,31 @@ function updateCfgLine(){
   if(!hasKey) $('cfgLine').innerHTML='OCR：<span class="warn">未配置 API_KEY</span> 模型 '+model+' <b>请点「设置」填写 OCR 密钥与模型名</b>';
   else $('cfgLine').innerHTML='OCR：真实调用 · 模型 <b>'+model+'</b> @ '+host;
 }
-function getOverrides(){ const s=ocrStash[ocrProvider]||{}; const o={provider:ocrProvider}; if(s.base_url)o.base_url=s.base_url; if(s.api_key)o.api_key=s.api_key; if(s.model)o.model=s.model; return o; }
+function getOverrides(){ const s=ocrStash[ocrProvider]||{}; const o={provider:ocrProvider}; if(s.base_url)o.base_url=s.base_url; if(s.api_key)o.api_key=s.api_key; if(s.model)o.model=s.model; if(s.email)o.email=s.email; if(s.det_mode)o.det_mode=s.det_mode; if(s.hp_order)o.hp_order=s.hp_order; if(s.secret)o.secret=s.secret; if(ocrProvider==='baidu')o.auto_fallback=(s.fallback==='false'?'false':'true'); return o; }
 
 // ---------- 加载图片（canvas drawImage 直接绘制，载入即显示，无需点击） ----------
-function loadDataURL(url,name,idx){ const pname=(name||'').replace(/\.[^.]+$/,'');
+function loadDataURL(url,name,idx,seq){ const pname=(name||'').replace(/\.[^.]+$/,'');
   // 切走前先把当前版状态存回 allPageData（始终回写，避免翻页丢失框选/编辑）
   if(srcName && allPageData[srcName]){ allPageData[srcName].boxes=boxes; allPageData[srcName].results=results; }
-  const im=new Image(); im.onerror=()=>{ log('[载入图片] 解码失败：'+(name||'')); };
+  const im=new Image(); im.onerror=()=>{ if(seq==null||seq===loadSeq){ imgLoading=false; updatePageNav(); draw(); } log('[载入图片] 解码失败：'+(name||'')); };
   im.onload=()=>{
+    if(seq!=null && seq!==loadSeq){ log('[载入] 丢弃过期图片响应：'+(name||'')+'（当前序号 '+loadSeq+'）'); return; }
+    imgLoading=false;
+    // 换图前取消进行中的框选/拖动：起点取旧图基准、终点取新图基准会把框拉歪
+    if(drawing||dragState){ drawing=null; dragState=null; cur=null; log('[载入] 换页时有未完成的框选/拖动，已取消以免坐标错基准'); }
     img=im; natW=im.naturalWidth; natH=im.naturalHeight;
+    // 同会话内尺寸变化检测（重抽图/旋转会改像素尺寸，旧框会整体偏移）——只告警不改坐标，避免把错框洗白
+    { const _dim=natW+'x'+natH, _old=pageDims.get(pname);
+      if(_old && _old!==_dim){ const _n=((allPageData[pname]&&allPageData[pname].boxes)||[]).length;
+        log('[载入] 警告：'+pname+' 图片尺寸已变（'+_old+' → '+_dim+'），该版 '+_n+' 个框，旧框会整体偏移，请复核'); }
+      pageDims.set(pname,_dim); }
     srcName=pname; const _sn=$('srcName'); if(_sn) _sn.textContent=srcName||'未命名';
     // 懒初始化该版存储；pageOrder 仅由「载入所选」批量填充，翻页（loadDataURL）绝不改动
     if(!allPageData[srcName]) allPageData[srcName]={boxes:[],results:{}};
     boxes=allPageData[srcName].boxes; results=allPageData[srcName].results;   // 引用，编辑即持久化
     selectedId=null; renderBoxList(); if(mergeMode!=='cross') renderResults(); resizeCanvas();   // 跨页模式面板内容与当前页无关，翻页不重建，避免校对文本框重置
     if(pendingSelectId!=null){ selectedId=pendingSelectId; pendingSelectId=null; renderBoxList(); draw(); }
+    if(pendingFocus){ const _pf=pendingFocus; pendingFocus=null; focusBoxOnCanvas(_pf); }
     // 页码优先用调用方传入的 idx（gotoPage 已同步设过，最可靠），反推仅作兜底（均基于 navList，即当前载入的工作集）
     if(typeof idx==='number' && idx>=0 && navList[idx] && navList[idx].replace(/\.[^.]+$/,'')===srcName) pageIdx=idx;
     else pageIdx=navList.findIndex(f=>f.replace(/\.[^.]+$/,'')===srcName);
@@ -3724,7 +4425,10 @@ function updatePageNav(){ const pc=$('pageCounter'); if(pc){ pc.textContent=page
 function gotoPage(i){ if(i<0||i>=navList.length) return; const name=navList[i];
   // 同步设置页码并立即刷新导航，不依赖图片 onload 反推（避免竞态/反推失败导致翻页失效）
   pageIdx=i; updatePageNav();
-  fetch('/api/image?name='+encodeURIComponent(name)+'&dir=cropped_hi').then(r=>r.json()).then(j=>loadDataURL(j.data,name,i)).catch(e=>log('翻页失败：'+e)); }
+  const _seq=++loadSeq; imgLoading=true;   // 进入「载入中」：此间画布仍是上一版的图，禁止起框
+  const _pc=$('pageCounter'); if(_pc) _pc.textContent+=' · 载入中…';   // 可见提示：否则用户在图未刷出来时落笔，会被静默忽略
+  draw();   // 立即盖遮罩，避免用户把上一版画面当成本次要框的版
+  fetch('/api/image?name='+encodeURIComponent(name)+'&dir=cropped_hi').then(r=>r.json()).then(j=>loadDataURL(j.data,name,i,_seq)).catch(e=>{ if(_seq===loadSeq){ imgLoading=false; updatePageNav(); draw(); } log('翻页失败：'+e); }); }
 const PAD=24;   // 画布四周留白像素，便于在图片边角起框
 function resizeCanvas(){ const wrap=$('canvasWrap'); const availW=Math.max(1,wrap.clientWidth-32-2*PAD); const availH=Math.max(1,wrap.clientHeight-32-2*PAD);
   if(img){ baseScale=Math.min(1,availW/natW,availH/natH); scale=baseScale*userZoom; cv.width=Math.max(1,Math.floor(natW*scale)+2*PAD); cv.height=Math.max(1,Math.floor(natH*scale)+2*PAD);
@@ -3745,15 +4449,29 @@ function globalBoxIndex(i){
   for(let k=0;k<idx;k++){ base += (allPageData[pageOrder[k]]&&allPageData[pageOrder[k]].boxes?allPageData[pageOrder[k]].boxes.length:0); }
   return base+i+1;
 }
-function draw(){ if(!img){ drawPlaceholder(); return; } ctx.clearRect(0,0,cv.width,cv.height); ctx.drawImage(img,PAD,PAD,natW*scale,natH*scale);
+function draw(){ if(!img){ drawPlaceholder(); return; } ensureOwnBoxes('绘制');   // 画布永远只画「当前版自己的」框，串页先纠回来
+  ctx.clearRect(0,0,cv.width,cv.height); ctx.drawImage(img,PAD,PAD,natW*scale,natH*scale);
   const cross = mergeMode==='cross';
-  boxes.forEach((b,i)=>{ const X=b.x*scale+PAD,Y=b.y*scale+PAD,W=b.w*scale,H=b.h*scale; const isSel=b.id===selectedId;
+  boxes.forEach((b,i)=>{
+    // 诊断①：框记录于别的版 → 不在本版绘制。这正是「第5版显示第1版的框」的形态，留痕而不静默。
+    if(b._pg && b._pg!==srcName){ if(!b._pgWarned){ b._pgWarned=1; log('[一致性] 框 #'+b.id+' 创建于「'+b._pg+'」，不属于当前版「'+srcName+'」，已不在本版绘制'); } return; }
+    // 诊断②：框记录时的像素尺寸与当前版不符 → 坐标基准不一致（两版尺寸不同、scale 又不同时就会这样）
+    if(b._bw && (b._bw!==natW||b._bh!==natH) && !b._dimWarned){ b._dimWarned=1;
+      log('[一致性] 框 #'+b.id+' 记录于 '+b._bw+'×'+b._bh+'，当前版 '+natW+'×'+natH+'，坐标基准不符，该框可能偏位'); }
+    const X=b.x*scale+PAD,Y=b.y*scale+PAD,W=b.w*scale,H=b.h*scale; const isSel=b.id===selectedId;
     const color=(b.group?groupColor(b.group):LBL_COLOR[b.label])||'#dc2626';
     ctx.strokeStyle=color; ctx.lineWidth=isSel?3:2; ctx.strokeRect(X,Y,W,H);
     ctx.fillStyle=color; ctx.fillRect(X,Y-16,20,16); ctx.fillStyle='#fff'; ctx.font='12px sans-serif';
-    ctx.textAlign='center'; ctx.fillText(String(cross?globalBoxIndex(i):(i+1)),X+10,Y-4);     ctx.textAlign='left'; if(isSel) drawHandles(b,isSel);
+    ctx.textAlign='center'; ctx.fillText(String(cross?globalBoxIndex(i):(i+1)),X+10,Y-4);     ctx.textAlign='left';
+    if(isSel) drawHandles(b,isSel);
   });
-  if(cur){ const X=cur.x*scale+PAD,Y=cur.y*scale+PAD,W=cur.w*scale,H=cur.h*scale; ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([5,3]); ctx.strokeRect(X,Y,W,H); ctx.setLineDash([]); } }
+  if(cur){ const X=cur.x*scale+PAD,Y=cur.y*scale+PAD,W=cur.w*scale,H=cur.h*scale; ctx.strokeStyle='#f59e0b'; ctx.lineWidth=2; ctx.setLineDash([5,3]); ctx.strokeRect(X,Y,W,H); ctx.setLineDash([]); }
+  // 载入遮罩：此刻画布上还是上一版的图与框，不遮住的话用户会误以为已经翻到新版并开始框选
+  // （跨页模式下连续几版版面相似，肉眼更难分辨），这正是「框用错基准」的入口。
+  if(imgLoading){ ctx.fillStyle='rgba(15,23,42,0.55)'; ctx.fillRect(0,0,cv.width,cv.height);
+    ctx.fillStyle='#fff'; ctx.textAlign='center'; ctx.font='bold 16px "Microsoft YaHei",sans-serif';
+    ctx.fillText('载入中…',cv.width/2,cv.height/2); ctx.font='12px "Microsoft YaHei",sans-serif';
+    ctx.fillStyle='#cbd5e1'; ctx.fillText('上一版画面，请稍候再框选',cv.width/2,cv.height/2+22); ctx.textAlign='left'; } }
 // commitCanvas 已移除：回退到 #166 同步绘制方案——绘制在图片 onload 同步任务内完成即可随该次渲染上屏，无需点击。
 function drawHandles(b,isSel){ const hs=handlesOf(b); const act=dragState&&dragState.kind==='resize'&&dragState.id===b.id; ctx.fillStyle=act?'#f59e0b':'#2563eb'; ctx.strokeStyle='#fff'; ctx.lineWidth=1;
   hs.forEach(h=>{ ctx.fillRect(h.x,h.y,HANDLE,HANDLE); ctx.strokeRect(h.x,h.y,HANDLE,HANDLE); }); }
@@ -3762,6 +4480,13 @@ function handlesOf(b){ const X=b.x*scale+PAD,Y=b.y*scale+PAD,W=b.w*scale,H=b.h*s
           {name:'e',x:c(X+W),y:c(Y+H/2)},{name:'sw',x:c(X),y:c(Y+H)},{name:'s',x:c(X+W/2),y:c(Y+H)},{name:'se',x:c(X+W),y:c(Y+H)}]; }
 
 function toNat(e){ const r=cv.getBoundingClientRect(); const px=(e.clientX-r.left)*(cv.width/r.width)-PAD, py=(e.clientY-r.top)*(cv.height/r.height)-PAD; return [px*(natW/(cv.width-2*PAD)),py*(natH/(cv.height-2*PAD))]; }
+// 按「按下鼠标那一刻的 scale」换算：scale 依赖图片尺寸（baseScale=min(1,availW/natW,availH/natH)），
+// 换图后 scale 会变，同一个屏幕位置就会算出两个不同的像素值 —— 框既偏位、尺寸又正常，这是偏移的真因。
+// 正常情况（s 与当前 scale 相同）完全走上面 toNat 的老路径，行为零变化。
+function toNatAt(e,s){ if(s==null||Math.abs(s-scale)<1e-9) return toNat(e);
+  const r=cv.getBoundingClientRect(); const k=Math.max(1e-6,s);
+  const px=(e.clientX-r.left)*(cv.width/r.width)-PAD, py=(e.clientY-r.top)*(cv.height/r.height)-PAD;
+  return [px/k, py/k]; }
 function toCanvas(e){ const r=cv.getBoundingClientRect(); return [(e.clientX-r.left)*(cv.width/r.width),(e.clientY-r.top)*(cv.height/r.height)]; }
 function hitHandle(e){ if(selectedId==null)return null; const sb=boxes.find(b=>b.id===selectedId); if(!sb)return null; const [cx,cy]=toCanvas(e); for(const h of handlesOf(sb)){
   if(cx>=h.x-HIT_PAD&&cx<=h.x+HANDLE+HIT_PAD&&cy>=h.y-HIT_PAD&&cy<=h.y+HANDLE+HIT_PAD) return {box:sb,handle:h.name}; } return null; }
@@ -3781,25 +4506,48 @@ if(_modeSelect) _modeSelect.onclick = ()=>setInteractionMode('select');
 if(_modePan) _modePan.onclick = ()=>setInteractionMode('pan');
 
 cv.addEventListener('mousedown',e=>{ if(!img)return;
+  // 载入中禁止起框：此刻画布仍是上一版的图，记下的坐标会落进上一版或混用两套基准
+  if(imgLoading){ log('[框选] 目标版尚未载入完成（画布仍是上一版），已忽略本次操作'); return; }
+  ensureOwnBoxes('起框');   // 串页兜底：boxes 若不属于当前版，先切回本版数组，再取基准快照
+  baseOf={page:srcName,w:natW,h:natH,s:scale};   // 基准快照（含 scale），mouseup 时校验+换算
+  clearBoxFocusHighlight();   // 回到画布操作即结束上一次的片段标记；若点到框，mouseup 会重新标新的那段
   if(interactionMode==='pan'){ panState={x:e.clientX,y:e.clientY}; cv.style.cursor='grabbing'; return; }
   if(!e.altKey){ const hh=hitHandle(e); if(hh){ const [x,y]=toNat(e);
-  dragState={kind:'resize',id:hh.box.id,handle:hh.handle,startX:x,startY:y,origBox:{...hh.box}}; selectedId=hh.box.id; renderBoxList(); draw(); return; }
-  const hb=hitBox(e); if(hb){ const [x,y]=toNat(e); dragState={kind:'move',id:hb.id,startX:x,startY:y,origBox:{...hb}}; selectedId=hb.id; renderBoxList(); draw(); return; } }
+  dragState={kind:'resize',id:hh.box.id,handle:hh.handle,startX:x,startY:y,origBox:{...hh.box},s:scale}; selectedId=hh.box.id; renderBoxList(); draw(); return; }
+  const hb=hitBox(e); if(hb){ const [x,y]=toNat(e); dragState={kind:'move',id:hb.id,startX:x,startY:y,origBox:{...hb},s:scale}; selectedId=hb.id; renderBoxList(); draw(); return; } }
   // Alt+左键：跳过命中检测，强制从空白起画新框（应对排版紧凑/框体重叠场景）
-  selectedId=null; renderBoxList(); draw(); const [x,y]=toNat(e); drawing={x,y}; cur=null; });
+  selectedId=null; renderBoxList(); draw(); const [x,y]=toNat(e); drawing={x,y,s:scale}; cur=null; });
 cv.addEventListener('mousemove',e=>{ if(interactionMode==='pan' && panState){ const w=$('canvasWrap'); if(w){ w.scrollLeft-=(e.clientX-panState.x); w.scrollTop-=(e.clientY-panState.y); } panState={x:e.clientX,y:e.clientY}; return; }
-  if(drawing){ const [x,y]=toNat(e);
+  if(drawing){ const [x,y]=toNatAt(e,drawing.s);
   cur={x:Math.min(drawing.x,x),y:Math.min(drawing.y,y),w:Math.abs(x-drawing.x),h:Math.abs(y-drawing.y)}; draw(); return; }
   if(!dragState){ if(interactionMode==='pan'){ cv.style.cursor='grab'; return; } const hh=hitHandle(e),hb=hitBox(e); cv.style.cursor=hh?'resize':(hb?'move':'crosshair'); return; }
-  const [x,y]=toNat(e); const dx=x-dragState.startX,dy=y-dragState.startY; const b=boxes.find(bx=>bx.id===dragState.id); if(!b)return; const o=dragState.origBox;
+  const [x,y]=toNatAt(e,dragState.s); const dx=x-dragState.startX,dy=y-dragState.startY; const b=boxes.find(bx=>bx.id===dragState.id); if(!b)return; const o=dragState.origBox;
   if(dragState.kind==='move'){ b.x=o.x+dx; b.y=o.y+dy; } else { let nx=o.x,ny=o.y,nw=o.w,nh=o.h; const h=dragState.handle;
     if(h.includes('w')){ nx+=dx; nw-=dx; } if(h.includes('e')){ nw+=dx; } if(h.includes('n')){ ny+=dy; nh-=dy; } if(h.includes('s')){ nh+=dy; }
     if(nw<5)nw=5; if(nh<5)nh=5; b.x=nx;b.y=ny;b.w=nw;b.h=nh; } draw(); });
 cv.addEventListener('mouseup',e=>{ if(interactionMode==='pan'){ panState=null; cv.style.cursor='grab'; return; }
-  if(drawing){ const [x,y]=toNat(e); const x0=Math.min(drawing.x,x),y0=Math.min(drawing.y,y);
+  // 基准一致性校验：起框/拖动用的是按下那一刻的版与像素尺寸；若抬起时已换过图，坐标就是两套基准拼出来的，必须丢弃
+  const _bad = !baseOf || baseOf.page!==srcName || baseOf.w!==natW || baseOf.h!==natH;
+  if(_bad){ log('[框选] 基准不一致（按下时 '+(baseOf?baseOf.page+' '+baseOf.w+'x'+baseOf.h:'无')+' → 现在 '+(srcName||'无')+' '+natW+'x'+natH+'），本次操作已丢弃'); }
+  if(drawing){ if(_bad){ drawing=null; cur=null; draw(); return; } const [x,y]=toNatAt(e,drawing.s); const x0=Math.min(drawing.x,x),y0=Math.min(drawing.y,y);
   const w=Math.abs(x-drawing.x),h=Math.abs(y-drawing.y); drawing=null;
-  if(w>5&&h>5){ const nb={id:uid++,label:$('lblSel').value,x:x0,y:y0,w,h,group:''}; boxes.push(nb); selectedId=nb.id; recomputeCross(); renderBoxList(); renderResults(); }
-  cur=null; draw(); return; } if(dragState){ dragState=null; draw(); } });
+  if(w>5&&h>5){ const _lb=$('lblSel').value;
+    // _pg/_bw/_bh：框创建时所在版与图片像素尺寸的快照，纯诊断用（不改坐标、不做自动换算）。
+    // 旧框没有这三个字段，一律视为「属于当前版、尺寸一致」，行为不变。
+    const nb={id:uid++,label:_lb,x:x0,y:y0,w,h,group:'',_pg:srcName,_bw:natW,_bh:natH}; ensureOwnBoxes('新建框'); boxes.push(nb); selectedId=nb.id;
+    // 标签只作用于「刚画的这一个框」：画完立即复位为 text。下拉框若粘在 title 上，
+    // 后面每个新框都会被误设成标题、一版画出多个假分组；连续画多个标题按数字键 1 切换即可。
+    try{ $('lblSel').value='text'; }catch(_e){}
+    if(_lb!=='text'){ try{ log('[框选] 新建 #'+nb.id+' 标签 '+_lb+'（已复位为 text）'); }catch(_e){} }
+    recomputeCross(); renderBoxList(); renderResults(); }
+  cur=null; draw(); return; } if(dragState){
+  if(_bad){ const _o0=dragState.origBox, _b0=boxes.find(x=>x.id===dragState.id); if(_b0&&_o0) Object.assign(_b0,_o0); dragState=null; cur=null; draw(); return; }
+  // 单击（按下抬起间框无位移）= 放大定位 + 右侧对应结果卡片跳上来；有位移则是拖动调框，不联动
+  const _ds=dragState, _o=_ds.origBox; dragState=null; draw();
+  const _b=boxes.find(x=>x.id===_ds.id);
+  const _moved=!_b||_b.x!==_o.x||_b.y!==_o.y||_b.w!==_o.w||_b.h!==_o.h;
+  if(!_moved && _ds.kind==='move') onBoxClick(_b);
+} });
 // 右键点击框 / 控制点直接删除该框（无需去侧边栏点删除）
 cv.addEventListener('contextmenu',e=>{
   if(!img)return;
@@ -3810,6 +4558,12 @@ cv.addEventListener('contextmenu',e=>{
 document.addEventListener('keydown',e=>{
   const tag=document.activeElement&&document.activeElement.tagName;
   if(tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT') return;
+  // 数字键 1~4 快速切换框选标签（title / text / author / section），只对下一个新框生效
+  if(!e.ctrlKey&&!e.altKey&&!e.metaKey){
+    const _km={'1':'title','2':'text','3':'author','4':'section'};
+    const _kv=_km[e.key];
+    if(_kv){ const s=$('lblSel'); if(s){ s.value=_kv; try{ log('[框选标签] 已切换为 '+_kv); }catch(_e){} e.preventDefault(); return; } }
+  }
   if(e.key==='Delete'||e.key==='Backspace'){
     if(selectedId!=null) deleteBoxById(selectedId);
     return;
@@ -3832,18 +4586,265 @@ function flattenBoxes(){ const list=[]; let g=0;
     for(let i=0;i<arr.length;i++) list.push({box:arr[i], pageName:pname, localIdx:i, globalIdx:g++}); }
   return list; }
 function pageArr(pg){ return (allPageData[pg]&&allPageData[pg].boxes)||boxes; }
-function locateBox(id){ for(const pname of pageOrder){ const arr=(allPageData[pname]&&allPageData[pname].boxes)||[];
-    if(arr.some(b=>b.id===id)){ if(srcName!==pname){ pendingSelectId=id; const idx=navList.findIndex(f=>f.replace(/\.[^.]+$/,'')===pname); if(idx>=0) gotoPage(idx); } else { selectedId=id; renderBoxList(); draw(); } return; } }
+// 归属断言：boxes 必须始终是「当前版自己的」数组。一旦两者不是同一个引用，接下来任何画框/改框都会写进别的版，
+// 表现为「这一版显示的是上一版的框」（2026-11-05 用户反馈版5 复刻版1）。发现即纠正 + 留痕，不静默继续。
+function ensureOwnBoxes(tag){
+  if(!srcName) return false;
+  const pd=allPageData[srcName]; if(!pd||!pd.boxes) return false;
+  if(boxes===pd.boxes) return false;
+  log('[一致性] 警告：'+(tag||'')+' 当前画布框数组不属于正在查看的版 '+srcName+'（疑似串页），已切回本版数组');
+  boxes=pd.boxes; results=pd.results||{};
+  return true; }
+function locateBox(id){
+  for(const pname of pageOrder){ const arr=(allPageData[pname]&&allPageData[pname].boxes)||[];
+    const b=arr.find(x=>x.id===id);
+    if(b){ if(srcName!==pname){ pendingSelectId=id; pendingFocus=b; const idx=navList.findIndex(f=>f.replace(/\.[^.]+$/,'')===pname); if(idx>=0) gotoPage(idx); }
+      else { selectedId=id; renderBoxList(); draw(); focusBoxOnCanvas(b); } return; } }
   selectedId=id; renderBoxList(); draw(); }
 
+// ---------- 画布 ↔ 结果面板 双向定位（校对时上方看图、右侧看文） ----------
+// 单击框即联动，不设开关：只在该框已有识别结果时触发，拖框/拉控制点/画新框都不参与，
+// 且右侧只做「滚到卡片 + 给该段涂底色」，不占用选区、不打断编辑，无需用户去关。
+let pendingFocus = null;      // 跨版定位时暂存的待聚焦矩形，等图片 onload 后再执行
+const FOCUS_ZOOM_MAX = 3.0;   // 放大上限 3×（小标题框放到更高会失真且丢掉上下文）
+// 让画布缩放并居中到指定矩形（自然坐标 r={x,y,w,h}）。上限 3×，下限保持「适应窗口」1×（只放大不缩小）。
+function focusBoxOnCanvas(r){
+  if(!r || !img) return;
+  const wrap=$('canvasWrap'); if(!wrap) return;
+  const availW=Math.max(1,wrap.clientWidth-24), availH=Math.max(1,wrap.clientHeight-24);
+  const fit=Math.min(availW*0.86/Math.max(1,r.w), availH*0.86/Math.max(1,r.h));
+  const z=Math.min(FOCUS_ZOOM_MAX, Math.max(1, fit/(baseScale||1)));
+  if(Math.abs(z-userZoom)>0.08) setZoom(z);   // 与当前缩放相差很小则不重绘，只滚动定位
+  requestAnimationFrame(()=>{
+    const wr=wrap.getBoundingClientRect(), cr=cv.getBoundingClientRect();
+    const cvLeft=cr.left-wr.left+wrap.scrollLeft, cvTop=cr.top-wr.top+wrap.scrollTop;
+    const cx=(r.x+r.w/2)*scale+PAD, cy=(r.y+r.h/2)*scale+PAD;
+    wrap.scrollLeft=cvLeft+cx-wrap.clientWidth/2;
+    wrap.scrollTop =cvTop +cy-wrap.clientHeight/2;
+  });
+}
+// 框 → 该框所属识别结果卡片的 key。单页为 page:版名:子key，跨页为 crossauto/cross/default 等，统一反查不硬编码。
+function resultKeyOfBox(b){
+  if(!b) return null;
+  const t=getOcrTargets(boxes).find(t=>t.boxes&&t.boxes.indexOf(b)>=0); if(!t) return null;
+  const ct=aggregateCrossTargets().find(ct=>ct.pageTargets&&ct.pageTargets.some(pt=>pt.pname===srcName && pt.t.key===t.key));
+  return ct?ct.key:null;
+}
+// 卡片 key → 卡片 DOM。逐项比对 dataset 而非属性选择器，规避 key 里冒号/中文的转义问题。
+function findResultCard(key){
+  if(!key) return null; let hit=null;
+  document.querySelectorAll('#resultList textarea[data-key]').forEach(ta=>{ if(ta.dataset.key===key) hit=ta.closest('.card'); });
+  return hit;
+}
+// 右侧面板平滑滚动到指定卡片，并短暂高亮
+function scrollResultCard(key){
+  const card=findResultCard(key); if(!card) return;
+  const pane=card.closest('.right'); if(!pane) return;
+  const top=card.getBoundingClientRect().top - pane.getBoundingClientRect().top + pane.scrollTop;
+  pane.scrollTo({top:Math.max(0, top-12), behavior:'smooth'});
+  card.classList.add('flash'); setTimeout(()=>card.classList.remove('flash'), 1400);
+}
+// 单击画布上的框：放大定位 + 右侧对应卡片跳上来。
+// 仅当该框「已有识别结果」时才联动 —— 框选阶段没有结果，天然不受影响，不会打扰画框。
+// 框级识别结果（仅内存，不落盘、不进产物）：键 = 版名|target key|框id
+// 用途：点画布上的某个框时，在该篇合并后的文本里精确选中「这个框自己读出来的那段」。
+// 多个框合并成一篇后，parts 里的逐框结果原本用完即弃，导致「点框 → 定位到对应文字」无从下手。
+let boxPartsMap={};
+// 识别失败的框登记（仅内存，不落盘）：键 = 版名|页内 target key。用途是把「没读到」与
+// 「读到了但内容不对」区分开——失败时不再把错误文本伪装成正文写进 results（那会覆盖上一次
+// 成功的结果，且产物里出现整段报错文字），只在此登记，由结果面板标红提示重新识别。
+// 每次「识别全部」起始清空，避免跨批次残留。
+let failedBoxMap={};
+function failMark(pname,tkey,total,count,error){
+  failedBoxMap[pname+'|'+tkey]={total:total,count:count,error:error||''}; }
+function failInfoOfTarget(t){
+  try{ for(const pt of (t.pageTargets||[])){ const f=failedBoxMap[pt.pname+'|'+pt.t.key]; if(f) return f; } }catch(_e){}
+  return null; }
+function bpKey(pname,tkey,boxId){ return pname+'|'+tkey+'|'+boxId; }
+function bpPut(pname,tkey,boxId,label,txt,tl,au,bd){
+  try{ boxPartsMap[bpKey(pname,tkey,boxId)]={label:label||'',text:txt||'',t:tl||'',a:au||'',b:bd||''}; }catch(_e){}
+}
+function bpGet(pname,tkey,boxId){ try{ return boxPartsMap[bpKey(pname,tkey,boxId)]||null; }catch(_e){ return null; } }
+// 该卡片覆盖的所有框（版名 + 局部 target key + 框 id）：编辑时用来同步片段文本。
+// 复用渲染时已算好的 aggregateCrossTargets 结果，避免每张卡都全量重算一遍。
+function cardPartsOfTarget(t){
+  const out=[];
+  try{ (t.pageTargets||[]).forEach(pt=>{ (pt.t.boxes||[]).forEach(b=>out.push({pname:pt.pname, tkey:pt.t.key, boxId:b.id})); }); }catch(_e){}
+  return out;
+}
+// 文本被编辑后，把本篇各框记住的「这个框自己读出来的那段」同步成编辑后的新文本。
+// 不同步的后果：下次点这个框仍拿识别时的原文做 indexOf，用户改过的段必然找不到 → 定位失效。
+// 偏移用 adjustHlSpan 推，改动在段前整体平移、段内并进来、段后不动。
+function syncPartsAfterEdit(parts, ov, nv){
+  if(!parts||!parts.length||ov===nv) return;
+  parts.forEach(p=>{
+    const rec=bpGet(p.pname,p.tkey,p.boxId); if(!rec) return;
+    for(const f of ['b','t','a']){
+      const s=(rec[f]||'').trim(); if(!s) continue;
+      const at=ov.indexOf(s); if(at<0) continue;   // 该段被合并去重丢弃，本就不参与定位，跳过
+      const sp=adjustHlSpan(ov, nv, at, s.length);
+      rec[f]=nv.slice(sp.start, sp.start+sp.len);
+    }
+  });
+}
+// 在该篇的文本框里选中「这个框自己读出来的那段文字」
+// 返回 true = 已定位到片段；false = 找不到（用户改过文本 / 该框片段被合并去重丢弃），退回卡片级滚动
+// ===== 片段标记（不占用选区） =====
+// 目标：点画布上的框后，右侧对应那段文字被「涂色」，而不是被「选中」。
+// 选区是浏览器的瞬时状态，用户一点进文本框改字就没了；改为底色标记后，
+// 标记与光标/选区互不干扰，校对编辑时不会再打断。
+const HL_NAME='mohen-boxfocus';
+let hlScrollTa=null, hlScrollFn=null;
+let hlState=null;   // {ta,start,len,value}：当前片段标记的锚点，编辑时按差异平移/扩展，黄底跟着文字走
+function detachHlScroll(){ if(hlScrollTa&&hlScrollFn){ try{ hlScrollTa.removeEventListener('scroll',hlScrollFn); }catch(_e){} } hlScrollTa=null; hlScrollFn=null; }
+function clearBoxFocusHighlight(){
+  hlState=null;
+  try{ if(window.CSS&&CSS.highlights) CSS.highlights.delete(HL_NAME); }catch(_e){}
+  detachHlScroll();
+  const rl=$('resultList'); if(rl) rl.querySelectorAll('.hl-band').forEach(n=>n.remove());
+}
+// 重新落一次标记（点进文本框、选字等会让浏览器重算高亮时用来复位；不改选区、不动光标）
+function hlReapply(){ const st=hlState; if(!st||!st.ta||!st.ta.isConnected) return;
+  try{ paintHlRaw(st.ta, st.start, st.len); }catch(_e){} }
+// 编辑后重算标记区间：用「公共前缀/后缀」定位这次改动落在哪，
+// 改动在标记前 → 整体平移；在标记后 → 不变；与标记重叠 → 把改动范围并进标记。
+function adjustHlSpan(ov,nv,start,len){
+  const end=start+len; if(ov===nv) return {start,len};
+  const minL=Math.min(ov.length,nv.length);
+  let p=0; while(p<minL && ov[p]===nv[p]) p++;
+  let s=0; while(s<minL-p && ov[ov.length-1-s]===nv[nv.length-1-s]) s++;
+  const oldEnd=ov.length-s, delta=nv.length-ov.length;
+  let ns=start, ne=end;
+  if(oldEnd<=start){ ns=start+delta; ne=end+delta; }
+  else if(p>=end){ /* 改动在标记之后，区间不变 */ }
+  else { ns=Math.min(start,p); ne=Math.max(end+delta, ns); }
+  if(ns<0) ns=0; if(ne<ns) ne=ns; if(ne>nv.length) ne=nv.length; if(ns>ne) ns=ne;
+  return {start:ns, len:ne-ns};
+}
+// 降级：老运行时没有 createValueRange 时，用同字体度量的隐藏镜像量出该段的行矩形，
+// 再在文本框上层盖半透明色带（pointer-events:none，不影响输入与选区）。
+function paintHlBands(ta, at, len){
+  const wrap=ta.parentElement; if(!wrap||!wrap.classList.contains('ta-wrap')) return false;
+  const layer=wrap.querySelector('.hl-layer'); if(!layer) return false;
+  layer.innerHTML='';
+  const cs=getComputedStyle(ta);
+  const padL=parseFloat(cs.paddingLeft)||0, padT=parseFloat(cs.paddingTop)||0;
+  const padR=parseFloat(cs.paddingRight)||0;
+  const contentW=Math.max(8, ta.clientWidth-padL-padR);
+  const m=document.createElement('div');
+  m.style.cssText='position:absolute;visibility:hidden;left:-99999px;top:0;box-sizing:content-box;width:'+contentW+'px;'+
+    'padding:0;border:0;margin:0;font-family:'+cs.fontFamily+';font-size:'+cs.fontSize+';font-weight:'+cs.fontWeight+
+    ';font-style:'+cs.fontStyle+';line-height:'+cs.lineHeight+';letter-spacing:'+cs.letterSpacing+
+    ';word-spacing:'+cs.wordSpacing+';white-space:pre-wrap;overflow-wrap:break-word;word-break:'+cs.wordBreak+
+    ';tab-size:'+(cs.tabSize||8)+';';
+  m.textContent=ta.value;
+  document.body.appendChild(m);
+  try{
+    const tn=m.firstChild; if(!tn) return false;
+    const s=Math.max(0,Math.min(at,ta.value.length)), e2=Math.max(s,Math.min(at+len,ta.value.length));
+    const rng=document.createRange(); rng.setStart(tn,s); rng.setEnd(tn,e2);
+    const base=m.getBoundingClientRect();
+    const rects=Array.from(rng.getClientRects()); if(!rects.length) return false;
+    const inner=document.createElement('div'); inner.className='hl-inner';
+    rects.forEach(r=>{ const d=document.createElement('div'); d.className='hl-band';
+      d.style.left=(r.left-base.left+padL)+'px'; d.style.top=(r.top-base.top+padT)+'px';
+      d.style.width=Math.max(2,r.width)+'px'; d.style.height=Math.max(2,r.height)+'px'; inner.appendChild(d); });
+    layer.appendChild(inner);
+    const sync=()=>{ inner.style.transform='translate(0,'+(-(ta.scrollTop||0))+'px)'; };
+    sync(); hlScrollTa=ta; hlScrollFn=sync; ta.addEventListener('scroll',sync,{passive:true});
+    return true;
+  }catch(_e){ return false; } finally { m.remove(); }
+}
+// 一级：CSS Custom Highlight API + OpaqueRange（textarea.createValueRange，Chromium 152+）
+// 只画标记、不动锚点：编辑跟随与点击复位都走这里，避免把 hlState 一起清掉
+function paintHlRaw(ta, at, len){
+  try{ if(window.CSS&&CSS.highlights) CSS.highlights.delete(HL_NAME); }catch(_e){}
+  detachHlScroll();
+  const rl=$('resultList'); if(rl) rl.querySelectorAll('.hl-band').forEach(n=>n.remove());
+  try{
+    if(ta&&typeof ta.createValueRange==='function'&&window.Highlight&&window.CSS&&CSS.highlights){
+      const s=Math.max(0,Math.min(at,ta.value.length)), e2=Math.max(s,Math.min(at+len,ta.value.length));
+      CSS.highlights.set(HL_NAME, new window.Highlight(ta.createValueRange(s,e2)));
+      return true;
+    }
+  }catch(_e){}
+  try{ return paintHlBands(ta, at, len); }catch(_e2){ return false; }
+}
+function highlightBoxRange(ta, at, len){ clearBoxFocusHighlight(); return paintHlRaw(ta, at, len); }
+function selectBoxText(b){
+  try{
+    const t=getOcrTargets(boxes).find(t=>t.boxes&&t.boxes.indexOf(b)>=0); if(!t) return false;
+    const rec=bpGet(srcName,t.key,b.id); if(!rec) return false;
+    const key=resultKeyOfBox(b); if(!key) return false;
+    const card=findResultCard(key); if(!card) return false;
+    const ta=card.querySelector('textarea'); if(!ta) return false;
+    // 候选顺序：正文 > 标题 > 署名。正文框就落在正文那段，标题框落在标题那段。
+    const cand=[rec.b,rec.t,rec.a].map(s=>(s||'').trim()).filter(s=>s.length>0);
+    let at=-1, len=0;
+    for(const s of cand){ const i=ta.value.indexOf(s); if(i>=0){ at=i; len=s.length; break; } }
+    if(at<0){ return false; }
+    ta.focus({preventScroll:true});
+    // 只把光标放到该段开头，不选中任何文字：选中态一改字就消失，也会和用户自己的选字打架
+    try{ ta.setSelectionRange(at, at); }catch(_e){}
+    // 用底色标出该框对应的那段文字（不占选区，编辑过程中仍在）
+    highlightBoxRange(ta, at, len);
+    // 记下锚点：之后编辑时按前后文差异把标记平移/扩展，黄底跟着文字走，不会一改就没
+    hlState={ta, start:at, len, value:ta.value};
+    // 文本框已自动撑高时无需内部滚动；若设了固定高度导致内部滚动，把光标估到可视区
+    if(ta.scrollHeight>ta.clientHeight+8){
+      const before=ta.value.slice(0,at);
+      const ratio=(before.length/Math.max(1,ta.value.length));
+      ta.scrollTop=Math.max(0, ratio*ta.scrollHeight - ta.clientHeight/2);
+    }
+    scrollResultCard(key);
+    return true;
+  }catch(_e){ return false; }
+}
+function onBoxClick(b){
+  if(!b || !img) return;
+  const key=resultKeyOfBox(b); if(!key) return;
+  const it=resultToItem(crossResults[key]);
+  if(!(it.raw||it.body||it.title||it.author)) return;
+  focusBoxOnCanvas(b);
+  // 优先做片段级定位（把该框对应的那段文字涂色标出），定位不到才退回卡片级滚动
+  clearBoxFocusHighlight();
+  if(!selectBoxText(b)) scrollResultCard(key);
+}
+// 反向：结果卡片上的「定位」按钮 → 画布定位到该篇（用整篇所有框的并集）。
+// 目标框在别的版时先翻页，把矩形存进 pendingFocus，等图片 onload 再定位（复用 pendingSelectId 通道）。
+function locateByResultKey(key){
+  const ct=aggregateCrossTargets().find(x=>x.key===key); if(!ct||!ct.pageTargets||!ct.pageTargets.length) return;
+  const pt=ct.pageTargets[0]; if(!allPageData[pt.pname]) return;
+  const r=computeUnionBox(pt.t.boxes||[]); if(!isFinite(r.x)) return;
+  const first=(pt.t.boxes||[])[0]||null;
+  if(srcName!==pt.pname){
+    if(first) pendingSelectId=first.id;
+    pendingFocus=r;
+    const idx=navList.findIndex(f=>f.replace(/\.[^.]+$/,'')===pt.pname); if(idx>=0) gotoPage(idx);
+    return;
+  }
+  if(first){ selectedId=first.id; renderBoxList(); draw(); }
+  focusBoxOnCanvas(r);
+}
+
 function renderBoxList(){ const el=$('boxList');
+  ensureOwnBoxes('渲染框列表');   // 先保证 boxes 属于当前版，避免把别版的框当成自己的列出来
   const cross = mergeMode==='cross';
   const view = cross ? flattenBoxes() : boxes.map((b,i)=>({box:b, pageName:srcName, localIdx:i, globalIdx:i}));
   if(!view.length){ el.innerHTML='<div style="color:var(--mut); font-size:12px;">尚未框选</div>'; return; } el.innerHTML='';
   const grpMap=new Map(); view.forEach(v=>{ if(!grpMap.has(v.pageName)) grpMap.set(v.pageName, effectiveGroups(pageArr(v.pageName))); });
+  // 跨页模式编号：必须按「成篇」全局累计，否则每版都从「自动1」重来，与下方「跨页·项 N」对不上。
+  // crossNo 直接由 aggregateCrossTargets 反查（成篇即编号），因此在「续页合并」后同一篇的各版框会共用同一个编号；
+  // 万一聚合抛错，退回 grpOff（按各版标题框数量累计）保证至少有全局递增的编号。单页模式两者皆空，行为不变。
+  const crossNo=new Map(), grpOff=new Map();
+  if(cross){ try{ aggregateCrossTargets().forEach((t,ti)=>{ (t.boxes||[]).forEach(b=>{ if(!crossNo.has(b.id)) crossNo.set(b.id,ti+1); }); }); }catch(_e){}
+    let acc=0; (pageOrder.length?pageOrder:[srcName]).forEach(pn=>{ grpOff.set(pn,acc); let n=0; (pageArr(pn)||[]).forEach(b=>{ if(!b.group&&b.label==='title') n++; }); acc+=n; }); }
   view.forEach((v)=>{ const b=v.box; const d=document.createElement('div'); d.className='box'+(b.id===selectedId?' sel':'');
     const effG = b.group || grpMap.get(v.pageName).get(b.id) || 'auto0';
-    const color=(b.group?groupColor(b.group):LBL_COLOR[b.label])||'#dc2626'; const groupHint=b.group?('组:'+b.group):('自动'+String(effG).replace(/^auto/,''));
+    const color=(b.group?groupColor(b.group):LBL_COLOR[b.label])||'#dc2626'; let groupHint;
+    if(b.group){ groupHint='组:'+b.group; }
+    else if(cross){ const gN=crossNo.get(b.id)||((parseInt(String(effG).replace(/^auto/,''),10)||0)+(grpOff.get(v.pageName)||0)); groupHint='自动'+gN; }
+    else { groupHint='自动'+String(effG).replace(/^auto/,''); }
     const num = cross ? (v.globalIdx+1) : (v.localIdx+1);
     const pageTag = cross ? `<span class="bx-page" title="所在版">${esc(v.pageName.replace(/\.[^.]+$/,'')||'')}</span>` : '';
     d.innerHTML=`<span class="bx-num" style="background:${color}">${num}</span>${pageTag}
@@ -3979,6 +4980,31 @@ function aggregateCrossTargets(){
   }
   return Array.from(groups.values());
 }
+// —— 合并后剔除正文里重复的署名 ——
+// 场景：署名框被标成「正文」，它读出的「雲姑」会按正文并入 body；同时另一个正文框
+// 又自己把署名读进 author 字段，于是产物里作者出现两次（作者：云姑 + 正文首行「雲姑」）。
+// 判定刻意收窄：只在正文前 3 块里找、必须是单行、极短、不含句读，且与作者「同字或差 1 字」
+// （差 1 字用于吸收繁简与个别 OCR 差异，如 云姑/雲姑）；一篇文章最多删一处。
+function _signNorm(s){ return String(s||'').replace(/[\s\u3000]+/g,'')
+  .replace(/[，。、；：:·．\.\-—－（）()「」『』《》〈〉“”"'`]/g,''); }
+function _levAtMost1(a,b){ if(a===b) return true; const la=a.length, lb=b.length;
+  if(Math.abs(la-lb)>1) return false;
+  if(la===lb){ let d=0; for(let i=0;i<la;i++){ if(a[i]!==b[i]){ if(++d>1) return false; } } return true; }
+  const s=la<lb?a:b, l=la<lb?b:a;
+  for(let i=0;i<s.length;i++){ if(s[i]!==l[i]) return s.slice(i)===l.slice(i+1); } return true; }
+function _sameSign(a,b){ const x=_signNorm(a), y=_signNorm(b); if(!x||!y) return false;
+  if(x===y) return true; return (x.length<=12 && y.length<=12) ? _levAtMost1(x,y) : false; }
+function dropDupSign(author, body){
+  const bd=body||''; if(!bd) return bd;
+  const auN=_signNorm(author); if(!auN || auN.length>12) return bd;  // 作者字段过长说明不是署名，放过
+  const blocks=bd.split(/\n{2,}/); if(blocks.length<2) return bd;
+  let removed=false; const out=[];
+  blocks.forEach((blk,i)=>{ const t=(blk||'').trim();
+    const hit = i<3 && !removed && t && t.indexOf('\n')<0 && _signNorm(t).length<=12 &&
+                !/[。！？，；：、]/.test(t) && _sameSign(auN,t);
+    if(hit){ removed=true; return; }
+    out.push(blk); });
+  return removed ? out.join('\n\n').replace(/^\s+|\s+$/g,'') : bd; }
 function mergeCrossTarget(ct){
   let title='',author='',bodies=[];
   for(const {pname,t} of ct.pageTargets){
@@ -4014,6 +5040,7 @@ function mergeCrossTarget(ct){
     else body += seg;                                // 跨页续句 → 直接衔接
     lastSeg=seg;
   }
+  body = dropDupSign(author, body);   // 正文里重复出现的署名（作者已单独成字段）剔除
   const raw=`标题：${title}\n作者：${author}\n正文：${body}`.trim();
   return {title,author,body,raw};
 }
@@ -4025,6 +5052,27 @@ function osRel(p){ if(!p) return p; try{ const base=((window.__RUNTIME_DIR)||'')
 // 常整列漏读（表现为「开头必丢一列」）。补边后贴边列离开图像边界，恢复正常识别。
 // 边距自适应：min(48, max(16, 4% × 长边))；纯白无内容，不引入噪声，源框坐标不变。
 function ocrPad(w,h){ return Math.min(48, Math.max(16, Math.round(0.04*Math.max(w,h)))); }
+// 并发识别：同版内的框允许同时发出。上限来自配置 OCR_CONCURRENCY（缺省 2，上限 6），
+// 设成 1 即退回严格串行。结果按索引写回，绝不依赖完成先后——段落顺序错乱不会报错，
+// 只会在成品里静默出现前后颠倒，是最不该由并发引入的故障。
+function ocrConcurrency(){
+  const v=(backendCfg&&backendCfg.values&&backendCfg.values.OCR_CONCURRENCY)||'';
+  const n=parseInt(v,10);
+  return (isFinite(n)&&n>0)?Math.min(n,6):3; }
+// 识别开始前重读一次配置：并发数改在 box_config.json 里即可生效，
+// 不必重启程序、也不必刷新页面（刷新会丢掉当前框选状态）。
+async function refreshRunCfg(){
+  try{ const r=await fetch('/api/config'); const j=await r.json();
+    if(j&&j.values){ backendCfg=backendCfg||{}; backendCfg.values=Object.assign({}, backendCfg.values||{}, j.values); }
+  }catch(_e){}
+}
+async function runLimited(items, limit, fn){
+  const list=items||[]; if(!list.length) return [];
+  const n=Math.max(1, Math.min(limit||1, list.length));
+  const out=new Array(list.length); let next=0;
+  const worker=async()=>{ for(;;){ const i=next++; if(i>=list.length) return; out[i]=await fn(list[i], i); } };
+  await Promise.all(Array.from({length:n}, worker));
+  return out; }
 // —— OCR 输出质量自检 ——
 // 便宜的视觉模型（如千问）遇到复杂竖排/密排原文会「整段读飞」：返回空、返回一两行、
 // 返回大量非汉字乱码或连续重复字符。这类失败此前静默混进结果，用户以为工具坏了。
@@ -4051,16 +5099,87 @@ function ocrQualityIssue(text, b){
   if(visible.length>=25 && han/visible.length<0.15) return '汉字占比仅 '+Math.round(han/visible.length*100)+'%，疑似乱码/串行';
   return '';
 }
-async function ocrBox(b, im, nW, nH){ const P=ocrPad(b.w,b.h);
+// 按框的显式标签，把 parseArticle 的结果收进对应字段（单框 / 多框共用，避免两处逻辑分叉）。
+// 关键防御在 author 分支：模型在署名框里没写「作者：」前缀时 p.author 为空、整段正文落在
+// p.body，旧写法 `parsed.author=p.author||p.body` 会把整段正文塞进作者行。作者行本身不会丢字，
+// 但多框合并时「作者只取首个非空」会让其余 parts 的作者字段整段消失——这是字面意义的缺行。
+// 署名必然极短，因此超过阈值或含句读的一律按正文处理。
+const AUTHOR_AS_SIGN_MAX=24;
+function foldParsedByLabel(b,p){
+  const parsed={title:'',author:'',body:''};
+  const lab=b?b.label:'';
+  if(lab==='title'){ parsed.title=p.title||p.body; }
+  else if(lab==='author'){
+    // 候选署名：模型写了「作者：」就用该字段，没写前缀时整段落在 body，只能看长短与形态判断。
+    const _au=(p.author||'').trim(), _bd=(p.body||'').trim(), _sign=_au||_bd;
+    const _isSign=!!_sign && _sign.length<=AUTHOR_AS_SIGN_MAX && _sign.indexOf('\n')<0 &&
+                  !/[，。；：、！？,;:!?]/.test(_sign);
+    if(_isSign) parsed.author=_sign; else parsed.body=_bd||_au;   // 不像署名：整段留作正文，避免合并阶段被丢弃
+  }
+  else if(lab==='section'){ parsed.body=(p.body||p.title||p.author||'').replace(/^(标题|作者|正文)[：:]\s*/,''); }
+  // 正文框（含历史结果）：整框内容一律作正文，不再拆出标题/作者。
+  // 一个框一个字段，text 框就是正文框；模型即便仍按旧提示词给出「标题：xxx」，那也只是它把某行读成了标题，
+  // 不代表这篇真有标题 —— 先按模型原始输出的行序整段取回，再剥掉字段名前缀，一个字都不丢。
+  else if(lab==='text'){
+    const _strip=s=>(s||'').replace(/^[ \t]*(标题|作者|正文)[：:][ \t]*\n?/gm,'').replace(/\n{3,}/g,'\n\n').trim();
+    const _rawStripped=_strip(p.raw);
+    parsed.body=_rawStripped || [p.title,p.author,p.body].filter(x=>x).join('\n\n');
+  }
+  // 未标标签的框（历史数据）：三个字段全部保留。曾只取 body —— 模型在未标标签框里输出「标题：xxx」时
+  // 该行被整段丢弃，表现为「结构化后第一个框的标题被吞」。
+  else { parsed.title=p.title||''; parsed.author=p.author||''; parsed.body=p.body||''; }
+  return parsed;
+}
+// 裁切一张框图（四周补白边，避免贴边列漏读）。
+function cropB64(b, im){ const P=ocrPad(b.w,b.h);
   const oc=document.createElement('canvas'); oc.width=b.w+2*P; oc.height=b.h+2*P;
   const octx=oc.getContext('2d'); octx.fillStyle='#fff'; octx.fillRect(0,0,oc.width,oc.height);
-  octx.drawImage(im,b.x,b.y,b.w,b.h,P,P,b.w,b.h); const b64=oc.toDataURL('image/png').split(',')[1];
-  const r=await fetch('/api/ocr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_b64:b64,src:srcName,label:(b.label||''),overrides:getOverrides()})});
-  const j=await r.json(); if(!j.ok) return {text:'[OCR_ERROR] '+(j.error||''), usage:{}};
+  octx.drawImage(im,b.x,b.y,b.w,b.h,P,P,b.w,b.h); return oc.toDataURL('image/png').split(',')[1]; }
+async function ocrBox(b, im, nW, nH){ const P=ocrPad(b.w,b.h);
+  // 防御：宽或高异常（0 / 负数 / 过小）时下面 canvas 会退化成纯白小图，模型必然返回空、
+  // 且界面上毫无提示（表现为「这个框一个字都没识别出来」）。这类框一律不发请求。
+  if(!(b.w>=8 && b.h>=8)){
+    const _m='框尺寸异常 '+Math.round(b.w)+'×'+Math.round(b.h)+'px，已跳过识别（多半是拖拽时只动了一条边或坐标被截断）。请删除该框重画。';
+    log('[识别] '+_m);
+    ocrQualityFlags.push({page:srcName, label:(b.label||'未标标签'), issue:_m});
+    return {text:'', usage:{}, finish_reason:'SKIPPED'}; }
+  // 坐标越界只告警不拦截：坐标系若整体偏移，跳过会让用户彻底无法识别，先让它照常发请求
+  if(nW && nH && (b.x>=nW || b.y>=nH || b.x+b.w<=0 || b.y+b.h<=0)){
+    const _w='框坐标越界 @('+Math.round(b.x)+','+Math.round(b.y)+') 尺寸 '+Math.round(b.w)+'×'+Math.round(b.h)+'，超出原图 '+(nW||'?')+'×'+(nH||'?')+'，识别结果可能为空。';
+    log('[识别] 警告：'+_w); }
+  const b64=cropB64(b,im);
+  // 请求本身可能直接抛错（后端未就绪、连接被拒、超时）。此前这类错误会冒泡到整页 try，
+  // 让该版所有框一起作废；这里就地收敛成「这个框识别失败」，其余框照常继续。
+  let j=null;
+  const _postOcr=async()=>{ const r=await fetch('/api/ocr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_b64:b64,src:srcName,label:(b.label||''),overrides:getOverrides()})});
+    return await r.json(); };
+  try{ j=await _postOcr(); }
+  catch(_e){ j={ok:false, error:'请求失败：'+String((_e&&_e.message)||_e).slice(0,180)}; }
+  // 并发识别会撞上厂商 RPM/TPM 限流：这类失败退避后重试一次，不能直接判成「这个框读不出来」，
+  // 否则并发只是把串行时能成功的框变成了随机的失败框。
+  const _rlTxt=String((j&&j.error)||'');
+  if((!j||!j.ok)&&/429|rate.?limit|RPM|TPM|concurren|too many requests|频繁|限流/i.test(_rlTxt)){
+    log('[识别] 触发限流，1.5 秒后重试 1 次：'+_rlTxt.slice(0,80));
+    await new Promise(_r=>setTimeout(_r,1500));
+    try{ j=await _postOcr(); }
+    catch(_e2){ j={ok:false, error:'请求失败（重试）：'+String((_e2&&_e2.message)||_e2).slice(0,180)}; }
+  }
+  if(!j || !j.ok){ const _e=(j&&j.error)||'未知错误';
+    // 关键：不返回「看起来像正文」的错误文本。此前返回 '[OCR_ERROR] xxx'，被 parseArticle
+    // 当正文写进 results，既覆盖掉上一次成功的结果，又在产物里留下整段报错文字（实测
+    // 29 次连续失败后界面显示 8033 字 = 29 × 277，全是同一条错误提示）。
+    return {ok:false, failed:true, error:_e, text:'', usage:{}, finish_reason:'FAILED'}; }
+  if(j.note) log('[百度] '+j.note);   // 额度用尽自动换档等过程提示，让用户知道档位变过
   const _t=j.text||'';
   const _issue=ocrQualityIssue(_t, b);
   if(_issue) ocrQualityFlags.push({page:srcName, label:(b.label||'未标标签'), issue:_issue});
-  return {text:_t, usage:j.usage||{}}; }
+  // 输出被截断（finish_reason=length）：结尾少了一截但界面上完全看不出来，必须显式报出
+  if(String(j.finish_reason||'')==='length'){
+    const _tm='模型输出达到长度上限被截断（finish_reason=length），本框结尾可能缺失，建议拆成两个框重跑。';
+    log('[识别] '+(b.label||'未标')+' 框：'+_tm);
+    ocrQualityFlags.push({page:srcName, label:(b.label||'未标标签'), issue:_tm});
+  }
+  return {ok:true, failed:false, text:_t, usage:j.usage||{}, finish_reason:j.finish_reason||''}; }
 async function recognizeOneBox(b){ return ocrBox(b, img, natW, natH); }
 async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); return; }
   if(!pageOrder.length){ alert('请先在卡片②勾选并「载入」整版原图。'); return; }
@@ -4069,12 +5188,22 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
   const noBoxPages=pageOrder.filter(p=>!boxedPages.includes(p));
   if(!boxedPages.length){ alert('没有可识别的整版：请先为至少一版框选区域再识别，无框严禁识别。'); return; }
   if(noBoxPages.length){ log('[识别全部] 以下整版未框选，已跳过（仅识别已框选的 '+boxedPages.length+' 版）：'+noBoxPages.join('、')); }
+  await refreshRunCfg();   // 取最新的 OCR_CONCURRENCY（改配置后直接点识别即可，不必重启）
   setOcrHint('识别中…', true);
   ocrQualityFlags=[];   // 每次识别全部重置质量自检标记，避免跨批次累积
+  boxPartsMap={};       // 同步清空框级识别结果（点框定位片段的依据）
+  failedBoxMap={};      // 清空上一次的失败登记，避免旧批次标红残留
+  // 标签自检：一版 title 框过多时提示。title 会开新组，误把正文框设成 title 会一次性造出多个假分组。
+  try{ const _bad=[];
+    for(const _p of pageOrder){ const _n=(((allPageData[_p]||{}).boxes)||[]).filter(b=>b.label==='title').length;
+      if(_n>6) _bad.push((_p||'-')+'（'+_n+' 个）'); }
+    if(_bad.length) log('[标签自检] 以下整版的 title 框偏多：'+_bad.join('、')+'。若非一页多篇，请到卡片③把误设的框改回 text。');
+  }catch(_e){}
   // 逐版离线识别：每版重新取图并按页存回 allPageData，最后统一聚合
   let failedPages=[];
   let ocrPt=0,ocrCt=0,ocrTt=0,ocrDur=0;  // 本次识别累计 token / 耗时
   const tStart=performance.now();
+  ensureOwnBoxes('识别前');   // 识别前再确认一次，避免把别版的框送去识别
   log('[识别全部] 模式='+mode+'，载入 '+pageOrder.length+' 版；各版框数：'+pageOrder.map(p=>(p+'='+(allPageData[p]?allPageData[p].boxes.length:'(无)'))).join('，'));
   for(const pname of boxedPages){
     const pd=allPageData[pname]; if(!pd){ failedPages.push(pname+'（未载入框选数据）'); continue; }
@@ -4089,29 +5218,55 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
         if(t.key==='__whole__'){ log('[识别全部] 错误：检测到整版兜底目标，已禁止识别（无框严禁）。'); continue; }
         else if(t.boxes&&t.boxes.length===1){
           const b=t.boxes[0]; const r=await ocrBox(b,im,nW,nH);
-          // 单框：整框内容严格归到框的显式标签字段。先用 parseArticle 拆出模型输出的标题/作者/正文，
-          // 再按框 label 只取对应字段；无对应字段时退取 body（模型未写前缀时整段即内容）。
+          // 识别失败：不写 results、不覆盖上一次成功的结果，只登记失败并由结果面板标红。
+          if(r.failed){ failMark(pname,t.key,1,1,r.error);
+            log('[识别全部] '+pname+' 框#'+(b.id!=null?b.id:'?')+'（'+(b.label||'未标')+'）识别失败，原结果保留未覆盖：'+(r.error||''));
+            continue; }
           const p=parseArticle(r.text||'');
-          const parsed={title:'',author:'',body:''};
-          if(b.label==='title') parsed.title=p.title||p.body;
-          else if(b.label==='author') parsed.author=p.author||p.body;
-          else if(b.label==='section') parsed.body=(p.body||p.title||p.author||'').replace(/^(标题|作者|正文)[：:]\s*/,'');
-          // 未标标签的框：三个字段全部保留。此前只取 body —— 模型在未标标签框里输出
-          // 「标题：xxx」时该行被整段丢弃，表现为「结构化后第一个框的标题被吞」。
-          else { parsed.title=p.title||''; parsed.author=p.author||''; parsed.body=p.body||''; }
+          const parsed=foldParsedByLabel(b,p);
+          bpPut(pname, t.key, b.id, b.label, r.text||'', parsed.title, parsed.author, parsed.body);
           pd.results[t.key]=parsed; if(r.usage){ ocrPt+=r.usage.prompt_tokens||0; ocrCt+=r.usage.completion_tokens||0; ocrTt+=r.usage.total_tokens||0; ocrDur+=r.usage.duration_s||0; } }
-        else if(t.boxes&&t.boxes.length>1){ const parts=[]; for(const b of t.boxes){ const r=await ocrBox(b,im,nW,nH);
-          // 同单框：先用 parseArticle 拆分模型输出，再按框 label 只取对应字段，避免内容串位。
-          const p=parseArticle(r.text||'');
-          const parsed={title:'',author:'',body:''};
-          if(b.label==='title') parsed.title=p.title||p.body;
-          else if(b.label==='author') parsed.author=p.author||p.body;
-          else if(b.label==='section') parsed.body=(p.body||p.title||p.author||'').replace(/^(标题|作者|正文)[：:]\s*/,'');
-          // 未标标签的框：三个字段全部保留。此前只取 body —— 模型在未标标签框里输出
-          // 「标题：xxx」时该行被整段丢弃，表现为「结构化后第一个框的标题被吞」。
-          else { parsed.title=p.title||''; parsed.author=p.author||''; parsed.body=p.body||''; }
-          parts.push(parsed); if(r.usage){ ocrPt+=r.usage.prompt_tokens||0; ocrCt+=r.usage.completion_tokens||0; ocrTt+=r.usage.total_tokens||0; ocrDur+=r.usage.duration_s||0; } }
-          const title=parts.map(p=>p.title).find(x=>x)||''; const author=parts.map(p=>p.author).find(x=>x)||''; const body=parts.map(p=>p.body).filter(x=>x).join('\n\n');
+        else if(t.boxes&&t.boxes.length>1){ const parts=[]; const _fail=[];
+          const _n=ocrConcurrency();
+          const _rs=new Array(t.boxes.length);
+          if(_n>1) log('[识别全部] '+pname+' 该篇 '+t.boxes.length+' 个框并发识别（并发数 '+_n+'）');
+          const rr=await runLimited(t.boxes, _n, (b)=>ocrBox(b,im,nW,nH));
+          rr.forEach((r,i)=>{ _rs[i]=r; });
+          for(let _i=0;_i<t.boxes.length;_i++){ const b=t.boxes[_i]; const r=_rs[_i];
+            if(!r||r.failed){ _fail.push({b:b,error:(r&&r.error)||''});
+              continue; }   // 失败框不产出 part，绝不伪造内容
+            const p=parseArticle(r.text||'');
+            const parsed=foldParsedByLabel(b,p);
+            bpPut(pname, t.key, b.id, b.label, r.text||'', parsed.title, parsed.author, parsed.body);
+            parts.push(parsed); if(r.usage){ ocrPt+=r.usage.prompt_tokens||0; ocrCt+=r.usage.completion_tokens||0; ocrTt+=r.usage.total_tokens||0; ocrDur+=r.usage.duration_s||0; } }
+          if(_fail.length){ failMark(pname,t.key,t.boxes.length,_fail.length,_fail[0].error);
+            log('[识别全部] '+pname+' 该篇 '+t.boxes.length+' 个框中有 '+_fail.length+' 个识别失败（框#'+
+              _fail.map(f=>f.b.id!=null?f.b.id:'?').join('、#')+'），失败框不产出内容，其余框照常合并：'+(_fail[0].error||'')); }
+          // 全部失败时整篇不落结果，避免把空篇写进 results 顶掉上一轮的成品
+          if(!parts.length){ log('[识别全部] '+pname+' 该篇全部框识别失败，保留原结果不动。'); continue; }
+          // 多个框各读各的，正文框常把页面上的大标题也顺带读进 title 字段，
+          // 于是「烟台纪行」这类正题会被重复读出 3~5 遍。合并口径与 mergeCrossTarget 一致：
+          // 与正题相同/相似的后续标题视为「同一个标题被重复读出」，丢弃不进正文；
+          // 只有真正不同的（副题、引题、另一篇的题头）才并入正文，不静默丢弃。
+          //
+          // 合并口径（20261103 修正三处）：
+          // ① 标题：首个非空作正题，后续相似者视为重复读出而丢弃，不同者原地并入正文。
+          // ② 作者：首个非空作作者，后续**不同的**一并进正文。旧写 `find(x=>x)` 只取首个非空、
+          //    其余 author 直接丢弃，若某 author 框被读成整段正文，整段就此消失。
+          // ③ 顺序：严格按 parts 顺序拼接。旧写把非首框标题统一前置到正文最前，
+          //    段落会从原位搬到开头（实测 17 字栏头被搬到 2922 字正文的开头）。
+          const _titles=parts.map(p=>p.title).filter(x=>x);
+          const title=_titles[0]||'';
+          const _authors=parts.map(p=>p.author).filter(x=>x);
+          const author=_authors[0]||'';
+          const _segs=[];
+          parts.forEach((p,i)=>{
+            if(i>0 && p.title && !_titleSame(_normTitle(p.title), _normTitle(title))) _segs.push(p.title);
+            if(i>0 && p.author && p.author!==author) _segs.push(p.author);
+            if(p.body) _segs.push(p.body);
+          });
+          const _bodyRaw=_segs.filter(x=>x).join('\n\n');
+          const body=dropDupSign(author, _bodyRaw);   // 剔除正文里重复出现的署名
           pd.results[t.key]={title,author,body,raw:`标题：${title}\n作者：${author}\n正文：${body}`.trim()}; } }
       // 单页模式：每版识别完立即按「当前版名」导出，避免循环结束后只导出末尾 srcName 那一版（其余版白识别）
       if(mergeMode!=='cross'){
@@ -4145,9 +5300,14 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
     });
     if(cross&&_cts.length===1&&boxedPages.length>1) log('[识别全部] 提示：'+boxedPages.length+' 版内容已合并成 1 篇（分篇只看标题）。若其中某版其实是另一篇文章，请给它那篇画上并标注「标题」框；也可在「自动分组」里给各篇填不同组号强制分篇。');
   }catch(_e){ log('[识别全部] 分篇清单打印失败：'+_e); }
+  // 失败框汇总：失败不写结果、不进导出，但必须让用户看见「哪里没读到」，否则只会以为内容就是这么少。
+  const _failBoxes=Object.keys(failedBoxMap).length;
+  if(_failBoxes) log('[识别全部] 注意：'+_failBoxes+' 篇存在识别失败的框（结果面板已标红）。失败框不写入任何内容、也不进导出；请检查网络与 API 配置后重新识别这些框。');
   if(failedPages.length) setOcrHint('识别完成，'+failedPages.length+' 版失败', false);
+  else if(_failBoxes) setOcrHint('识别完成，'+_failBoxes+' 篇有失败框（已标红）', false);
   else setOcrHint('识别完成 ✓（'+okCount+' 版）', true);
-  log('[识别全部] 本次 OCR 消耗'+(cfgModel?'（'+cfgModel+'）':'')+' → 输入 '+ocrPt.toLocaleString()+' + 输出 '+ocrCt.toLocaleString()+' = 总 '+ocrTt.toLocaleString()+' tokens；OCR 接口耗时 '+ocrDur.toFixed(2)+'s，总耗时 '+wall+'s。');
+  const _ccN=ocrConcurrency();
+  log('[识别全部] 本次 OCR 消耗'+(cfgModel?'（'+cfgModel+'）':'')+' → 输入 '+ocrPt.toLocaleString()+' + 输出 '+ocrCt.toLocaleString()+' = 总 '+ocrTt.toLocaleString()+' tokens；各框识别耗时合计 '+ocrDur.toFixed(2)+'s'+(_ccN>1?('（并发 '+_ccN+' 个框）'):'')+'，本批实际用时 '+wall+'s。');
   // 记录一次「识别全部」运行；OCR 调用次数按本次识别的「组」数计（每个 group 1 次，含未标 group 自动合并的默认组）
   if(okCount>0){ try{ const callGroups=aggregateCrossTargets(); fetch('/api/ocr_run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:cfgModel,pages:pageOrder.length,boxes:pageOrder.reduce((s,p)=>s+((allPageData[p]&&allPageData[p].boxes)?allPageData[p].boxes.length:0),0),calls:callGroups.length})}).catch(()=>{}); }catch(e){} }
   if(failedPages.length) log('[识别全部] 以下版识别失败：'+failedPages.join('、'));
@@ -4181,12 +5341,13 @@ function parseArticle(text){ const t=(text||'').replace(/\r/g,'');
 function resultToItem(o){ if(!o)return{title:'',author:'',body:'',raw:''}; if(typeof o==='string')return parseArticle(o); return o; }
 function itemToText(it){ if(!it)return''; if(typeof it==='string')return it.trim(); if(it.raw)return it.raw.trim(); return `标题：${it.title||''}\n作者：${it.author||''}\n正文：${it.body||''}`.trim(); }
 function renderResults(){ const el=$('resultList');
+  clearBoxFocusHighlight();   // 重渲染会重建 textarea，旧的片段标记必须一起清掉，否则指向已销毁的节点
   if(!img){ el.innerHTML='<div style="color:var(--mut); font-size:12px;">载入整版图片后，在此显示可核对 / 编辑的识别结果。</div>'; return; }
   const cross = mergeMode==='cross';
   const targets=aggregateCrossTargets(); if(!targets.length){ el.innerHTML='<div style="color:var(--mut); font-size:12px;">多篇模式需先框选区域，再点「识别全部」。</div>'; return; }
   // 重建前快照：容器滚动位置 + 各 textarea 的高度/滚动位置，避免翻页/重渲染后校对位置丢失
   const keepSc=el.scrollTop; const keep={};
-  el.querySelectorAll('textarea[data-key]').forEach(ta=>{ keep[ta.dataset.key]={h:ta.style.height, st:ta.scrollTop}; });
+  el.querySelectorAll('textarea[data-key]').forEach(ta=>{ keep[ta.dataset.key]={h:ta.style.height, st:ta.scrollTop, ex:ta.dataset.expanded||''}; });
   el.innerHTML='';
   // 全局序号映射：box 对象 -> 阅读顺序中的连续编号（与 renderBoxList 展平一致），避免多版时局部序号错乱
   const flat=flattenBoxes(); const gIdx=new Map(); flat.forEach(v=>gIdx.set(v.box, v.globalIdx+1));
@@ -4195,22 +5356,60 @@ function renderResults(){ const el=$('resultList');
       if(t.key==='__cross_whole__'){ title='跨页·整篇合并'; size=pageOrder.length+' 版合并'; }
       else if(t.group){ const pages=t.pageTargets.map(pt=>pt.pname.replace(/\.[^.]+$/,'')).join('、'); title=`跨页·组 ${t.group}（${pages}）`; size=t.pageTargets.length+' 处 / '+pageOrder.length+' 版'; }
       else if(t.key==='__cross_default__'){ title='跨页·续页（开头无标题）'; size=t.pageTargets.map(pt=>pt.pname.replace(/\.[^.]+$/,'')).join('、'); }
-      else { title=`跨页·项 ${i+1} · ${t.label}`; size=t.pageTargets.map(pt=>pt.pname.replace(/\.[^.]+$/,'')).join('、'); }
+      else { title=`跨页·项 ${i+1}`; size=t.pageTargets.map(pt=>pt.pname.replace(/\.[^.]+$/,'')).join('、'); }
     } else if(t.key==='__whole__'){ title='（无框未识别）'; size='请框选后再识别'; }
     else if(t.boxes&&t.boxes.length>1){ const g=t.boxes[0].group; title=g?`组 ${g}`:'合并';
       const area=t.boxes.reduce((s,b)=>s+b.w*b.h,0); size=`${t.boxes.length} 个框 / 约 ${Math.round(area).toLocaleString()}px²`; }
     else { const b=t.boxes?t.boxes[0]:null; title=b?`框 ${i+1} · ${b.label}`:'单篇'; size=b?`${b.w}×${b.h}px`:''; }
+    // 识别失败标记：失败不再伪造正文，因此卡片可能为空。没有显式提示的话，用户只会看到
+    // 「这篇没内容」，误以为漏识别或程序坏了。标红 + 提示条把「没读到」讲清楚。
+    const _fi=failInfoOfTarget(t);
     let display=item.raw;
     if(!cross && t.boxes&&t.boxes.length===1){ const b=t.boxes[0];
       if(b.label==='title')display=item.title?`标题：${item.title}`:item.raw;
       else if(b.label==='author')display=item.author?`作者：${item.author}`:item.raw;
       else if(b.label==='section')display=item.body||item.title||item.author||item.raw||'';
       else if(b.label==='text'){ const ls=[]; if(item.title)ls.push(`标题：${item.title}`); if(item.author)ls.push(`作者：${item.author}`); if(item.body)ls.push(item.body); display=ls.join('\n')||item.raw; } }
-    const d=document.createElement('div'); d.className='card'; d.innerHTML=`<div class="hd"><span class="title">${title}</span><span class="meta">${size}</span></div><textarea data-key="${esc(t.key)}">${esc(display)}</textarea>`;
+    const d=document.createElement('div'); d.className='card'+(_fi?' fail':''); d.dataset.key=t.key;
+    d._parts=cardPartsOfTarget(t);   // 本篇各框的片段记录位置，编辑时同步用（挂 DOM 上，避免二次全量聚合）
+    // 提示条放在 textarea 之外：不能让「识别失败」这类提示进入文本框，否则会被当正文编辑并导出。
+    const _failBar=_fi?`<div class="failbar">⚠ 识别失败：${esc(_fi.count+'/'+_fi.total+' 个框未读到')} — ${esc(_fi.error||'未知错误')}${
+      item.raw?'（下方为上一次成功识别的结果，本次失败未覆盖它）':'（本篇无内容，可修正后重新识别）'}</div>`:'';
+    d.innerHTML=`<div class="hd"><span class="title">${title}</span><span class="meta">${size}</span><button class="exp" data-exp-key="${esc(t.key)}" title="展开：显示全文，不用框内滚动条">展开</button><button class="loc" data-loc-key="${esc(t.key)}" title="在左侧画布定位并放大到该篇">定位</button></div>${_failBar}<div class="ta-wrap"><textarea data-key="${esc(t.key)}"${_fi&&!item.raw?' placeholder="识别失败，暂无内容"':''}>${esc(display)}</textarea><div class="hl-layer"></div></div>`;
     el.appendChild(d); });
-  el.querySelectorAll('textarea').forEach(ta=>{ const k=ta.dataset.key; const kb=keep[k]; if(kb){ if(kb.h) ta.style.height=kb.h; ta.scrollTop=kb.st; }
-    ta.oninput=e=>{ const item=resultToItem(crossResults[k]); item.raw=e.target.value;
-    const p=parseArticle(e.target.value); item.title=p.title; item.author=p.author; item.body=p.body; crossResults[k]=item; }; });
+  el.querySelectorAll('[data-loc-key]').forEach(btn=>{ btn.onclick=e=>{ e.stopPropagation(); locateByResultKey(btn.dataset.locKey); }; });
+  // 展开 / 收起：展开＝撑到内容全高（不再用框内滚动条），收起＝回到 CSS 的自适应高度。
+  // 状态记在 textarea.dataset.expanded 上，翻页/重识别重渲染时由上方 keep 快照恢复，
+  // 否则校对到一半翻页就会被收回去。
+  const applyExpanded=(ta,on)=>{ const _c=ta.closest('.card'); const btn=_c?_c.querySelector('[data-exp-key]'):null;
+    if(on){ ta.dataset.expanded='1'; ta.style.height='auto'; ta.style.height=(ta.scrollHeight+2)+'px';
+      if(btn){ btn.textContent='收起'; btn.title='收起：回到默认高度'; } }
+    else { ta.dataset.expanded=''; ta.style.height='';
+      if(btn){ btn.textContent='展开'; btn.title='展开：显示全文，不用框内滚动条'; } } };
+  el.querySelectorAll('textarea').forEach(ta=>{ const k=ta.dataset.key; const kb=keep[k];
+    if(kb){ if(kb.ex){ applyExpanded(ta,true); } else if(kb.h) ta.style.height=kb.h; ta.scrollTop=kb.st; }
+    const _card=ta.closest('.card'); const _expBtn=_card?_card.querySelector('[data-exp-key]'):null;
+    if(_expBtn) _expBtn.onclick=e=>{ e.stopPropagation(); applyExpanded(ta, ta.dataset.expanded!=='1'); };
+    // 该卡片覆盖的框（编辑时要把这些框记住的片段文本一起同步，否则改过的段落下次点框定位不回来）
+    const cardParts=(ta.closest('.card')||{})._parts||[]; let prevVal=ta.value;
+    ta.oninput=e=>{
+    const nv=e.target.value, ov=prevVal; prevVal=nv;
+    // 先同步各框片段文本（不依赖当前有没有片段标记，换过卡片也照样同步）
+    syncPartsAfterEdit(cardParts, ov, nv);
+    // 编辑时不清除标记，改为跟着这次改动平移/扩展（用户就是要边改边看原图对应位置）
+    if(hlState && hlState.ta===ta){
+      const sp=adjustHlSpan(hlState.value, nv, hlState.start, hlState.len);
+      hlState.start=sp.start; hlState.len=sp.len; hlState.value=nv;
+      try{ paintHlRaw(ta, sp.start, sp.len); }catch(_e){}
+    }
+    const item=resultToItem(crossResults[k]); item.raw=e.target.value;
+    const p=parseArticle(e.target.value); item.title=p.title; item.author=p.author; item.body=p.body; crossResults[k]=item; };
+    // 点进文本框、拖选、失焦回来等会让浏览器重算高亮，这里复位一次，保证黄底不会因「点击」而消失
+    ta.addEventListener('focus', ()=>{ if(hlState && hlState.ta!==ta) clearBoxFocusHighlight(); hlReapply(); });
+    ta.addEventListener('click', ()=>hlReapply());
+    ta.addEventListener('mouseup', ()=>hlReapply());
+    ta.addEventListener('select', ()=>hlReapply());
+  });
   el.scrollTop=keepSc; }
 
 // ---------- 导出 ----------
@@ -4222,11 +5421,15 @@ function aggregateTargetsForExport(pageName){
   // 单页模式：只导出指定版（pageName，缺省为当前 srcName），不把工作集其余版也写进同一个文件
   const scope = pageName || srcName;
   if(!cross && scope){ targets=targets.filter(t=>t.key.startsWith('page:'+scope+':') || t.pageTargets.every(pt=>pt.pname===scope)); }
-  return targets.map((t,i)=>{
+  const rows=targets.map((t,i)=>{
     if(cross) return {order:i+1,label:t.label,group:t.group||'',box:null,text:itemToText(crossResults[t.key])};
     if(t.key==='__whole__') return {order:i+1,label:'（无框未识别）',group:'',box:null,text:'请框选后再识别'};
     const bs=t.boxes; return {order:i+1,label:t.label,group:(bs[0].group||''),box:bs.length===1?{x:Math.round(bs[0].x),y:Math.round(bs[0].y),w:Math.round(bs[0].w),h:Math.round(bs[0].h)}:computeUnionBox(bs),text:itemToText(crossResults[t.key])};
-  }); }
+  });
+  // 空篇不进导出：识别失败或尚未识别的篇，其文本只剩「标题：\\n作者：\\n正文：」骨架。
+  // 此前这类空壳照样写成 txt/json 并进入结构化统计，成品里留下空条目；过滤后 order 连续重排。
+  const _blankRow=r=>r.text!=='请框选后再识别' && String(r.text||'').replace(/^(标题|作者|正文)[：:]\s*/gm,'').trim()==='';
+  return rows.filter(r=>!_blankRow(r)).map((r,i)=>({...r,order:i+1})); }
 function currentExportName(){ return (mergeMode==='cross' && pageOrder.length>1)?crossBaseName():srcName; }
 // 跨页产物归集目录：每次跨页任务一个专属文件夹（以跨页基名为子目录）；单页不建子目录
 function currentOutDir(){ return (mergeMode==='cross' && pageOrder.length>1)?crossBaseName():''; }
@@ -4777,6 +5980,7 @@ function resetCanvasState(){
   // 彻底复位：回到未载入的初始状态
   srcName=''; const sn=$('srcName'); if(sn) sn.textContent='未载入';
   img=null; natW=0; natH=0; pageIdx=-1;
+  loadSeq++; imgLoading=false; drawing=null; dragState=null; cur=null;   // 作废在途载入，避免旧响应把画布复活
   allPageData={}; pageOrder=[]; crossResults={};
   boxes=[]; results={}; selectedId=null; pendingSelectId=null;
   updatePageNav(); renderBoxList(); renderResults(); resizeCanvas(); draw();
@@ -4974,7 +6178,16 @@ async function checkUpdate(){
       let html='发现新版本 <b>'+escHtml(j.latest)+'</b>（当前 '+escHtml(j.current||'--')+'）';
       // 该版本没提供与本机芯片匹配的 Mac 包时（如 Intel 包缺失），不提供自动更新按钮——
       // 否则点了必然装错架构、装完打不开，用户还找不到原因。
-      if(j.arch_warn){
+      // macOS：仅当运行位置无法自我替换（还在 dmg 里 / 不在应用程序文件夹 / 目录不可写）
+      // 或上次更新未完成时，才只给「打开发布页手动下载」；位置正常的 Mac 用户照常「立即更新」。
+      if(j.manual_only){
+        html+='<div style="color:var(--mut);margin-top:6px;line-height:1.7;">'
+            + (j.env_hint?('<span style="color:var(--warn);">'+escHtml(j.env_hint)+'</span><br>'):'')
+            + '下载时按芯片选包：Apple 芯片（M1/M2/M3…）选 <b>arm64</b>，Intel 选 <b>x86_64</b>。<br>'
+            + '请下载 dmg，双击后把里面的「墨痕」拖进「应用程序」文件夹；'
+            + '装好后再弹出 dmg，从「应用程序」里打开。直接在 dmg 窗口里双击运行会导致更新失败。<br>'
+            + '<button class="sec" id="gotoReleaseArch" style="margin-top:8px;">打开发布页下载</button></div>';
+      } else if(j.arch_warn){
         html+='<div style="color:var(--warn);margin-top:6px;line-height:1.6;">'
             + '该版本未提供适用于本机芯片（'+escHtml(j.local_arch||'未知')+'）的 Mac 安装包，已停用自动更新以免装错架构；'
             + '请 <button class="sec" id="gotoReleaseArch" style="margin:0 2px;">手动打开发布页</button> 自行选择。</div>';
@@ -4993,10 +6206,12 @@ async function checkUpdate(){
   }
 }
 async function startUpdate(j){
+  // 防御：Mac 版不走程序内替换，直接引导去发布页（正常路径已不会调到这里）。
+  if(j && j.manual_only){ openExternalUrl(j.page_url||RELEASE_PAGE_URL); return; }
   const st=$('updateStatus'); if(!st) return;
   st.textContent='正在下载更新包…（可能需要一会儿）'; st.style.color='var(--mut)';
   try{
-    const r=await fetch('/api/update_download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({download_url:j.download_url, sha256_url:j.sha256_url, alt_download_url:j.alt_download_url||'', alt_sha256_url:j.alt_sha256_url||''})});
+    const r=await fetch('/api/update_download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({download_url:j.download_url, sha256_url:j.sha256_url, alt_download_url:j.alt_download_url||'', alt_sha256_url:j.alt_sha256_url||'', target:j.latest||''})});
     const d=await r.json();
     if(!d.ok) throw new Error(d.error||'下载失败');
     st.textContent='下载完成，正在重启以完成升级…'; st.style.color='var(--ok)';
@@ -5019,6 +6234,12 @@ async function autoUpdateCheckOnLaunch(){
     const j=await r.json();
     if(!j.ok || !j.need) return;
     if(j.latest===SKIP_VERSION){ log('[更新] 已设置跳过 '+SKIP_VERSION+'，暂不提醒'); return; }
+    // 当前环境不能自我替换（在 dmg 里运行 / 不在应用程序文件夹 / 上次更新未完成）：
+    // 只记日志，等用户手动点「检查更新」看原因与下载入口。
+    if(j.manual_only){
+      log('[更新] 发现新版本 '+j.latest+'，但当前环境不适合自动更新'+(j.env_hint?('（'+j.env_hint+'）'):'')+'，请点「检查更新」手动下载');
+      return;
+    }
     if(AUTO_UPDATE && !j.arch_warn){ log('[更新] 已开启自动更新，正在下载新版本…'); startUpdate(j); }
     else if(AUTO_UPDATE && j.arch_warn){ log('[更新] 该版本无本机芯片（'+(j.local_arch||'未知')+'）对应包，跳过自动更新，改提示手动选包'); showUpdateModal(j); }
     else { showUpdateModal(j); }
@@ -5108,6 +6329,8 @@ function applySort(){
 $('checkUpdateBtn').onclick=checkUpdate;
 // 自动更新开关：开启时把开关状态持久化到 box_config.json
 const autoChk=$('autoUpdateChk');
+// Mac 版照常支持自动更新：只有在「程序不在应用程序文件夹 / 还在 dmg 里运行 / 目录不可写」或
+// 「上次更新没完成」时，check_update 才返回 manual_only，届时只给「打开发布页」不给「立即更新」。
 if(autoChk) autoChk.onchange=async ()=>{
   const v=autoChk.checked;
   try{ await fetch('/api/auto_update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({auto_update:v})}); AUTO_UPDATE=v; log('[设置] 自动更新已'+(v?'开启':'关闭')); }
@@ -5240,13 +6463,21 @@ const EYE_OPEN=`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stro
 const EYE_CLOSED=`<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.84 9.84 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-3.72.91-3.46 3.46"/><line x1="1" y1="1" x2="23" y2="23"/></svg>`;
 document.querySelectorAll('.eye').forEach(e=>{ e.innerHTML=EYE_CLOSED; e.onclick=()=>{ const inp=$(e.dataset.target); const hidden=inp.classList.contains('secret'); inp.classList.toggle('secret'); e.innerHTML=hidden?EYE_OPEN:EYE_CLOSED; }; });
 // OCR 服务商：输入框实时暂存 + 切换时回填对应服务商凭据
-['cfgApiKey','cfgBaseUrl','cfgModel'].forEach(id=>{ const el=$(id); if(el) el.addEventListener('input', stashActive); });
+['cfgApiKey','cfgBaseUrl','cfgModel','cfgKandianEmail','cfgKandianMode','cfgKandianHpOrder','cfgBaiduSecret'].forEach(id=>{ const el=$(id); if(el) el.addEventListener('input', stashActive); });
+// select 的取值变化在部分内核下不触发 input，必须补绑 change，否则下拉选择会丢失（det_mode 曾因此一直停在 auto）
+['cfgKandianMode','cfgKandianHpOrder','cfgBaiduModel'].forEach(id=>{ const el=$(id); if(el) el.addEventListener('change', stashActive); });
+['cfgBaiduFallback'].forEach(id=>{ const el=$(id); if(el) el.addEventListener('change', stashActive); });
 document.querySelectorAll('input[name="cfgProvider"]').forEach(r=>{ r.addEventListener('change',()=>{ if(r.checked){ stashActive(); ocrProvider=r.value; fillActiveProviderInputs(); } }); });
 function collectCfg(){
   stashActive();
   const d = { BOX_OCR_PROVIDER: ocrProvider };
-  for(const p of ['qwen','doubao','other']){ const pre=p.toUpperCase(); const s=ocrStash[p];
-    d[pre+'_API_KEY']=s.api_key; d[pre+'_BASE_URL']=s.base_url; d[pre+'_MODEL']=s.model; }
+  for(const p of ['qwen','doubao','kandian','baidu','other']){ const pre=p.toUpperCase(); const s=ocrStash[p]||{};
+    d[pre+'_API_KEY']=s.api_key||''; d[pre+'_BASE_URL']=s.base_url||''; d[pre+'_MODEL']=s.model||''; }
+  d.KANDIAN_EMAIL=(ocrStash.kandian&&ocrStash.kandian.email)||'';
+  d.KANDIAN_DET_MODE=(ocrStash.kandian&&ocrStash.kandian.det_mode)||'auto';
+  d.KANDIAN_HP_ORDER=(ocrStash.kandian&&ocrStash.kandian.hp_order)||'right2left';
+  d.BAIDU_SECRET_KEY=(ocrStash.baidu&&ocrStash.baidu.secret)||'';
+  d.BAIDU_AUTO_FALLBACK=(ocrStash.baidu&&ocrStash.baidu.fallback)||'true';
   d.DEEPSEEK_API_KEY=$('cfgDsKey').value.trim(); d.DEEPSEEK_BASE_URL=$('cfgDsUrl').value.trim(); d.DEEPSEEK_MODEL=$('cfgDsModel').value.trim();
   const cfSel=$('cfgCitationFormat'); if(cfSel) d.CITATION_FORMAT=cfSel.value||'gb7714';
   const rp=$('cfgRenamePolicy'); if(rp) d.RENAME_POLICY=rp.value||'auto';
