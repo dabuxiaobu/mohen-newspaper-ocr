@@ -230,7 +230,7 @@ except Exception as _e:
     # pythonnet 真正初始化在 webview.start() 里（见文件末尾，那里也做了兜底）。
     _startup_fail(f"{type(_e).__name__}: {_e}")
 
-VERSION = "4.1.0"
+VERSION = "4.1.1"
 
 # ---------- OCR 服务商（豆包 / 千问 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -3955,6 +3955,21 @@ HTML = r"""<!doctype html>
 
     <div class="card">
       <h2>④ 校对与结构化</h2>
+      <!-- 单框重识别结果：放在 resultList 之外，renderResults() 清空列表时不会被重建。
+           只读展示，绝不写回 crossResults / allPageData / output，由用户自行复制粘贴。 -->
+      <div id="rerunPanel" class="card" style="display:none; margin-bottom:10px; border-color:var(--pri);">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px; margin-bottom:6px;">
+          <span id="rerunHead" style="font-size:12px; color:var(--mut);"></span>
+          <button class="sm sec" id="rerunClose" title="关闭">关闭</button>
+        </div>
+        <div id="rerunStatus" style="font-size:12px; margin-bottom:6px; color:var(--mut); word-break:break-all;"></div>
+        <textarea id="rerunText" readonly style="width:100%; min-height:120px; max-height:40vh; box-sizing:border-box; font-family:'Microsoft YaHei',monospace; font-size:12px; padding:6px; border:1px solid var(--bd); border-radius:4px; resize:vertical;" placeholder="新识别结果将显示在这里"></textarea>
+        <div class="btns" style="margin-top:8px; align-items:center; gap:6px;">
+          <button class="sm" id="rerunCopy">复制新文本</button>
+          <button class="sm sec" id="rerunLocate">在结果中定位</button>
+          <span id="rerunHint" style="font-size:11.5px; color:var(--mut); flex:1 1 auto; line-height:1.5;">结果不会自动写回，请自行粘贴到下方对应段落。</span>
+        </div>
+      </div>
       <div id="resultList"></div>
       <div id="ctxMenu" style="display:none;"></div>
       <div class="btns" style="margin-top:10px; align-items:center;">
@@ -4855,15 +4870,96 @@ function renderBoxList(){ const el=$('boxList');
       </div>
       <div class="bx-ops">
         <button class="mini sec" data-up="${v.localIdx}" data-page="${esc(v.pageName)}">↑ 上移</button><button class="mini sec" data-dn="${v.localIdx}" data-page="${esc(v.pageName)}">↓ 下移</button>
-        <button class="mini" data-loc="${b.id}">定位</button><button class="mini stop" data-del="${b.id}">✕ 删除</button>
+        <button class="mini" data-loc="${b.id}">定位</button><button class="mini sec" data-rerun="${b.id}" title="只重新识别这一框并显示新文本，不自动写回（需手动复制粘贴）">重识别</button><button class="mini stop" data-del="${b.id}">✕ 删除</button>
       </div>`; el.appendChild(d); });
   el.querySelectorAll('select').forEach(s=>s.onchange=e=>{ const pg=e.target.dataset.page, i=+e.target.dataset.idx; pageArr(pg)[i].label=e.target.value; recomputeCross(); draw(); renderResults(); renderBoxList(); });
   el.querySelectorAll('input.grp').forEach(inp=>inp.onchange=e=>{ const pg=e.target.dataset.page, i=+e.target.dataset.idx; pageArr(pg)[i].group=e.target.value.trim(); recomputeCross(); renderBoxList(); draw(); renderResults(); });
   el.querySelectorAll('[data-del]').forEach(b=>b.onclick=e=>{ deleteBoxById(+e.target.dataset.del); });
   el.querySelectorAll('[data-up]').forEach(b=>b.onclick=e=>{ const i=+e.target.dataset.up, pg=e.target.dataset.page; const arr=pageArr(pg); if(i>0){[arr[i-1],arr[i]]=[arr[i],arr[i-1]];recomputeCross();renderBoxList();draw();} });
   el.querySelectorAll('[data-dn]').forEach(b=>b.onclick=e=>{ const i=+e.target.dataset.dn, pg=e.target.dataset.page; const arr=pageArr(pg); if(i<arr.length-1){[arr[i],arr[i+1]]=[arr[i+1],arr[i]];recomputeCross();renderBoxList();draw();} });
-  el.querySelectorAll('[data-loc]').forEach(b=>b.onclick=e=>{ locateBox(+e.target.dataset.loc); }); }
+  el.querySelectorAll('[data-loc]').forEach(b=>b.onclick=e=>{ locateBox(+e.target.dataset.loc); });
+  el.querySelectorAll('[data-rerun]').forEach(b=>b.onclick=e=>{ e.stopPropagation(); rerunBox(+e.target.dataset.rerun); });
+  rerunSyncButtons(); }
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+// ---------- 单框重识别：只返回新文本，绝不写回 ----------
+// 单页 / 跨页行为完全一致：重新识别这一个框，把新文本显示在小窗里，由用户自行复制粘贴。
+// 不写 crossResults / allPageData / boxPartsMap / failedBoxMap，不触发 renderResults() /
+// recomputeCross() / 导出 / 统计，避免任何一次重算冲掉用户手改。
+let rerunBusy=false, rerunCtx=null;
+function rerunSyncButtons(){ let v=false; try{ v=rerunBusy; }catch(_e){}
+  document.querySelectorAll('[data-rerun]').forEach(b=>{ b.disabled=v; }); }
+function rerunShow(head,status,text,color){
+  const p=$('rerunPanel'); if(!p) return;
+  const has=(text!==null && text!==undefined);
+  p.style.display='block';
+  $('rerunHead').textContent=head||'';
+  $('rerunStatus').textContent=status||'';
+  $('rerunStatus').style.color=color||'var(--mut)';
+  $('rerunText').value=has?String(text):'';
+  $('rerunText').style.display=has?'block':'none';
+  $('rerunCopy').style.display=has?'':'none';
+}
+function rerunSetBusy(v){ rerunBusy=v; rerunSyncButtons(); }
+$('rerunClose').onclick=()=>{ const p=$('rerunPanel'); if(p) p.style.display='none'; };
+$('rerunCopy').onclick=()=>{
+  const ta=$('rerunText'); if(!ta.value) return;
+  ta.focus(); ta.select(); let ok=false;
+  try{ ok=document.execCommand('copy'); }catch(_e){}
+  if(!ok){ try{ navigator.clipboard.writeText(ta.value).catch(()=>{}); }catch(_e2){} }
+  $('rerunHint').textContent='已复制，请粘贴到下方对应段落（结果不会自动写回）。';
+};
+$('rerunLocate').onclick=()=>{
+  const c=rerunCtx; if(!c) return;
+  try{
+    if(c.pname===srcName && boxes.indexOf(c.box)>=0 && selectBoxText(c.box)){
+      $('rerunHint').textContent='已用黄底标出该框对应的段落。'; return; }
+    const ct=aggregateCrossTargets().find(t=>(t.boxes||[]).indexOf(c.box)>=0);
+    if(ct){ scrollResultCard(ct.key); $('rerunHint').textContent='已滚到对应结果卡片（该框不在当前版，未切换页面以免冲掉手改）。'; return; }
+  }catch(_e){}
+  $('rerunHint').textContent='未找到对应结果卡片，请先点「识别全部」生成结果。';
+};
+async function rerunBox(boxId){
+  if(rerunBusy) return;
+  let pname=null, b=null;
+  for(const pn of pageOrder){ const arr=(allPageData[pn]&&allPageData[pn].boxes)||[];
+    const hit=arr.find(x=>String(x.id)===String(boxId)); if(hit){ pname=pn; b=hit; break; } }
+  if(!pname||!b){ alert('找不到该框，请刷新框列表后重试'); return; }
+  const flat=flattenBoxes().find(v=>v.box===b);
+  const num=(mergeMode==='cross')?(flat?(flat.globalIdx+1):'?'):(boxes.indexOf(b)>=0?boxes.indexOf(b)+1:'?');
+  let artNo=0; try{ const cts=aggregateCrossTargets();
+    for(let i=0;i<cts.length;i++){ if((cts[i].boxes||[]).indexOf(b)>=0){ artNo=i+1; break; } } }catch(_e){}
+  const head='框 #'+(b.id!=null?b.id:'?')+' · '+String(pname).replace(/\.[^.]+$/,'')+' · '+(b.label||'未标')+
+    (mergeMode==='cross'?' · 第 '+(artNo||'?')+' 篇 / 第 '+num+' 框':' · 第 '+num+' 框');
+  rerunCtx={pname:pname, box:b};
+  const seq0=loadSeq, dim0=pageDims.get(pname)||'';
+  rerunSetBusy(true);
+  rerunShow(head,'识别中…（只返回新文本，不自动写回）',null,'var(--pri)');
+  $('rerunHint').textContent='结果不会自动写回，请自行粘贴到下方对应段落。';
+  log('[单框重识别] 开始：'+head);
+  try{
+    await refreshRunCfg();
+    const j=await fetch('/api/image?name='+encodeURIComponent(pname)+'&dir=cropped_hi').then(r=>r.json()).catch(e=>({error:e.message}));
+    if(j.error||!j.data) throw new Error(j.error||'取图失败（no data）');
+    const im=await new Promise((res,rej)=>{ const m=new Image(); m.onload=()=>res(m); m.onerror=()=>rej(new Error('整版图解码失败')); m.src=j.data; });
+    const nW=im.naturalWidth, nH=im.naturalHeight;
+    // 竞态：期间翻页 / 该版重抽图改了像素尺寸 / 框被删，都丢弃结果，避免用错基准
+    if(loadSeq!==seq0) throw new Error('期间已切换图片，本次结果已丢弃，请重试');
+    if(dim0 && dim0!==(nW+'x'+nH)) throw new Error('该版图片尺寸已变（'+dim0+' → '+nW+'x'+nH+'），框坐标基准可能失效，请重试');
+    if(!allPageData[pname] || !(allPageData[pname].boxes||[]).some(x=>String(x.id)===String(boxId))) throw new Error('该框已被删除，本次结果已丢弃');
+    if(!(b.w>=8 && b.h>=8)) throw new Error('框尺寸异常 '+Math.round(b.w)+'×'+Math.round(b.h)+'px，请删除该框重画');
+    const r=await ocrBox(b, im, nW, nH, {pname:pname, quiet:true});
+    if(loadSeq!==seq0) throw new Error('期间已切换图片，本次结果已丢弃，请重试');
+    if(!r || r.failed) throw new Error((r&&r.error)||'识别失败');
+    if(r.finish_reason==='SKIPPED') throw new Error('框尺寸异常，已跳过识别，请删除该框重画');
+    const txt=String(r.text||'');
+    rerunShow(head,'识别完成 · 新文本 '+txt.length+' 字（未写回，需手动复制粘贴）',txt,'var(--ok)');
+    log('[单框重识别] 完成：'+head+'，新文本 '+txt.length+' 字；未写回任何结果，需手动复制粘贴。');
+  }catch(e){
+    const msg=String((e&&e.message)||e);
+    rerunShow(head,'未获得新文本：'+msg,null,'var(--err)');
+    log('[单框重识别] 失败：'+head+' — '+msg+'（原结果未改动）');
+  }finally{ rerunSetBusy(false); }
+}
 
 // ---------- 识别 ----------
 // 组内排序优先级：标题 → 作者 → 正文。节标题(section)与正文同级（同为 2），
@@ -5076,7 +5172,7 @@ async function runLimited(items, limit, fn){
 // —— OCR 输出质量自检 ——
 // 便宜的视觉模型（如千问）遇到复杂竖排/密排原文会「整段读飞」：返回空、返回一两行、
 // 返回大量非汉字乱码或连续重复字符。这类失败此前静默混进结果，用户以为工具坏了。
-// 判定为可疑时记入 ocrQualityFlags，识别结束后统一提示「改用豆包 Seed-2.1-Pro 重跑」。
+// 判定为可疑时记入 ocrQualityFlags，识别结束后统一提示「改用豆包 Seed-2.1-turbo 重跑」。
 let ocrQualityFlags=[];
 function ocrQualityIssue(text, b){
   const lab=(b&&b.label)||'';
@@ -5135,13 +5231,16 @@ function cropB64(b, im){ const P=ocrPad(b.w,b.h);
   const oc=document.createElement('canvas'); oc.width=b.w+2*P; oc.height=b.h+2*P;
   const octx=oc.getContext('2d'); octx.fillStyle='#fff'; octx.fillRect(0,0,oc.width,oc.height);
   octx.drawImage(im,b.x,b.y,b.w,b.h,P,P,b.w,b.h); return oc.toDataURL('image/png').split(',')[1]; }
-async function ocrBox(b, im, nW, nH){ const P=ocrPad(b.w,b.h);
+async function ocrBox(b, im, nW, nH, opt){ const P=ocrPad(b.w,b.h);
+  // opt.pname：单框重识别时目标框可能不属于当前显示版，日志/来源/质量标记须用该版名；
+  // opt.quiet：单框重识别不写入本批质量自检标记，避免污染「识别全部」的统计与提示。
+  const _pn=(opt&&opt.pname)||srcName, _quiet=!!(opt&&opt.quiet);
   // 防御：宽或高异常（0 / 负数 / 过小）时下面 canvas 会退化成纯白小图，模型必然返回空、
   // 且界面上毫无提示（表现为「这个框一个字都没识别出来」）。这类框一律不发请求。
   if(!(b.w>=8 && b.h>=8)){
     const _m='框尺寸异常 '+Math.round(b.w)+'×'+Math.round(b.h)+'px，已跳过识别（多半是拖拽时只动了一条边或坐标被截断）。请删除该框重画。';
     log('[识别] '+_m);
-    ocrQualityFlags.push({page:srcName, label:(b.label||'未标标签'), issue:_m});
+    if(!_quiet) ocrQualityFlags.push({page:_pn, label:(b.label||'未标标签'), issue:_m});
     return {text:'', usage:{}, finish_reason:'SKIPPED'}; }
   // 坐标越界只告警不拦截：坐标系若整体偏移，跳过会让用户彻底无法识别，先让它照常发请求
   if(nW && nH && (b.x>=nW || b.y>=nH || b.x+b.w<=0 || b.y+b.h<=0)){
@@ -5151,7 +5250,7 @@ async function ocrBox(b, im, nW, nH){ const P=ocrPad(b.w,b.h);
   // 请求本身可能直接抛错（后端未就绪、连接被拒、超时）。此前这类错误会冒泡到整页 try，
   // 让该版所有框一起作废；这里就地收敛成「这个框识别失败」，其余框照常继续。
   let j=null;
-  const _postOcr=async()=>{ const r=await fetch('/api/ocr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_b64:b64,src:srcName,label:(b.label||''),overrides:getOverrides()})});
+  const _postOcr=async()=>{ const r=await fetch('/api/ocr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_b64:b64,src:_pn,label:(b.label||''),overrides:getOverrides()})});
     return await r.json(); };
   try{ j=await _postOcr(); }
   catch(_e){ j={ok:false, error:'请求失败：'+String((_e&&_e.message)||_e).slice(0,180)}; }
@@ -5172,12 +5271,12 @@ async function ocrBox(b, im, nW, nH){ const P=ocrPad(b.w,b.h);
   if(j.note) log('[百度] '+j.note);   // 额度用尽自动换档等过程提示，让用户知道档位变过
   const _t=j.text||'';
   const _issue=ocrQualityIssue(_t, b);
-  if(_issue) ocrQualityFlags.push({page:srcName, label:(b.label||'未标标签'), issue:_issue});
+  if(_issue && !_quiet) ocrQualityFlags.push({page:_pn, label:(b.label||'未标标签'), issue:_issue});
   // 输出被截断（finish_reason=length）：结尾少了一截但界面上完全看不出来，必须显式报出
   if(String(j.finish_reason||'')==='length'){
     const _tm='模型输出达到长度上限被截断（finish_reason=length），本框结尾可能缺失，建议拆成两个框重跑。';
     log('[识别] '+(b.label||'未标')+' 框：'+_tm);
-    ocrQualityFlags.push({page:srcName, label:(b.label||'未标标签'), issue:_tm});
+    if(!_quiet) ocrQualityFlags.push({page:_pn, label:(b.label||'未标标签'), issue:_tm});
   }
   return {ok:true, failed:false, text:_t, usage:j.usage||{}, finish_reason:j.finish_reason||''}; }
 async function recognizeOneBox(b){ return ocrBox(b, img, natW, natH); }
@@ -5317,7 +5416,7 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
     log('[质量自检] 本次有 '+ocrQualityFlags.length+' 个框的识别结果异常，疑似识别失败：');
     ocrQualityFlags.slice(0,15).forEach(f=>log('  · '+f.page+' / '+f.label+' — '+f.issue));
     if(ocrQualityFlags.length>15) log('  · …其余 '+(ocrQualityFlags.length-15)+' 个略');
-    if(_p!=='doubao') log('[质量自检] 当前识别模型不是豆包。此类整段读飞多因原文字形/版式复杂超出该模型能力边界，建议在「设置 → 识别模型」改用豆包 Seed-2.1-Pro 后重跑这些框。');
+    if(_p!=='doubao') log('[质量自检] 当前识别模型不是豆包。此类整段读飞多因原文字形/版式复杂超出该模型能力边界，建议在「设置 → 识别模型」改用豆包 Seed-2.1-turbo 后重跑这些框。');
     else log('[质量自检] 若原图清晰仍大量异常，请检查框是否切到字行、或整版图分辨率过低。');
     ocrQualityFlags=[];
   }
