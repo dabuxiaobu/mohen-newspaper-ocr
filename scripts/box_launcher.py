@@ -230,7 +230,7 @@ except Exception as _e:
     # pythonnet 真正初始化在 webview.start() 里（见文件末尾，那里也做了兜底）。
     _startup_fail(f"{type(_e).__name__}: {_e}")
 
-VERSION = "4.1.1"
+VERSION = "4.1.2"
 
 # ---------- OCR 服务商（豆包 / 千问 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -1375,6 +1375,13 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
                   completion_tokens=usage.get("completion_tokens", 0),
                   total_tokens=usage.get("total_tokens", 0),
                   duration_s=duration)
+        # 内容安全过滤：模型已生成文本但被平台整段撤回，content 为空、finish_reason=content_filter。
+        # 若仍按「成功 + 空文本」返回，界面只显示「0 字」，用户无从区分配置、图片与平台策略。
+        # 实测豆包 turbo / 2.1-pro / 2.0-pro 三款表现一致，重试与换同服务商型号均无效，故直接标为失败。
+        if "content_filter" in finish_reason.lower():
+            raise RuntimeError("【内容安全拦截】本框被模型服务商的内容安全策略拦下，未返回文字（content_filter）。"
+                               "重试或更换同一服务商的其他型号无效，请在设置里换一家 OCR 服务商，"
+                               "或把该框拆成两个框分别识别后人工合并。")
         return {"text": text, "usage": {
             "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
             "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
@@ -4952,6 +4959,12 @@ async function rerunBox(boxId){
     if(!r || r.failed) throw new Error((r&&r.error)||'识别失败');
     if(r.finish_reason==='SKIPPED') throw new Error('框尺寸异常，已跳过识别，请删除该框重画');
     const txt=String(r.text||'');
+    if(!txt){
+      const _why='模型返回空文本（finish_reason='+(r.finish_reason||'未知')+'）';
+      rerunShow(head,'未获得文本：'+_why+'。请检查框内图像，或换一家服务商重试',null,'var(--err)');
+      log('[单框重识别] 空文本：'+head+' — '+_why+'；原结果未改动。');
+      return;
+    }
     rerunShow(head,'识别完成 · 新文本 '+txt.length+' 字（未写回，需手动复制粘贴）',txt,'var(--ok)');
     log('[单框重识别] 完成：'+head+'，新文本 '+txt.length+' 字；未写回任何结果，需手动复制粘贴。');
   }catch(e){
@@ -5090,9 +5103,40 @@ function _levAtMost1(a,b){ if(a===b) return true; const la=a.length, lb=b.length
   for(let i=0;i<s.length;i++){ if(s[i]!==l[i]) return s.slice(i)===l.slice(i+1); } return true; }
 function _sameSign(a,b){ const x=_signNorm(a), y=_signNorm(b); if(!x||!y) return false;
   if(x===y) return true; return (x.length<=12 && y.length<=12) ? _levAtMost1(x,y) : false; }
-function dropDupSign(author, body){
+// 署名形态判定与单行化：字段模式、单页合并、跨页合并三处共用，避免口径分叉。
+// 20261109 修正：4.1.0 的 _isSign 要求署名单行、无句读、≤24 字，同版提示词却要求
+// 「并列署名逐个转录、用换行分隔」，竖排双字署名 / 并列署名 / 署名带标点因此被改判成正文。
+// 用户已显式标 author，标签对字段归属有最终约束力；这里只保留长度闸门拦截误框的大段正文。
+// 折叠规则：每行都是单字且总字数很短时拼回一个名字（「陳\n辛」→「陳辛」），
+// 否则按并列署名用顿号分隔（「张甲\n李乙」→「张甲、李乙」）；单行原文保留。
+const SIGN_MAX=24, SIGN_HARD_MAX=60;
+function _signLines(s){
+  return String(s||'').replace(/^(标题|作者|正文)[：:]\s*/gm,'')
+    .split(/[\r\n]+/).map(x=>x.trim()).filter(Boolean);
+}
+function isShortSign(s){
+  const ls=_signLines(s); if(!ls.length) return false;
+  const raw=ls.join('');
+  if(raw.length>SIGN_HARD_MAX) return false;
+  if(raw.length>SIGN_MAX && /[，。；：！？,;:!?]/.test(raw)) return false;
+  return true;
+}
+function normSignText(s){
+  const ls=_signLines(s); if(!ls.length) return '';
+  const allSingle=ls.length>1 && ls.every(x=>x.length===1);
+  return (allSingle ? ls.join('') : ls.join('、')).replace(/[。，、；：]+$/g,'').trim();
+}
+function mergeSign(author, candidate){
+  const c=normSignText(candidate);
+  if(!c) return {author:author||'', overflow:''};
+  if(!isShortSign(candidate)) return {author:author||'', overflow:String(candidate||'').trim()};
+  if(!author) return {author:c, overflow:''};
+  if(author===c || author.split('、').indexOf(c)>=0) return {author, overflow:''};
+  return {author:author+'、'+c, overflow:''};
+}
+function _dropOneSign(author, body){
   const bd=body||''; if(!bd) return bd;
-  const auN=_signNorm(author); if(!auN || auN.length>12) return bd;  // 作者字段过长说明不是署名，放过
+  const auN=_signNorm(author); if(!auN || auN.length>12) return bd;
   const blocks=bd.split(/\n{2,}/); if(blocks.length<2) return bd;
   let removed=false; const out=[];
   blocks.forEach((blk,i)=>{ const t=(blk||'').trim();
@@ -5101,6 +5145,10 @@ function dropDupSign(author, body){
     if(hit){ removed=true; return; }
     out.push(blk); });
   return removed ? out.join('\n\n').replace(/^\s+|\s+$/g,'') : bd; }
+function dropDupSign(author, body){
+  let bd=body||''; if(!bd || !author) return bd;
+  for(const s of String(author).split(/[、,，]/).map(x=>x.trim()).filter(Boolean)) bd=_dropOneSign(s,bd);
+  return bd; }
 function mergeCrossTarget(ct){
   let title='',author='',bodies=[];
   for(const {pname,t} of ct.pageTargets){
@@ -5113,8 +5161,9 @@ function mergeCrossTarget(ct){
       // 明显不同者（显式组里混了另一篇）绝不能丢，并入正文
     }
     if(item.author){
-      if(!author) author=item.author;            // 首个非空作为作者
-      else bodies.push(item.author);             // 后续非空：并入正文，不静默丢弃
+      const _m=mergeSign(author,item.author);    // 与单页合并同一口径：同名去重、不同短署名并入作者
+      author=_m.author;
+      if(_m.overflow) bodies.push(_m.overflow);  // 疑似误框的长文本仍按正文，不静默丢弃
     }
     if(item.body) bodies.push(item.body);
   }
@@ -5196,21 +5245,22 @@ function ocrQualityIssue(text, b){
   return '';
 }
 // 按框的显式标签，把 parseArticle 的结果收进对应字段（单框 / 多框共用，避免两处逻辑分叉）。
-// 关键防御在 author 分支：模型在署名框里没写「作者：」前缀时 p.author 为空、整段正文落在
-// p.body，旧写法 `parsed.author=p.author||p.body` 会把整段正文塞进作者行。作者行本身不会丢字，
-// 但多框合并时「作者只取首个非空」会让其余 parts 的作者字段整段消失——这是字面意义的缺行。
-// 署名必然极短，因此超过阈值或含句读的一律按正文处理。
-const AUTHOR_AS_SIGN_MAX=24;
+// 20261109 修正：用户已显式标 author，标签即对字段归属有最终约束力。旧的 _isSign 形态闸门
+// 与本版「多行逐条转录、用换行分隔」的提示词互相冲突，会把作者框内容改判成正文。
+// 现只保留长度闸门拦截误框进作者框的大段正文，其余形态一律收为署名。
 function foldParsedByLabel(b,p){
   const parsed={title:'',author:'',body:''};
   const lab=b?b.label:'';
   if(lab==='title'){ parsed.title=p.title||p.body; }
   else if(lab==='author'){
-    // 候选署名：模型写了「作者：」就用该字段，没写前缀时整段落在 body，只能看长短与形态判断。
+    // 模型写「作者：」时落在 p.author，字段模式输出纯文本时落在 p.body，两者都是候选。
     const _au=(p.author||'').trim(), _bd=(p.body||'').trim(), _sign=_au||_bd;
-    const _isSign=!!_sign && _sign.length<=AUTHOR_AS_SIGN_MAX && _sign.indexOf('\n')<0 &&
-                  !/[，。；：、！？,;:!?]/.test(_sign);
-    if(_isSign) parsed.author=_sign; else parsed.body=_bd||_au;   // 不像署名：整段留作正文，避免合并阶段被丢弃
+    if(!_sign) return parsed;
+    if(isShortSign(_sign)) parsed.author=normSignText(_sign);
+    else {
+      parsed.body=_bd||_au;
+      if(typeof log==='function') log('[署名判定] author 框内容 '+_sign.length+' 字，疑似把正文框进了作者框，已按正文处理，请核对框选范围。');
+    }
   }
   else if(lab==='section'){ parsed.body=(p.body||p.title||p.author||'').replace(/^(标题|作者|正文)[：:]\s*/,''); }
   // 正文框（含历史结果）：整框内容一律作正文，不再拆出标题/作者。
@@ -5270,6 +5320,7 @@ async function ocrBox(b, im, nW, nH, opt){ const P=ocrPad(b.w,b.h);
     return {ok:false, failed:true, error:_e, text:'', usage:{}, finish_reason:'FAILED'}; }
   if(j.note) log('[百度] '+j.note);   // 额度用尽自动换档等过程提示，让用户知道档位变过
   const _t=j.text||'';
+  if(!_t) log('[识别] 警告：本框模型返回空文本（finish_reason='+(j.finish_reason||'未知')+'），未写入任何内容；请检查框内图像是否有效，或换一家服务商重试。');
   const _issue=ocrQualityIssue(_t, b);
   if(_issue && !_quiet) ocrQualityFlags.push({page:_pn, label:(b.label||'未标标签'), issue:_issue});
   // 输出被截断（finish_reason=length）：结尾少了一截但界面上完全看不出来，必须显式报出
@@ -5356,16 +5407,19 @@ async function recognizeAll(){ if(!img){ alert('请先载入整版图片'); retu
           //    段落会从原位搬到开头（实测 17 字栏头被搬到 2922 字正文的开头）。
           const _titles=parts.map(p=>p.title).filter(x=>x);
           const title=_titles[0]||'';
-          const _authors=parts.map(p=>p.author).filter(x=>x);
-          const author=_authors[0]||'';
+          let author='';
           const _segs=[];
           parts.forEach((p,i)=>{
             if(i>0 && p.title && !_titleSame(_normTitle(p.title), _normTitle(title))) _segs.push(p.title);
-            if(i>0 && p.author && p.author!==author) _segs.push(p.author);
+            if(p.author){
+              const _m=mergeSign(author,p.author);
+              author=_m.author;
+              if(_m.overflow) _segs.push(_m.overflow);   // 疑似误框的长文本仍按正文处理，不静默丢字
+            }
             if(p.body) _segs.push(p.body);
           });
           const _bodyRaw=_segs.filter(x=>x).join('\n\n');
-          const body=dropDupSign(author, _bodyRaw);   // 剔除正文里重复出现的署名
+          const body=dropDupSign(author, _bodyRaw);   // 逐个剔除正文里重复出现的署名
           pd.results[t.key]={title,author,body,raw:`标题：${title}\n作者：${author}\n正文：${body}`.trim()}; } }
       // 单页模式：每版识别完立即按「当前版名」导出，避免循环结束后只导出末尾 srcName 那一版（其余版白识别）
       if(mergeMode!=='cross'){
