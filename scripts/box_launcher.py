@@ -230,7 +230,7 @@ except Exception as _e:
     # pythonnet 真正初始化在 webview.start() 里（见文件末尾，那里也做了兜底）。
     _startup_fail(f"{type(_e).__name__}: {_e}")
 
-VERSION = "4.1.2"
+VERSION = "4.1.3"
 
 # ---------- OCR 服务商（豆包 / 千问 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -1970,14 +1970,23 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)[:160]})
         if u.path == "/api/logs":
-            # 读取持久化日志文件，供前端启动时恢复历史日志（关闭 exe 不丢失）
+            # 读取持久化日志文件，供前端启动时恢复历史日志（关闭 exe 不丢失）。
+            # 4.1.3：日志文件是 append-only 的排错证据，绝不删除；只恢复最近 500 行，
+            # 避免几千行历史一次性灌进 DOM 造成启动卡顿，也避免旧写回日志看着像又执行了一遍。
             try:
+                total, truncated = 0, 0
                 if os.path.exists(LOG_FILE):
                     with open(LOG_FILE, encoding="utf-8") as f:
-                        content = f.read()
+                        lines = f.read().splitlines()
+                    total = len(lines)
+                    if total > 500:
+                        truncated = total - 500
+                        lines = lines[-500:]
+                    content = "\n".join(lines)
                 else:
                     content = ""
-                return self._json({"ok": True, "content": content})
+                return self._json({"ok": True, "content": content,
+                                   "total": total, "truncated": truncated})
             except Exception as e:
                 return self._json({"ok": False, "error": str(e)[:120]})
         if u.path == "/api/usage":
@@ -4273,6 +4282,17 @@ let imgLoading = false, loadSeq = 0, baseOf = null; const pageDims = new Map();
 // pageOrder 记录工作集（= 阅读顺序，由「载入」批量填充）。
 // mergeMode 决定整版间关系：'single' 每版独立识别/导出；'cross' 多版合并为一篇。
 let allPageData = {}; let pageOrder = []; let pageList = []; let navList = []; let pageIdx = -1; let crossResults = {};
+// 防重入与引用重算门控（4.1.3）：结构化 / 保存修改各自互斥，避免并发多轮覆盖写回。
+let _saveBusy = false, _postBusy = false, _refDirty = false, _savedRefText = {};
+// 仅在「结果面板被手工编辑过」或「同一篇导出文本相对上次保存发生变化」时才重算引用。
+// 目的：避免每轮保存都逐篇启动一次 rebuild_ref 子进程。当前工作集里的篇多未结构化，
+// 无条件调用会逐篇返回「未结构化」并在日志里刷「引用重算跳过」，还多付一次磁盘扫描；
+// 同时减少对已存在产物的无谓整文件写回（按行替换后 open(...,"w") 会顺带改掉行尾）。
+function needRefRebuild(sn, txt){
+  const prev = _savedRefText[sn];
+  _savedRefText[sn] = txt;
+  return _refDirty || (prev !== undefined && prev !== txt);
+}
 let fileMtimes = {};   // 整版原图修改时间（秒），来自 /api/list_images 的 mtimes，供排序抽屉使用
 let mergeMode = 'single';
 // 跨页分篇：以「标题」为唯一边界（无前端开关）。有标题开新篇，无标题并入前一篇；
@@ -5555,6 +5575,7 @@ function renderResults(){ const el=$('resultList');
       hlState.start=sp.start; hlState.len=sp.len; hlState.value=nv;
       try{ paintHlRaw(ta, sp.start, sp.len); }catch(_e){}
     }
+    _refDirty = true;   // 结果面板发生手工编辑：下一轮保存允许重算引用
     const item=resultToItem(crossResults[k]); item.raw=e.target.value;
     const p=parseArticle(e.target.value); item.title=p.title; item.author=p.author; item.body=p.body; crossResults[k]=item; };
     // 点进文本框、拖选、失焦回来等会让浏览器重算高亮，这里复位一次，保证黄底不会因「点击」而消失
@@ -5625,7 +5646,21 @@ function setSaveHint(txt, ok){
   h.style.display = txt? 'inline' : 'none';
 }
 // 保存修改：把右侧当前编辑结果覆盖写回 output/ 的 txt + json
-async function saveEdit(){
+// 防重入由 saveEdit() 包装层负责，原函数体改名为 saveEditCore 保持不动，避免缩进级改动引入风险。
+async function saveEdit(opts){
+  const _fromPost = !!(opts && opts.fromPost);
+  if(_saveBusy){ log('[保存修改] 上一次保存尚未结束，请稍候。'); return; }
+  if(!_fromPost && _postBusy){ log('[保存修改] 结构化正在进行，请等待完成后再保存。'); return; }
+  _saveBusy = true;
+  const _btn = $('saveEdit'), _oldTxt = _btn ? _btn.textContent : '';
+  if(_btn){ _btn.disabled = true; _btn.textContent = '保存中…'; }
+  try{ return await saveEditCore(); }
+  finally{
+    _saveBusy = false; _refDirty = false;
+    if(_btn){ _btn.disabled = false; _btn.textContent = _oldTxt || '保存修改'; }
+  }
+}
+async function saveEditCore(){
   flushEditsToAll();   // 单页模式：先把手动编辑落回 allPageData，避免后续翻页/重识别丢字
   const cross = mergeMode==='cross';
   if(cross){
@@ -5645,8 +5680,11 @@ async function saveEdit(){
       // 跨页·按篇拆分：逐篇调用（每篇文件名为 {en}__{篇序}），避免整轮只重算第一篇。
       try{
         for(let i=0;i<items.length;i++){
-          const br=await fetch('/api/rebuild_ref',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_name:`${en}__${i+1}`,mode:mode,out_dir:od,boxes:[items[i]]})}).then(r=>r.json());
-          if(br&&br.ok&&br.ref) log('[保存修改] 已按手改字段重算引用(篇'+(i+1)+')：'+br.ref);
+          const _sn = `${en}__${i+1}`;
+          if(!needRefRebuild(_sn, String(items[i].text||''))) continue;
+          const br=await fetch('/api/rebuild_ref',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_name:_sn,mode:mode,out_dir:od,boxes:[items[i]]})}).then(r=>r.json());
+          if(br&&br.ok&&br.unchanged) log('[保存修改] 引用无需更新(篇'+(i+1)+')：'+br.ref);
+          else if(br&&br.ok&&br.ref) log('[保存修改] 已按手改字段重算引用(篇'+(i+1)+')：'+br.ref);
           else if(br&&br.ok) log('[保存修改] 引用重算未返回结果(篇'+(i+1)+')，产物引用可能未更新');
           else if(br) log('[保存修改] 引用重算跳过(篇'+(i+1)+')：'+(br.error||'未结构化'));
         }
@@ -5678,9 +5716,11 @@ async function saveEdit(){
         const _rfBase = (items.length>1) ? `${en}__` : null;
         for(let i=0;i<items.length;i++){
           const _sn = _rfBase ? (_rfBase+(i+1)) : en;
+          if(!needRefRebuild(_sn, String(items[i].text||''))) continue;
           const br=await fetch('/api/rebuild_ref',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({source_name:_sn,mode:mode,out_dir:'',boxes:[items[i]]})}).then(r=>r.json());
           const _tag = _rfBase ? ('['+en+' 篇'+(i+1)+']') : ('['+en+']');
-          if(br&&br.ok&&br.ref) log(_tag+' 已按手改字段重算引用：'+br.ref);
+          if(br&&br.ok&&br.unchanged) log(_tag+' 引用无需更新：'+br.ref);
+          else if(br&&br.ok&&br.ref) log(_tag+' 已按手改字段重算引用：'+br.ref);
           else if(br&&br.ok) log(_tag+' 引用重算未返回结果，产物引用可能未更新');
           else if(br) log(_tag+' 引用重算跳过：'+(br.error||'未结构化'));
         }
@@ -5787,6 +5827,18 @@ function renderPerPageSrc(){
   box.innerHTML = html;
 }
 async function runPost(){
+  if(_postBusy){ log('[结构化] 上一轮仍在进行，请等待日志停稳后再点。'); return; }
+  if(_saveBusy){ log('[结构化] 保存修改尚未结束，请稍候再点。'); return; }
+  _postBusy = true;
+  const _btn = $('runPost'), _oldTxt = _btn ? _btn.textContent : '';
+  if(_btn){ _btn.disabled = true; _btn.textContent = '结构化中…'; }
+  try{ return await runPostCore(); }
+  finally{
+    _postBusy = false;
+    if(_btn){ _btn.disabled = false; _btn.textContent = _oldTxt || '结构化'; }
+  }
+}
+async function runPostCore(){
   const mode = $('postMode') ? $('postMode').value : 'plain';
   // 来源补充：区分单页/跨页。跨页合并一篇→一份全局自由文本；单页一次多版→每版各自自由文本。
   // 判定口径必须与 renderPerPageSrc 一致（只看 mergeMode）：跨页模式下每版行不渲染，
@@ -5819,7 +5871,7 @@ async function runPost(){
   // crossResults；因此必须先确保 output/ 下的 .txt/.json 已写回，省去手动点「保存修改」的前置步骤。
   // 复用 saveEdit 的落盘逻辑（跨页合并单文件 / 单页逐版写回），同时 flushEditsToAll 防止手动编辑丢字。
   log('[结构化] 先自动保存当前识别结果（等同「保存修改」）…');
-  await saveEdit();
+  await saveEdit({fromPost:true});
   // 诊断：本轮到底分成几篇。若此处是 N 篇而结构化只出 1 篇文档，问题在导出/收拢层；
   // 若此处就是 1 篇，说明分篇判定把多篇并成了一篇（看结果面板卡片数即可确认）。
   try{
@@ -5882,11 +5934,16 @@ async function runPost(){
     // 跨页：合并为一篇，单文件夹，打开该合并子文件夹（维持原行为）
     const outDir = crossBaseName().replace(/\.[^.]+$/,'');
     const pages = recPages.slice();
-    fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:outDir,pages,source_override:globalSO})})
-      .then(r=>r.json()).then(j=>{ let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+']\n'+(j.stdout||'')+(j.stderr?'\n'+j.stderr:''); if(j.ok&&j.opened_dir){ const rel=osRel(j.opened_dir); s+='\n↑ 已打开该轮文件夹：'+rel; }
-        // 只把本次实际识别处理（recPages）的版交给 clearPost 移除并删除源图；未框选未识别的版保留在工作集，可继续框选识别。
-        if(j.ok && !j.skipped){ clearPost(recPages.slice()); s+='\n[结构化] 已识别版已从工作集移除，未识别版保留在列表中，可继续框选识别。'; } log(s); })
-      .catch(e=>log('后置失败：'+e));
+    // 改为 await：防重入标志须等整轮 postprocess 与 clearPost 跑完才复位，
+    // 原来 fire-and-forget 会让 runPost 立即返回，按钮提前解锁。
+    try{
+      const j = await fetch('/api/postprocess',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode,out_dir:outDir,pages,source_override:globalSO})}).then(r=>r.json());
+      let s='[后置 阶段4 · '+(mode==='plain'?'纯文本':'知识库')+']\n'+(j.stdout||'')+(j.stderr?'\n'+j.stderr:'');
+      if(j.ok&&j.opened_dir){ const rel=osRel(j.opened_dir); s+='\n↑ 已打开该轮文件夹：'+rel; }
+      // 只把本次实际识别处理（recPages）的版交给 clearPost 移除并删除源图；未框选未识别的版保留在工作集，可继续框选识别。
+      if(j.ok && !j.skipped){ clearPost(recPages.slice()); s+='\n[结构化] 已识别版已从工作集移除，未识别版保留在列表中，可继续框选识别。'; }
+      log(s);
+    }catch(e){ log('后置失败：'+e); }
     return;
   }
   // 单页模式：逐版调用 postprocess，每版独立子文件夹（output/{top}/{整版名}/）；
@@ -5933,9 +5990,12 @@ async function runPost(){
              : ('；未能统计出可分篇数，请点「保存修改」核对实际导出的文件数后反馈。'));
     const after = ()=>{ if(hasRealOutput){ clearPost(okPages); s+='\n[结构化] 已完成版已从工作集移除，其余版保留在列表中，可继续框选识别。'; if(failedPages.length){ s+='\n[提示] 以下版未完成结构化（无产物/失败），仍保留在列表与 cropped_hi/：'+failedPages.join('、'); } } log(s); };
     // 统一打开父目录 output/{top}（多子文件夹，不钻进某一页）
-    fetch('/api/open_folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:top})})
-      .then(r=>r.json()).then(j=>{ if(j.ok){ const rel=osRel(j.path); s+='\n↑ 已打开父文件夹：'+rel; } }).catch(()=>{})
-      .finally(after);
+    // 改为 await + 显式 after()：保证防重入标志在本轮清理完成后才复位。
+    try{
+      const j = await fetch('/api/open_folder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:top})}).then(r=>r.json());
+      if(j.ok){ const rel=osRel(j.path); s+='\n↑ 已打开父文件夹：'+rel; }
+    }catch(e){}
+    after();
   }
 }
 
@@ -5946,13 +6006,18 @@ function log(s){ const lines=String(s).split('\n'); const box=$('log'); const fr
   // 持久化：每行追加到后端日志文件，关闭 exe 后历史可恢复
   try{ fetch('/api/log',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({line:String(s)})}).catch(()=>{}); }catch(e){} }
 // 页面加载时恢复历史日志（关闭 exe 不丢失）
-async function restoreLogs(){ try{ const r=await fetch('/api/logs'); const j=await r.json(); if(j.ok && j.content){ const box=$('log'); j.content.split('\n').filter(l=>l.length).forEach(m=>{ const div=document.createElement('div'); div.className='logline lvl-info'; const msg=document.createElement('span'); msg.className='msg'; msg.textContent=m; div.appendChild(msg); div._txt=m; box.appendChild(div); }); box.scrollTop=box.scrollHeight; applySearch(); } }catch(e){} }
+async function restoreLogs(){ try{ const r=await fetch('/api/logs'); const j=await r.json(); if(j.ok && j.content){ const box=$('log');
+  const _sep=document.createElement('div'); _sep.className='logline lvl-info'; _sep.style.cssText='color:#888;border-top:1px dashed #ccc;margin-top:6px;padding-top:4px;';
+  const _sm=document.createElement('span'); _sm.className='msg';
+  _sm.textContent='── 以下为上次运行的历史日志'+(j.truncated? '（仅显示最近 '+(j.total-j.truncated)+' 行，共 '+j.total+' 行）':'')+' ──';
+  _sep.appendChild(_sm); _sep._txt=_sm.textContent; box.appendChild(_sep);   // 不调用 log()，避免把分隔行写回日志
+  j.content.split('\n').filter(l=>l.length).forEach(m=>{ const div=document.createElement('div'); div.className='logline lvl-info'; const msg=document.createElement('span'); msg.className='msg'; msg.textContent=m; div.appendChild(msg); div._txt=m; box.appendChild(div); }); box.scrollTop=box.scrollHeight; applySearch(); } }catch(e){} }
 function escLog(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 function applySearch(){ const v=($('logSearch').value||'').trim().toLowerCase(); document.querySelectorAll('#log .logline').forEach(d=>{ const txt=(d._txt||'').toLowerCase();
   const msg=d.querySelector('.msg'); if(!v||txt.includes(v)){ d.style.display=''; if(msg){ if(v){ const i=txt.indexOf(v); msg.innerHTML=escLog(d._txt.slice(0,i))+'<mark style="background:#fde68a">'+escLog(d._txt.slice(i,i+v.length))+'</mark>'+escLog(d._txt.slice(i+v.length)); } else msg.textContent=d._txt; } } else d.style.display='none'; }); }
 $('logSearch').addEventListener('input',applySearch);
 $('logCopy').onclick=()=>{ const lines=[...document.querySelectorAll('#log .logline')].map(d=>d._txt||''); navigator.clipboard.writeText(lines.join('\n')).then(()=>{ const b=$('logCopy'); const o=b.textContent; b.textContent='已复制✓'; setTimeout(()=>b.textContent=o,1200); }); };
-$('logClear').onclick=()=>{ if(confirm('确认清空日志面板？')){ $('log').innerHTML=''; off=0; } };
+$('logClear').onclick=()=>{ if(confirm('确认清空日志面板？磁盘日志文件会保留，重启后仍会显示最近的历史记录。')){ $('log').innerHTML=''; off=0; } };
 
 // ---------- 事件绑定 ----------
 $('recogAll').onclick=recognizeAll;
@@ -5985,7 +6050,7 @@ $('canvasWrap').addEventListener('wheel',e=>{
   if(e.shiftKey){ w.scrollLeft+=e.deltaY; }
   else { setZoom(userZoom*(e.deltaY<0?1.1:0.9)); }
 },{passive:false});
-$('saveEdit').onclick=saveEdit;
+$('saveEdit').onclick=()=>saveEdit();
 // 一键清空：清掉「所有已载入版」的识别结果，并删除 output/ 下本轮导出的 raw 转录产物（txt/json）。
 // 不动框选区域、不动 cropped_hi/ 整版原图、不动已生成的结构化 .md；清空后需重新点「识别全部」。
 // 用 addEventListener 绑定（与 clearBoxes 同理），避免按钮 id 与同名函数/变量冲突导致点击无反应。
@@ -6818,10 +6883,43 @@ def main():
             with open(script_path, "r", encoding="utf-8") as f:
                 code = f.read()
             exec(compile(code, script_path, "exec"), {"__name__": "__main__", "__file__": script_path})
+        except SystemExit as e:
+            # 子脚本用 sys.exit(...) 主动结束：postprocess.py 有 3 处（缺 DEEPSEEK_API_KEY /
+            # 找不到指定 txt / 本轮有失败篇需以非 0 退出）。SystemExit 继承 BaseException，
+            # 原 except Exception 捕获不到，会穿透到顶层交给解释器收尾；冻结态不应依赖
+            # bootloader 的清理，这里显式 flush 后按原退出码收口，保证 stdout/stderr 完整。
+            _code = e.code
+            if isinstance(_code, int):
+                _rc = _code
+            elif _code is None:
+                _rc = 0
+            else:
+                # sys.exit("消息") 在正常退出时由解释器把消息写 stderr，os._exit 会绕过，须自己补写，
+                # 否则父进程 /api/* 的 error 字段只剩「子进程退出码 1，无输出」。
+                try:
+                    print(str(_code), file=sys.stderr)
+                except Exception:
+                    pass
+                _rc = 1
+            try:
+                sys.stdout.flush(); sys.stderr.flush()
+            except Exception:
+                pass
+            os._exit(_rc)
         except Exception as e:
             import traceback
             traceback.print_exc()
+            # os._exit 不走解释器正常清理，stdout/stderr 缓冲区会整段丢失；
+            # 打包态 /api/rebuild_ref 与 /api/postprocess 都靠子进程 stdout 取结果，必须先 flush。
+            try:
+                sys.stdout.flush(); sys.stderr.flush()
+            except Exception:
+                pass
             os._exit(1)
+        try:
+            sys.stdout.flush(); sys.stderr.flush()
+        except Exception:
+            pass
         os._exit(0)
     port = 8788
     for i, a in enumerate(sys.argv):

@@ -1455,6 +1455,13 @@ def rebuild_ref(txt_path, fmt="gb7714", kt=False):
 
     ref = build_ref(title, author, carrier_type, carrier_name, date, edition,
                    volume, issue, pages, fmt, kt)
+    # 幂等保护（4.1.3）：算出的引用与产物里现存引用一致时不重写文件，
+    # 避免每次重算都把结构化产物整文件写回一遍（顺带改掉行尾）。
+    # 注：_write_plain_ref / _write_kb_ref 只按行替换标题/作者/日期/引用，正文原样写回。
+    if ref0 and ref == ref0:
+        return {"ok": True, "ref": ref0, "mode": mode,
+                "path": (plain_path if mode == "plain" else kb_path),
+                "unchanged": True}
     if mode == "plain":
         _write_plain_ref(plain_path, title, author, date, ref)
         target = plain_path
