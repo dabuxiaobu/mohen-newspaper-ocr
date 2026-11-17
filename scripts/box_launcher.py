@@ -230,7 +230,7 @@ except Exception as _e:
     # pythonnet 真正初始化在 webview.start() 里（见文件末尾，那里也做了兜底）。
     _startup_fail(f"{type(_e).__name__}: {_e}")
 
-VERSION = "4.1.3"
+VERSION = "4.1.4"
 
 # ---------- OCR 服务商（豆包 / 千问 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -728,7 +728,7 @@ def _load_cfg():
                  "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                  "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
                  "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE", "RENAME_POLICY",
-                 "OCR_CONCURRENCY", "OCR_TEMPERATURE")
+                 "OCR_CONCURRENCY", "OCR_TEMPERATURE", "OCR_IMAGE_FORMAT")
     if os.path.exists(p):
         try:
             data = json.load(open(p, encoding="utf-8"))
@@ -845,6 +845,29 @@ def _translate_api_error(detail, status_code=None):
     """
     d = (detail or "").lower()
     code = status_code
+    # HTTP 404 必须先于关键词分支判断：服务商把「模型/接入点无效」「URL 路径无效」
+    # 都归到 404，且报文里可能带 quota 等字样，靠关键词会被误判成额度问题。
+    if code == 404:
+        _raw = (detail or "")[:300]
+        if "invalidendpointormodel.notfound" in d or ("model or endpoint" in d and "not exist" in d):
+            return ("【模型或接入点不存在或账号无权限】接口返回 HTTP 404，设置里的「模型」字段未通过服务商校验。\n"
+                    "请按顺序核对：\n"
+                    "  1. 豆包应填 ep- 开头的推理接入点 ID（火山方舟「在线推理 - 接入点」里复制），"
+                    "或控制台中精确的官方 model ID；不要把展示用的模型名称、接入点名称当作 ID 填入；\n"
+                    "  2. 该接入点未删除、未下架，且与当前 API Key 属于同一账号；\n"
+                    "  3. 账号已开通该模型，接入点地域与 Base URL 一致。\n"
+                    "服务商原文：" + (_raw or "（空）"))
+        if "invalidaction" in d or "chat/completions/chat/completions" in d:
+            return ("【接口地址路径不正确】接口返回 HTTP 404，Base URL 填写有误；"
+                    "程序会在其后自动补 /chat/completions。\n"
+                    "豆包应填 https://ark.cn-beijing.volces.com/api/v3 ："
+                    "不要漏 /api/v3，也不要把 /chat/completions 填进配置。\n"
+                    "服务商原文：" + (_raw or "（空）"))
+        return ("【接口返回 404】服务商未给出结构化错误说明，常见于 Base URL 漏 /api/v3、域名填错，"
+                "或本机代理 / VPN 网关拦截了请求。\n"
+                "请先在设置里逐字核对 Base URL 全文（豆包为 https://ark.cn-beijing.volces.com/api/v3），"
+                "再关闭系统代理与 VPN 全局模式后重试。\n"
+                "原始返回：" + (_raw or "（空）"))
     # 额度 / 免费额度耗尽（最常见，用户易误以为程序坏了）
     if (code == 403 or "forbidden" in d or "free quota" in d or "freeter" in d
             or "free tier" in d or "allocationquota" in d or "quota" in d):
@@ -867,12 +890,12 @@ def _translate_api_error(detail, status_code=None):
     return detail or "未知错误（未返回任何信息）"
 
 
-def _translate_net_error(e, base_url=""):
+def _translate_net_error(e, base_url="", body_mb=None):
     """把网络层异常（连接被远端中断 / 超时 / 域名解析失败）翻成可自行处置的中文提示。
 
-    典型场景：OCR Base URL 经图书馆 WebVPN 等代理网关转发时，单张整版裁切图
-    base64 后常达数 MB，中间节点往往直接掐断连接（WinError 10054 等）。此类
-    失败程序侧无从重试成功，只能给用户可执行的自救指引。
+    典型场景：本机代理 / VPN 客户端处于全局模式，或链路中间节点在上传数 MB 级
+    请求体时直接掐断连接（WinError 10054 等）。此类失败程序侧无从重试成功，
+    只能给用户可执行的自救指引。
 
     绝不吞掉原始报错，一律原样附在末尾。
     """
@@ -889,13 +912,15 @@ def _translate_net_error(e, base_url=""):
         head = "网络请求失败"
     msg = (f"{head}（属网络链路问题，不是识别出错）：{raw}\n"
            "常见原因：\n"
-           "  1. 网络 / 代理节点不稳定（多位用户反馈切换节点后即恢复正常）；\n"
-           "  2. OCR Base URL 经图书馆 WebVPN 等代理网关转发时，"
-           "单张整版裁切图 base64 后可达数 MB，中间节点会直接掐断连接。\n"
-           "解决办法（任选其一）：\n"
-           "  1. 切换网络节点、换 Wi-Fi 或重新联网后重试；\n"
-           "  2. 关闭网络代理 / VPN（含图书馆 WebVPN 等网关），改直连后重试；\n"
-           "  3. 仍失败请把这段提示反馈给开发者。")
+           "  1. 本机网络代理 / VPN 客户端处于全局模式，或链路中间节点在上传数 MB 级请求体时直接掐断连接；\n"
+           "  2. 单个框覆盖了整版或大半版，裁切图 base64 后可达数 MB（程序已默认用 JPEG 压缩，仍可能偏大）。\n"
+           "解决办法（按顺序试）：\n"
+           "  1. 把这个大框拆成 2–4 个小框分别识别（同时避免模型输出被截断、跳栏）；\n"
+           "  2. 关闭 Windows 系统代理、退出 VPN / 加速器 / 校园网客户端的全局模式后重试；"
+           "换 Wi-Fi 或手机热点不会改变这些设置；\n"
+           "  3. 仍失败请把这段提示（含下方请求体大小）反馈给开发者。")
+    if body_mb is not None:
+        msg += "\n本次请求体：%.2f MB" % body_mb
     bu = (base_url or "").lower()
     if "vpn" in bu or "/https/" in bu or "webvpn" in bu:
         msg += "\n提示：当前 OCR Base URL 填的是代理网关地址，单张整版图经网关转发时容易被掐断，建议先按第 2 条关闭代理、改直连后重试。"
@@ -1326,8 +1351,14 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
                       "按阅读顺序（竖排从右到左逐列、每列从上到下）连续输出，段与段之间用空行分隔；"
                       "输出为不带任何字段名前缀的纯文本，**不要输出「标题：/作者：/正文：」结构，"
                       "也不要把某一行单独提升为标题或署名单列出来**。")
+    # 裁图格式由前端随请求显式带回（image_format），后端配置只作兜底，避免前后端不同步。
+    # 默认 JPEG q0.9：整版裁图 PNG base64 可达 8–11 MB，JPEG 约三分之一；
+    # 2026-11-15 本机对照显示竖排密排小字区 PNG 与 JPEG q90 输出逐字一致。
+    _mime = str(ov.get("image_format") or cfg.get("OCR_IMAGE_FORMAT") or "image/jpeg").strip().lower()
+    if _mime not in ("image/png", "image/jpeg"):
+        _mime = "image/jpeg"
     _ucontent = [{"type": "text", "text": user_text},
-                 {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}}]
+                 {"type": "image_url", "image_url": {"url": f"data:{_mime};base64,{b64}"}}]
     payload = {
         "model": model,
         "messages": [
@@ -1357,6 +1388,8 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
         payload["thinking"] = {"type": "disabled"}
     url = base_url.rstrip("/") + "/chat/completions"
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    _body_mb = len(data) / 1e6
+    _probe_log("[OCR] POST %s | image %s | body %.2f MB" % (urlparse(url).netloc, _mime, _body_mb))
     req = urllib.request.Request(url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("Authorization", "Bearer " + api_key)
@@ -1394,7 +1427,7 @@ def do_ocr(b64, src, prompt_override=None, overrides=None, provider=None, label=
     except OSError as e:
         # URLError / 超时 / ConnectionResetError / RemoteDisconnected 均为 OSError 子类，
         # 统一翻成可行动提示（详见 _translate_net_error）
-        raise RuntimeError(_translate_net_error(e, base_url))
+        raise RuntimeError(_translate_net_error(e, base_url, _body_mb))
     except KeyError:
         raise RuntimeError("响应缺少 choices[0].message.content，返回体：" +
                           json.dumps(j, ensure_ascii=False)[:400])
@@ -1846,7 +1879,7 @@ class Handler(BaseHTTPRequestHandler):
                             "BAIDU_API_KEY", "BAIDU_SECRET_KEY", "BAIDU_MODEL", "BAIDU_BASE_URL", "BAIDU_AUTO_FALLBACK",
                             "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                             "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
-                            "DATA_DIR", "OCR_CONCURRENCY", "OCR_TEMPERATURE")},
+                            "DATA_DIR", "OCR_CONCURRENCY", "OCR_TEMPERATURE", "OCR_IMAGE_FORMAT")},
                 # 提示词出厂默认（抽屉「恢复默认」回填；自定义留空则回落到此）
                 "prompt_ocr_default": SINGLE_INSTRUCTION,
                 "prompt_post_default": _read_post_default_prompt(),
@@ -2131,8 +2164,12 @@ class Handler(BaseHTTPRequestHandler):
                 # 前端未显式传 prompt_override 时，自动用配置里的 PROMPT_OCR 覆盖（提示词抽屉保存后即时生效）
                 cfg_ocr, _ = _load_cfg()
                 ov_prompt = data.get("prompt_override") or cfg_ocr.get("PROMPT_OCR") or None
+                _ov = dict(data.get("overrides") or {})
+                _ifmt = str(data.get("image_format") or "").strip().lower()
+                if _ifmt:
+                    _ov["image_format"] = _ifmt
                 res = do_ocr(data.get("image_b64", ""), data.get("src", ""),
-                             ov_prompt, data.get("overrides") or {}, label=data.get("label") or None)
+                             ov_prompt, _ov, label=data.get("label") or None)
             except Exception as e:
                 _err = f"{type(e).__name__}: {e}"
                 if _err.startswith("RuntimeError: "):
@@ -3456,7 +3493,7 @@ class Handler(BaseHTTPRequestHandler):
                    "DEEPSEEK_API_KEY", "DEEPSEEK_MODEL", "DEEPSEEK_BASE_URL",
                    "PROMPT_OCR", "PROMPT_POST", "PROMPT_POST_PLAIN", "PROMPT_POST_HISTORY", "PROMPT_POST_PLAIN_HISTORY",
                    "CITATION_FORMAT", "KEEP_TRADITIONAL", "EYE_CARE",
-                   "DATA_DIR", "RENAME_POLICY")
+                   "DATA_DIR", "RENAME_POLICY", "OCR_IMAGE_FORMAT")
         p = os.path.join(CONFIG_DIR, "box_config.json")
         merged = {}
         if os.path.exists(p):
@@ -3869,7 +3906,7 @@ HTML = r"""<!doctype html>
   </div>
 </div>
 <div id="vpnTip">
-  <div class="vpn-txt"><b>识别前请先关闭网络代理 / VPN</b>（含图书馆 WebVPN 等网关）。整版裁切图单张可达数 MB，经代理转发时容易被中途掐断，表现为「连接被远端中断 / 连接超时」；改用直连后重试即可。</div>
+  <div class="vpn-txt"><b>识别前请先关闭网络代理 / VPN</b>（含图书馆 WebVPN 等网关），换 Wi-Fi 或手机热点不会改变这些设置。单框请勿覆盖整版：超大裁图经代理转发容易被中途掐断（表现为「连接被远端中断 / 连接超时」），模型输出也会被截断或跳栏；请拆成 2–4 个小框并改用直连。</div>
   <button class="vpn-x" id="vpnTipClose" title="不再显示这条提示">知道了</button>
 </div>
 <div class="wrap">
@@ -5297,10 +5334,19 @@ function foldParsedByLabel(b,p){
   return parsed;
 }
 // 裁切一张框图（四周补白边，避免贴边列漏读）。
+// 默认 JPEG q0.9：整版 PNG base64 可达 8–11 MB，经代理网关易被中途掐断；
+// 2026-11-15 本机对照显示竖排密排小字区 PNG 与 JPEG q90 输出逐字一致。
+// 回退：box_config.json 里设 "OCR_IMAGE_FORMAT": "png" 即恢复 PNG。
+function ocrImageMime(){
+  const v=String((backendCfg&&backendCfg.values&&backendCfg.values.OCR_IMAGE_FORMAT)||'').trim().toLowerCase();
+  return v==='png' ? 'image/png' : 'image/jpeg'; }
 function cropB64(b, im){ const P=ocrPad(b.w,b.h);
   const oc=document.createElement('canvas'); oc.width=b.w+2*P; oc.height=b.h+2*P;
   const octx=oc.getContext('2d'); octx.fillStyle='#fff'; octx.fillRect(0,0,oc.width,oc.height);
-  octx.drawImage(im,b.x,b.y,b.w,b.h,P,P,b.w,b.h); return oc.toDataURL('image/png').split(',')[1]; }
+  octx.drawImage(im,b.x,b.y,b.w,b.h,P,P,b.w,b.h);
+  const mime=ocrImageMime();
+  const b64=(mime==='image/jpeg'?oc.toDataURL(mime,0.9):oc.toDataURL(mime)).split(',')[1];
+  return {b64:b64, mime:mime}; }
 async function ocrBox(b, im, nW, nH, opt){ const P=ocrPad(b.w,b.h);
   // opt.pname：单框重识别时目标框可能不属于当前显示版，日志/来源/质量标记须用该版名；
   // opt.quiet：单框重识别不写入本批质量自检标记，避免污染「识别全部」的统计与提示。
@@ -5316,11 +5362,11 @@ async function ocrBox(b, im, nW, nH, opt){ const P=ocrPad(b.w,b.h);
   if(nW && nH && (b.x>=nW || b.y>=nH || b.x+b.w<=0 || b.y+b.h<=0)){
     const _w='框坐标越界 @('+Math.round(b.x)+','+Math.round(b.y)+') 尺寸 '+Math.round(b.w)+'×'+Math.round(b.h)+'，超出原图 '+(nW||'?')+'×'+(nH||'?')+'，识别结果可能为空。';
     log('[识别] 警告：'+_w); }
-  const b64=cropB64(b,im);
+  const _crop=cropB64(b,im);
   // 请求本身可能直接抛错（后端未就绪、连接被拒、超时）。此前这类错误会冒泡到整页 try，
   // 让该版所有框一起作废；这里就地收敛成「这个框识别失败」，其余框照常继续。
   let j=null;
-  const _postOcr=async()=>{ const r=await fetch('/api/ocr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_b64:b64,src:_pn,label:(b.label||''),overrides:getOverrides()})});
+  const _postOcr=async()=>{ const r=await fetch('/api/ocr',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({image_b64:_crop.b64,image_format:_crop.mime,src:_pn,label:(b.label||''),overrides:getOverrides()})});
     return await r.json(); };
   try{ j=await _postOcr(); }
   catch(_e){ j={ok:false, error:'请求失败：'+String((_e&&_e.message)||_e).slice(0,180)}; }

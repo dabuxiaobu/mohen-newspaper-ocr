@@ -26,7 +26,7 @@ cd "$SKILL_DIR"
 APP_NAME="墨痕"
 
 # 版本（去 v 前缀）
-VERSION_RAW="${MH_VERSION:-4.1.3}"
+VERSION_RAW="${MH_VERSION:-4.1.4}"
 VERSION="${VERSION_RAW#v}"
 
 # 架构后缀

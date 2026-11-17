@@ -235,6 +235,122 @@ def _fast_embedded_image(page, used):
         return None
 
 
+def extract_images_stream(pdf_path: str, save_one, name: str):
+    """流式抽图：抽出每页后立刻交给 save_one(pnum, im) 存盘并释放，不把所有页堆在内存。
+
+    与 extract_images_per_page 共用同一套逐页取图逻辑，但只保留当前一页 PIL 图，
+    避免 842 页 × 160 MB ≈ 131 GB 的全量驻留（大型影印本 PDF 会 OOM 或被系统杀掉）。
+    save_one 返回 True 表示已存盘；返回 False 表示该页已存在被跳过。
+    返回 (产出页数, 错误列表)。
+    """
+    reader = PdfReader(pdf_path)
+    produced = 0
+    errors = []
+    jbig2_pages = 0
+    jbig2_failed = 0
+    for i, page in enumerate(reader.pages, 1):
+        if STOP_EVENT.is_set():
+            _elog("[info] 抽图收到停止请求，提前结束")
+            break
+        best = None
+        best_area = 0
+        enum_err = None
+        used = _used_image_names(page)
+        if used:
+            best = _fast_embedded_image(page, used)
+            if best is not None:
+                best_area = best.width * best.height
+        if best is None:
+            try:
+                images = list(page.images)
+                images = _filter_images_by_content(page, images)
+            except Exception as e:
+                enum_err = f"{os.path.basename(pdf_path)} page {i}: 页面图像枚举失败: {type(e).__name__}: {e}"
+                if "jbig2" in str(e).lower():
+                    jbig2_pages += 1
+                else:
+                    _elog(f"  [warn] {enum_err}（将尝试 pdfium 整页渲染回退）")
+            if not enum_err:
+                for im in images:
+                    try:
+                        pil = im.image
+                    except Exception as e:
+                        msg = f"{os.path.basename(pdf_path)} page {i} 图 {getattr(im, 'name', '?')}: 解码失败: {type(e).__name__}: {e}"
+                        errors.append(msg)
+                        _elog(f"  [skip image] {msg}")
+                        continue
+                    if pil is None:
+                        continue
+                    area = pil.width * pil.height
+                    if area > best_area:
+                        best_area = area
+                        best = pil.convert("RGB")
+        if best is None:
+            try:
+                best = render_page_pdfium(pdf_path, i, dpi=300)
+                if best is not None:
+                    if enum_err and "jbig2" not in enum_err.lower():
+                        _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 内嵌图枚举失败，改用整页渲染（{best.width}x{best.height}）")
+                    elif not enum_err:
+                        _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 页内无内嵌图，改用整页渲染（{best.width}x{best.height}）")
+            except Exception as e:
+                if "jbig2" in (enum_err or "").lower():
+                    jbig2_failed += 1
+                msg = (f"{os.path.basename(pdf_path)} page {i}: pdfium 整页渲染回退失败"
+                       + (f"（pypdf 枚举: {enum_err}）" if enum_err else "（页内无内嵌图）")
+                       + f": {type(e).__name__}: {e}")
+                errors.append(msg)
+                _elog(f"  [skip page] {msg}")
+                continue
+        if _page_is_edited(page):
+            try:
+                dpi = _native_dpi(page, best) if best is not None else 300
+                best = render_page_pdfium(pdf_path, i, dpi=dpi)
+                if best is not None:
+                    _elog(f"  [可见区渲染] {os.path.basename(pdf_path)} page {i}: 页面被裁剪/旋转，按原图分辨率渲染可见区（{best.width}x{best.height}）")
+            except Exception as e:
+                if "jbig2" in (enum_err or "").lower():
+                    jbig2_failed += 1
+                msg = (f"{os.path.basename(pdf_path)} page {i}: 页面被裁剪/旋转，可见区渲染失败"
+                       + (f"（pypdf 枚举: {enum_err}）" if enum_err else "")
+                       + f": {type(e).__name__}: {e}")
+                errors.append(msg)
+                _elog(f"  [skip page] {msg}")
+                continue
+        elif best is None:
+            try:
+                best = render_page_pdfium(pdf_path, i, dpi=300)
+                if best is not None:
+                    if enum_err and "jbig2" not in enum_err.lower():
+                        _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 内嵌图枚举失败，改用整页渲染（{best.width}x{best.height}）")
+                    elif not enum_err:
+                        _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 页内无内嵌图，改用整页渲染（{best.width}x{best.height}）")
+            except Exception as e:
+                if "jbig2" in (enum_err or "").lower():
+                    jbig2_failed += 1
+                msg = (f"{os.path.basename(pdf_path)} page {i}: pdfium 整页渲染回退失败"
+                       + (f"（pypdf 枚举: {enum_err}）" if enum_err else "（页内无内嵌图）")
+                       + f": {type(e).__name__}: {e}")
+                errors.append(msg)
+                _elog(f"  [skip page] {msg}")
+                continue
+        if best:
+            try:
+                if save_one(i, best):
+                    produced += 1
+            finally:
+                # 立刻释放当前页位图，内存峰值 ≈ 单页 160 MB，而非全量 131 GB
+                best = None
+    if jbig2_pages:
+        if jbig2_failed:
+            _elog(f"  [warn] {os.path.basename(pdf_path)}：{jbig2_pages} 页为 JBIG2 压缩（pypdf 无内置解码器），"
+                  f"其中 {jbig2_failed} 页 pdfium 回退也失败、未产出图（详见上方 skip page 的真实异常）。")
+        else:
+            _elog(f"  [info] {os.path.basename(pdf_path)}：{jbig2_pages} 页为 JBIG2 压缩（pypdf 无内置解码器），"
+                  f"已自动改用 pdfium 整页渲染，识别结果不受影响。")
+    return produced, errors
+
+
 def extract_images_per_page(pdf_path: str):
     """从 PDF 每页抽出面积最大的内嵌图（数据库导出一般是单图全页）。
 
@@ -244,7 +360,8 @@ def extract_images_per_page(pdf_path: str):
     reader = PdfReader(pdf_path)
     out = []
     errors = []
-    jbig2_pages = 0   # JBIG2 压缩页计数（摘要提示用，详见枚举失败处注释）
+    jbig2_pages = 0        # JBIG2 压缩页计数（摘要提示用，详见枚举失败处注释）
+    jbig2_failed = 0       # JBIG2 页中 pdfium 回退也失败的页数：这些页确实没产出图，必须如实报告
     for i, page in enumerate(reader.pages, 1):
         best = None
         best_area = 0
@@ -265,8 +382,9 @@ def extract_images_per_page(pdf_path: str):
                 images = _filter_images_by_content(page, images)
             except Exception as e:
                 enum_err = f"{os.path.basename(pdf_path)} page {i}: 页面图像枚举失败: {type(e).__name__}: {e}"
-                # JBIG2 页属已知限制（pypdf 无内置 jbig2 解码器），已由下方 pdfium 整页渲染回退兜住，
-                # 结果不受影响。逐页刷 warn 会让用户误以为导入失败，故只计数、最后汇总一条。
+                # JBIG2 页属已知限制（pypdf 无内置 jbig2 解码器），由下方 pdfium 整页渲染回退。
+                # 回退是否成功尚未知（须等 render_page_pdfium 结果），故此处只计数、不预判结论，
+                # 逐页刷 warn 会让用户误以为导入失败，最终在循环末尾按成功/失败分别汇总。
                 if "jbig2" in str(e).lower():
                     jbig2_pages += 1
                 else:
@@ -296,13 +414,15 @@ def extract_images_per_page(pdf_path: str):
                     else:
                         _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 页内无内嵌图，改用整页渲染（{best.width}x{best.height}）")
             except Exception as e:
-                if enum_err:
-                    errors.append(enum_err)
-                    _elog(f"  [skip page] {enum_err}")
-                else:
-                    msg = f"{os.path.basename(pdf_path)} page {i}: 无内嵌图且 pdfium 渲染失败: {type(e).__name__}: {e}"
-                    errors.append(msg)
-                    _elog(f"  [skip page] {msg}")
+                # 真实失败原因是 pdfium 异常 e，不是 pypdf 的 enum_err。
+                # 旧代码在 enum_err 存在时只记 jbig2dec 报错并汇总成"不受影响"，把回退失败完全掩盖。
+                if "jbig2" in (enum_err or "").lower():
+                    jbig2_failed += 1
+                msg = (f"{os.path.basename(pdf_path)} page {i}: pdfium 整页渲染回退失败"
+                       + (f"（pypdf 枚举: {enum_err}）" if enum_err else "（页内无内嵌图）")
+                       + f": {type(e).__name__}: {e}")
+                errors.append(msg)
+                _elog(f"  [skip page] {msg}")
                 continue
         # 页面被裁剪/旋转（WPS 等编辑后内嵌图未变）→ 内嵌原图不是「保存后的样子」，
         # 必须按 CropBox 可见区（pdfium 自动应用旋转）渲染，DPI 取内嵌原图原生分辨率。
@@ -313,13 +433,13 @@ def extract_images_per_page(pdf_path: str):
                 if best is not None:
                     _elog(f"  [可见区渲染] {os.path.basename(pdf_path)} page {i}: 页面被裁剪/旋转，按原图分辨率渲染可见区（{best.width}x{best.height}）")
             except Exception as e:
-                if enum_err:
-                    errors.append(enum_err)
-                    _elog(f"  [skip page] {enum_err}")
-                else:
-                    msg = f"{os.path.basename(pdf_path)} page {i}: 页面被裁剪/旋转，可见区渲染失败: {type(e).__name__}: {e}"
-                    errors.append(msg)
-                    _elog(f"  [skip page] {msg}")
+                if "jbig2" in (enum_err or "").lower():
+                    jbig2_failed += 1
+                msg = (f"{os.path.basename(pdf_path)} page {i}: 页面被裁剪/旋转，可见区渲染失败"
+                       + (f"（pypdf 枚举: {enum_err}）" if enum_err else "")
+                       + f": {type(e).__name__}: {e}")
+                errors.append(msg)
+                _elog(f"  [skip page] {msg}")
                 continue
         else:
             # 未编辑：走 pypdf 内嵌原图；抽不到（枚举失败/页内无图）→ pdfium 整页渲染回退
@@ -333,22 +453,25 @@ def extract_images_per_page(pdf_path: str):
                         else:
                             _elog(f"  [pdfium 回退] {os.path.basename(pdf_path)} page {i}: 页内无内嵌图，改用整页渲染（{best.width}x{best.height}）")
                 except Exception as e:
-                    if enum_err:
-                        errors.append(enum_err)
-                        _elog(f"  [skip page] {enum_err}")
-                    else:
-                        msg = f"{os.path.basename(pdf_path)} page {i}: 无内嵌图且 pdfium 渲染失败: {type(e).__name__}: {e}"
-                        errors.append(msg)
-                        _elog(f"  [skip page] {msg}")
+                    if "jbig2" in (enum_err or "").lower():
+                        jbig2_failed += 1
+                    msg = (f"{os.path.basename(pdf_path)} page {i}: pdfium 整页渲染回退失败"
+                           + (f"（pypdf 枚举: {enum_err}）" if enum_err else "（页内无内嵌图）")
+                           + f": {type(e).__name__}: {e}")
+                    errors.append(msg)
+                    _elog(f"  [skip page] {msg}")
                     continue
         if best:
             out.append((i, best))
-    # JBIG2 页已由 pdfium 回退成功：从错误列表剔除，避免「N 条页级错误」误导用户；
-    # 若确实有回退也失败的 JBIG2 页，其「无内嵌图且 pdfium 渲染失败」记录会以另一文案保留在 errors 里。
+    # JBIG2 汇总必须据实：回退成功的页不报错；回退失败的页已由上方 [skip page] 记真实异常，
+    # 保留在 errors 里，绝不能按"jbig2"关键词删除——那会把全盘失败包装成"不受影响"。
     if jbig2_pages:
-        errors = [e for e in errors if "jbig2" not in e.lower()]
-        _elog(f"  [info] {os.path.basename(pdf_path)}：{jbig2_pages} 页为 JBIG2 压缩（pypdf 无内置解码器），"
-              f"已自动改用 pdfium 整页渲染，识别结果不受影响。")
+        if jbig2_failed:
+            _elog(f"  [warn] {os.path.basename(pdf_path)}：{jbig2_pages} 页为 JBIG2 压缩（pypdf 无内置解码器），"
+                  f"其中 {jbig2_failed} 页 pdfium 回退也失败、未产出图（详见上方 skip page 的真实异常）。")
+        else:
+            _elog(f"  [info] {os.path.basename(pdf_path)}：{jbig2_pages} 页为 JBIG2 压缩（pypdf 无内置解码器），"
+                  f"已自动改用 pdfium 整页渲染，识别结果不受影响。")
     return out, errors
 
 
@@ -469,27 +592,29 @@ def main():
             continue
         try:
             if ext == ".pdf":
-                pages, errs = extract_images_per_page(src)
-                if not pages:
-                    _elog(f"[no image] {name}"
-                          + (f"（{len(errs)} 条页级错误，详见上文）" if errs else "（未发现内嵌图片，可能是文字型 PDF）"))
-                    continue
                 kind = "PDF"
-                for pnum, im in pages:
-                    out, out_legacy = _page_out(os.path.splitext(name)[0], pnum)
-                    if (os.path.exists(out) or os.path.exists(out_legacy)) and not _src_newer(src, out if os.path.exists(out) else out_legacy):
+                def _save_pdf_page(pnum, im):
+                    """存单页并立即释放 im；返回 True 表示新产出，False 表示已存在跳过。"""
+                    nonlocal skipped
+                    _out, _legacy = _page_out(os.path.splitext(name)[0], pnum)
+                    if (os.path.exists(_out) or os.path.exists(_legacy)) and not _src_newer(src, _out if os.path.exists(_out) else _legacy):
                         skipped += 1
-                        print(f"{name[:30]:32} [{kind}] page {pnum} [skip 已存在] {os.path.basename(out if os.path.exists(out) else out_legacy)}")
-                        continue
+                        print(f"{name[:30]:32} [{kind}] page {pnum} [skip 已存在] {os.path.basename(_out if os.path.exists(_out) else _legacy)}")
+                        return False
                     w0, h0 = im.size
                     cropped = autocrop(im)
                     w1, h1 = cropped.size
-                    cropped.save(out, "JPEG", quality=95, subsampling=0)
-                    _bn = os.path.basename(out)
+                    cropped.save(_out, "JPEG", quality=95, subsampling=0)
+                    _bn = os.path.basename(_out)
                     if _bn not in _ch_order:
                         _ch_order.append(_bn)
                     print(f"{name[:30]:32} [{kind}] page {pnum} 原图 {w0}x{h0} -> 裁切 {w1}x{h1} "
                           f"(留 {100*w1*h1/(w0*h0):.0f}%)")
+                    return True
+                produced, errs = extract_images_stream(src, _save_pdf_page, name)
+                if not produced:
+                    _elog(f"[no image] {name}"
+                          + (f"（{len(errs)} 条页级错误，详见上文）" if errs else "（未发现内嵌图片，可能是文字型 PDF）"))
             else:
                 im = Image.open(src).convert("RGB")
                 kind = "图片"
