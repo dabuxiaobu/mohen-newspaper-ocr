@@ -230,7 +230,7 @@ except Exception as _e:
     # pythonnet 真正初始化在 webview.start() 里（见文件末尾，那里也做了兜底）。
     _startup_fail(f"{type(_e).__name__}: {_e}")
 
-VERSION = "4.1.4"
+VERSION = "4.1.5"
 
 # ---------- OCR 服务商（豆包 / 千问 自由切换） ----------
 # 每个服务商独立保存一组凭据（API Key / Base URL / 模型名），切换后各自记住，
@@ -3473,7 +3473,8 @@ class Handler(BaseHTTPRequestHandler):
                     out["error"] = ("抽图结果为 0 张：PDF/图片中未抽出任何图像。常见原因："
                                     "① 文字型 PDF（页面为矢量文字，无内嵌扫描图）；"
                                     "② PDF 为 AES 加密但打包环境缺 cryptography（2.0.5 起已内置）；"
-                                    "③ 图像编码不支持。详情见上方抽取日志，建议将 PDF 页面导出为图片后重新导入。")
+                                    "③ JBIG2/CCITT G4 等编码需 pdfium 整页渲染回退，打包环境缺 pypdfium2 会失败；"
+                                    "④ 图像编码不支持。详情见上方抽取日志，建议将 PDF 页面导出为图片后重新导入。")
                     return self._json(out)
                 out["ok"] = True
                 return self._json(out)

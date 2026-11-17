@@ -13,7 +13,7 @@
 # 步骤概览：
 #   [1/6] 检查 python3
 #   [2/6] 建独立 venv（build_venv_mac）
-#   [3/6] 装依赖（pyinstaller pywebview numpy Pillow opencc ...）
+#   [3/6] 装依赖（pyinstaller pywebview numpy Pillow opencc pypdf pypdfium2 cryptography ...）
 #   [4/6] 用 PIL 把 icon/newspaper.ico 转 macOS 的 AppIcon.icns
 #   [5/6] PyInstaller 打包 → dist/墨痕.app
 #   [6/6] 生成 .dmg + .zip（绿色版）+ sha256
@@ -26,7 +26,7 @@ cd "$SKILL_DIR"
 APP_NAME="墨痕"
 
 # 版本（去 v 前缀）
-VERSION_RAW="${MH_VERSION:-4.1.4}"
+VERSION_RAW="${MH_VERSION:-4.1.5}"
 VERSION="${VERSION_RAW#v}"
 
 # 架构后缀
@@ -58,7 +58,7 @@ source "$VENV/bin/activate"
 # [3/6] 依赖
 echo "[3/6] 安装依赖"
 pip install -U pip >/dev/null 2>&1
-pip install pyinstaller pywebview numpy Pillow opencc-python-reimplemented openai pypdf cryptography
+pip install pyinstaller pywebview numpy Pillow opencc-python-reimplemented openai pypdf pypdfium2 cryptography
 
 # [4/6] .ico → .icns（PIL 原生支持 ICNS）
 echo "[4/6] 生成 AppIcon.icns"

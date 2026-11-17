@@ -41,6 +41,7 @@ a = Analysis(
         "openai",
         "truststore",  # _ssl_ctx() 优先用它桥接系统钥匙串证书（macOS 冻结态无默认 CA 文件）
         "pypdf",
+        "pypdfium2",  # 内嵌图抽取失败（CCITT G4 等）时的整页渲染回退引擎
         "cryptography",  # pypdf 可选依赖：AES 加密 PDF 解密必需（缺失则抽图静默 0 张）
         # 人工框选链路子模块（import 模式冻结进 app；均已有 main()）
         "extract_original",
@@ -63,6 +64,16 @@ a.hiddenimports += _opencc_hidden
 
 # webview 子模块（macOS 用 Cocoa/WebKit 后端）运行时动态加载，需递归收集
 a.hiddenimports += collect_submodules('webview')
+
+# pypdfium2 的整页渲染回退依赖原生 pdfium 动态库（macOS 为 libpdfium.dylib），
+# 仅放 hiddenimports 不足以让 PyInstaller 收集该库。照 opencc 写法强制 collect_all
+# 收集 dylib + 版本文件：实测 4.1.4 Mac 包缺此项，JBIG2 页回退时报
+# ModuleNotFoundError: No module named 'pypdfium2'，该页 0 张图。
+_pf_datas, _pf_bins, _pf_hidden = collect_all("pypdfium2")
+a.datas += [(os.path.join(d, os.path.basename(s)), s, "DATA")
+            for s, d in _pf_datas if os.path.isfile(s)]
+a.binaries += _pf_bins
+a.hiddenimports += _pf_hidden
 
 pyz = PYZ(a.pure)
 
